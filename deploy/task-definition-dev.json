@@ -1,0 +1,70 @@
+{
+  "family": "rrelayer-dev",
+  "taskRoleArn": "arn:aws:iam::314429810762:role/rrelayer-dev-task-role",
+  "executionRoleArn": "arn:aws:iam::314429810762:role/rrelayer-dev-task-execution-role",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "runtimePlatform": {
+    "cpuArchitecture": "ARM64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "containerDefinitions": [
+    {
+      "name": "rrelayer-dev",
+      "image": "314429810762.dkr.ecr.ap-northeast-1.amazonaws.com/rrelayer-dev:20737da16642-rds-ca2",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 3000,
+          "hostPort": 3000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "AWS_REGION",
+          "value": "ap-northeast-1"
+        },
+        {
+          "name": "RUST_LOG",
+          "value": "info"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "DATABASE_URL",
+          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:314429810762:secret:rrelayer/dev/database-url-TIKpPk"
+        },
+        {
+          "name": "RRELAYER_AUTH_USERNAME",
+          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:314429810762:secret:rrelayer/dev/auth-username-IfMebQ"
+        },
+        {
+          "name": "RRELAYER_AUTH_PASSWORD",
+          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:314429810762:secret:rrelayer/dev/auth-password-iI4bsW"
+        },
+        {
+          "name": "RRELAYER_PRIVATE_KEY",
+          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:314429810762:secret:rrelayer/dev/private-key-euilPZ"
+        }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -fsS http://localhost:3000/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/rrelayer-dev",
+          "awslogs-region": "ap-northeast-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
