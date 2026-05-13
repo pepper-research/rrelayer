@@ -12,10 +12,7 @@
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
         },
         "StringLike": {
-          "token.actions.githubusercontent.com:sub": [
-            "repo:pepper-research/rrelayer:ref:refs/heads/master",
-            "repo:pepper-research/rrelayer:ref:refs/heads/feature/7702-support"
-          ]
+          "token.actions.githubusercontent.com:sub": "repo:pepper-research/rrelayer:ref:refs/heads/master"
         }
       }
     }
