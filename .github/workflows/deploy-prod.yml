@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - master
+      - feature/7702-support
 
 permissions:
   contents: read
