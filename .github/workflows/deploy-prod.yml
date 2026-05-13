@@ -1,0 +1,111 @@
+name: Deploy rrelayer prod
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-northeast-1
+  AWS_ROLE_ARN: arn:aws:iam::314429810762:role/rrelayer-prod-gha
+  ECR_REPOSITORY: rrelayer-prod
+  ECS_CLUSTER: rrelayer-prod-cluster
+  ECS_SERVICE: rrelayer-prod
+  ECS_TASK_DEFINITION: deploy/task-definition-prod.json
+  ECS_CONTAINER_NAME: rrelayer-prod
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        id: build-image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.aws-dev
+          platforms: linux/arm64
+          push: true
+          build-args: |
+            RRELAYER_CONFIG=deploy/rrelayer-prod.yaml
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:prod
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Render ECS task definition
+        id: render-task
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          container-name: ${{ env.ECS_CONTAINER_NAME }}
+          image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Deploy ECS service
+        run: |
+          set -euo pipefail
+
+          task_definition_arn=$(
+            aws ecs register-task-definition \
+              --region "${AWS_REGION}" \
+              --cli-input-json "file://${{ steps.render-task.outputs.task-definition }}" \
+              --query 'taskDefinition.taskDefinitionArn' \
+              --output text
+          )
+
+          service_status=$(
+            aws ecs describe-services \
+              --region "${AWS_REGION}" \
+              --cluster "${ECS_CLUSTER}" \
+              --services "${ECS_SERVICE}" \
+              --query 'services[0].status' \
+              --output text 2>/dev/null || true
+          )
+
+          if [ "${service_status}" = "ACTIVE" ]; then
+            aws ecs update-service \
+              --region "${AWS_REGION}" \
+              --cluster "${ECS_CLUSTER}" \
+              --service "${ECS_SERVICE}" \
+              --task-definition "${task_definition_arn}" \
+              --force-new-deployment >/dev/null
+          else
+            aws ecs create-service \
+              --region "${AWS_REGION}" \
+              --cluster "${ECS_CLUSTER}" \
+              --service-name "${ECS_SERVICE}" \
+              --task-definition "${task_definition_arn}" \
+              --desired-count 1 \
+              --launch-type FARGATE \
+              --network-configuration 'awsvpcConfiguration={subnets=[subnet-07d8d1d2c6c048d81],securityGroups=[sg-04e52845779f3a0ef],assignPublicIp=ENABLED}' >/dev/null
+          fi
+
+          aws ecs wait services-stable \
+            --region "${AWS_REGION}" \
+            --cluster "${ECS_CLUSTER}" \
+            --services "${ECS_SERVICE}"

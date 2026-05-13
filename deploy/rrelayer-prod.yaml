@@ -1,0 +1,15 @@
+name: rrelayer-prod
+signing_provider:
+  private_keys:
+    - raw: ${RRELAYER_PRIVATE_KEY}
+networks:
+  - name: sepolia_ethereum
+    chain_id: 11155111
+    provider_urls:
+      - https://sepolia.gateway.tenderly.co
+    block_explorer_url: https://sepolia.etherscan.io
+api_config:
+  host: "0.0.0.0"
+  port: 3000
+  authentication_username: ${RRELAYER_AUTH_USERNAME}
+  authentication_password: ${RRELAYER_AUTH_PASSWORD}

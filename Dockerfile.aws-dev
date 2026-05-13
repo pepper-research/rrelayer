@@ -1,5 +1,6 @@
 FROM rust:trixie AS builder
 ARG TARGETPLATFORM
+ARG RRELAYER_CONFIG=deploy/rrelayer-dev.yaml
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 RUN apt-get update && apt-get install -y \
@@ -19,6 +20,7 @@ RUN if [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
     fi
 
 FROM debian:trixie-slim
+ARG RRELAYER_CONFIG=deploy/rrelayer-dev.yaml
 RUN apt-get update && apt-get install -y \
     libssl3 \
     ca-certificates \
@@ -30,7 +32,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/rrelayer_cli /app/rrelayer
-COPY deploy/rrelayer-dev.yaml /app/project/rrelayer.yaml
+COPY ${RRELAYER_CONFIG} /app/project/rrelayer.yaml
 
 WORKDIR /app/project
 ENTRYPOINT ["/app/rrelayer"]
