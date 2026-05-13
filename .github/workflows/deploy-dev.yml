@@ -22,7 +22,7 @@ env:
 jobs:
   deploy:
     name: Build and deploy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
 
     steps:
