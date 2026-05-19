@@ -1,15 +1,35 @@
-name: rrelayer-dev
-signing_provider:
-  private_keys:
-    - raw: ${RRELAYER_PRIVATE_KEY}
-networks:
-  - name: sepolia_ethereum
-    chain_id: 11155111
-    provider_urls:
-      - https://sepolia.gateway.tenderly.co
-    block_explorer_url: https://sepolia.etherscan.io
+name: spiceflow-mainnet
 api_config:
   host: "0.0.0.0"
   port: 3000
   authentication_username: ${RRELAYER_AUTH_USERNAME}
   authentication_password: ${RRELAYER_AUTH_PASSWORD}
+signing_provider:
+  private_keys:
+    - raw: ${RRELAYER_SOLVER_PK}
+    - raw: ${RRELAYER_ESCROW_PK}
+    - raw: ${RRELAYER_GAS_PK}
+networks:
+  - name: ethereum
+    chain_id: 1
+    provider_urls:
+      - ${RPC_URL_1}
+    block_explorer_url: https://etherscan.io
+    enable_sending_blobs: true
+  - name: citrea_mainnet
+    chain_id: 4114
+    provider_urls:
+      - ${RPC_URL_4114}
+    enable_sending_blobs: true
+  - name: arbitrum_one
+    chain_id: 42161
+    provider_urls:
+      - ${RPC_URL_42161}
+    block_explorer_url: https://arbiscan.io
+    enable_sending_blobs: true
+  - name: base_mainnet
+    chain_id: 8453
+    provider_urls:
+      - ${RPC_URL_8453}
+    block_explorer_url: https://basescan.org
+    enable_sending_blobs: true
