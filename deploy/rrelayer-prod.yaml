@@ -1,39 +1,40 @@
 name: spiceflow-mainnet
+
 api_config:
   host: "0.0.0.0"
   port: 3000
-  authentication_username: ${RRELAYER_AUTH_USERNAME}
-  authentication_password: ${RRELAYER_AUTH_PASSWORD}
+  authentication_username: ${RELAYER_USER}
+  authentication_password: ${RELAYER_PASS}
 
 signing_provider:
   private_keys:
-    - raw: ${RRELAYER_PRIVATE_KEY}
+    - raw: ${SOLVER_PRIVATE_KEY}
 
 networks:
   - name: ethereum
     chain_id: 1
     provider_urls:
-      - https://site1.moralis-nodes.com/eth/867f8369d3f9437097da0da57e890dd7
+      - https://eth-mainnet.g.alchemy.com/v2/7SgOekVydB9TOyNk3NKj8
     block_explorer_url: https://etherscan.io
     enable_sending_blobs: true
 
   - name: citrea_mainnet
     chain_id: 4114
     provider_urls:
-      - https://rpc.mainnet.citrea.xyz
+      - https://citrea-mainnet.g.alchemy.com/v2/7SgOekVydB9TOyNk3NKj8
     block_explorer_url: https://explorer.mainnet.citrea.xyz
     enable_sending_blobs: true
 
   - name: arbitrum_one
     chain_id: 42161
     provider_urls:
-      - https://site1.moralis-nodes.com/arbitrum/c112b24efbda440aaba4f7edb2300c99
+      - https://arb-mainnet.g.alchemy.com/v2/7SgOekVydB9TOyNk3NKj8
     block_explorer_url: https://arbiscan.io
     enable_sending_blobs: true
 
   - name: base_mainnet
     chain_id: 8453
     provider_urls:
-      - https://site1.moralis-nodes.com/base/3d8304e0ab0f45ceaa2186e350f9469d
+      - https://base-mainnet.g.alchemy.com/v2/7SgOekVydB9TOyNk3NKj8
     block_explorer_url: https://basescan.org
     enable_sending_blobs: true
