@@ -16,6 +16,7 @@ networks:
       - https://site1.moralis-nodes.com/eth/867f8369d3f9437097da0da57e890dd7
     block_explorer_url: https://etherscan.io
     enable_sending_blobs: true
+    allowed_random_relayers: "*"
 
   - name: citrea_mainnet
     chain_id: 4114
@@ -23,6 +24,7 @@ networks:
       - https://rpc.mainnet.citrea.xyz
     block_explorer_url: https://explorer.mainnet.citrea.xyz
     enable_sending_blobs: true
+    allowed_random_relayers: "*"
 
   - name: arbitrum_one
     chain_id: 42161
@@ -30,6 +32,7 @@ networks:
       - https://site1.moralis-nodes.com/arbitrum/c112b24efbda440aaba4f7edb2300c99
     block_explorer_url: https://arbiscan.io
     enable_sending_blobs: true
+    allowed_random_relayers: "*"
 
   - name: base_mainnet
     chain_id: 8453
@@ -37,3 +40,4 @@ networks:
       - https://site1.moralis-nodes.com/base/3d8304e0ab0f45ceaa2186e350f9469d
     block_explorer_url: https://basescan.org
     enable_sending_blobs: true
+    allowed_random_relayers: "*"
