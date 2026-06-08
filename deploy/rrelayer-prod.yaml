@@ -13,7 +13,7 @@ networks:
   - name: ethereum
     chain_id: 1
     provider_urls:
-      - https://eth-mainnet.g.alchemy.com/v2/7SgOekVydB9TOyNk3NKj8
+      - https://eth-mainnet.g.alchemy.com/v2/ptbizDVrFOiQ2Fz7m1GH0
     block_explorer_url: https://etherscan.io
     enable_sending_blobs: true
     allowed_random_relayers: "*"
@@ -21,7 +21,7 @@ networks:
   - name: citrea_mainnet
     chain_id: 4114
     provider_urls:
-      - https://citrea-mainnet.g.alchemy.com/v2/7SgOekVydB9TOyNk3NKj8
+      - https://citrea-mainnet.g.alchemy.com/v2/ptbizDVrFOiQ2Fz7m1GH0
     block_explorer_url: https://explorer.mainnet.citrea.xyz
     enable_sending_blobs: true
     allowed_random_relayers: "*"
@@ -29,7 +29,7 @@ networks:
   - name: arbitrum_one
     chain_id: 42161
     provider_urls:
-      - https://arb-mainnet.g.alchemy.com/v2/7SgOekVydB9TOyNk3NKj8
+      - https://arb-mainnet.g.alchemy.com/v2/ptbizDVrFOiQ2Fz7m1GH0
     block_explorer_url: https://arbiscan.io
     enable_sending_blobs: true
     allowed_random_relayers: "*"
@@ -37,7 +37,7 @@ networks:
   - name: base_mainnet
     chain_id: 8453
     provider_urls:
-      - https://base-mainnet.g.alchemy.com/v2/7SgOekVydB9TOyNk3NKj8
+      - https://base-mainnet.g.alchemy.com/v2/ptbizDVrFOiQ2Fz7m1GH0
     block_explorer_url: https://basescan.org
     enable_sending_blobs: true
     allowed_random_relayers: "*"
