@@ -435,10 +435,12 @@ impl TransactionsQueues {
         let estimated_gas_limit = match estimated_gas_limit {
             Ok(limit) => limit,
             Err(err) => {
+                let failed_transaction =
+                    Transaction { status: TransactionStatus::FAILED, ..transaction };
                 self.db
                     .transaction_failed_on_send(
                         relayer_id,
-                        &transaction,
+                        &failed_transaction,
                         format!(
                             "Failed to send transaction as always failing on gas estimation: {err}"
                         ),
