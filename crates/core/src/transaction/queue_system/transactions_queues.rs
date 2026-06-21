@@ -304,7 +304,7 @@ impl TransactionsQueues {
         blob_gas_price: Option<&BlobGasPriceResult>,
     ) -> Result<GasLimit, AddTransactionError> {
         // Use a reasonable temporary limit for gas estimation
-        const TEMP_GAS_LIMIT: u128 = 1_000_000;
+        const TEMP_GAS_LIMIT: u128 = 10_000_000;
         let temp_gas_limit = GasLimit::new(TEMP_GAS_LIMIT);
 
         let current_onchain_nonce = transactions_queue.get_nonce().await.map_err(|e| {
