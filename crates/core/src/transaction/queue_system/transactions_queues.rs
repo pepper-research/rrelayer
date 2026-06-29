@@ -22,6 +22,7 @@ pub enum TransactionsQueuesError {
 }
 
 use super::{
+    log_summary::summarize_rpc_error,
     start::spawn_processing_tasks_for_relayer,
     transactions_queue::TransactionsQueue,
     types::{
@@ -323,7 +324,7 @@ impl TransactionsQueues {
         )?;
 
         let estimated_gas_limit = transactions_queue
-            .estimate_gas(&temp_transaction_request, transaction.is_noop)
+            .estimate_gas(&temp_transaction_request, transaction.is_noop, Some(transaction))
             .await
             .map_err(|e| {
                 AddTransactionError::TransactionEstimateGasError(transaction.relayer_id, e)
@@ -437,12 +438,20 @@ impl TransactionsQueues {
             Err(err) => {
                 let failed_transaction =
                     Transaction { status: TransactionStatus::FAILED, ..transaction };
+                let decoded_reason = match &err {
+                    AddTransactionError::TransactionEstimateGasError(_, rpc_error) => {
+                        summarize_rpc_error(rpc_error)
+                            .map(|summary| format!("; decoded revert: {summary}"))
+                            .unwrap_or_default()
+                    }
+                    _ => String::new(),
+                };
                 self.db
                     .transaction_failed_on_send(
                         relayer_id,
                         &failed_transaction,
                         format!(
-                            "Failed to send transaction as always failing on gas estimation: {err}"
+                            "Failed to send transaction as always failing on gas estimation: {err}{decoded_reason}"
                         ),
                     )
                     .await

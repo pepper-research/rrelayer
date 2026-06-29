@@ -2,6 +2,8 @@ mod transactions_queue;
 mod transactions_queues;
 pub use transactions_queues::TransactionsQueues;
 
+mod log_summary;
+
 mod types;
 pub use types::{ReplaceTransactionResult, TransactionToSend, TransactionsQueueSetup};
 

@@ -3,11 +3,14 @@ use std::{
     sync::Arc,
 };
 
-use super::types::{
-    CompetitionResolutionResult, CompetitionType, CompetitiveTransaction, EditableTransaction,
-    MoveInmempoolTransactionToMinedError, MovePendingTransactionToInmempoolError,
-    SendTransactionGasPriceError, TransactionQueueSendTransactionError, TransactionSentWithRelayer,
-    TransactionsQueueSetup,
+use super::{
+    log_summary::{compact_rpc_error, summarize_rpc_error, transaction_context},
+    types::{
+        CompetitionResolutionResult, CompetitionType, CompetitiveTransaction, EditableTransaction,
+        MoveInmempoolTransactionToMinedError, MovePendingTransactionToInmempoolError,
+        SendTransactionGasPriceError, TransactionQueueSendTransactionError,
+        TransactionSentWithRelayer, TransactionsQueueSetup,
+    },
 };
 use crate::transaction::types::{TransactionNonce, TransactionValue};
 use crate::{
@@ -1031,26 +1034,43 @@ impl TransactionsQueue {
         &self,
         transaction_request: &TypedTransaction,
         is_noop: bool,
+        transaction: Option<&Transaction>,
     ) -> Result<GasLimit, RpcError<TransportErrorKind>> {
-        info!(
-            "Estimating gas for transaction (noop: {}) for relayer: {}",
-            is_noop, self.relayer.name
-        );
+        let tx_context =
+            transaction.map(|tx| transaction_context(tx, &self.relayer)).unwrap_or_else(|| {
+                format!(
+                    "relayer={} relayer_id={} noop={}",
+                    self.relayer.name, self.relayer.id, is_noop
+                )
+            });
 
         let estimated_gas_result = self
             .evm_provider
             .estimate_gas(transaction_request, &self.relayer.address)
             .await
             .map_err(|e| {
-                error!("Gas estimation failed for relayer {}: {:?}", self.relayer.name, e);
+                if let Some(decoded) = summarize_rpc_error(&e) {
+                    error!(
+                        "rrelayer_gas_estimate_failed {} decoded_revert=\"{}\" provider_error=\"{}\"",
+                        tx_context,
+                        decoded,
+                        compact_rpc_error(&e)
+                    );
+                } else {
+                    error!(
+                        "rrelayer_gas_estimate_failed {} provider_error=\"{}\"",
+                        tx_context,
+                        compact_rpc_error(&e)
+                    );
+                }
                 e
             })?;
 
         if !is_noop {
             let estimated_gas = estimated_gas_result * 12 / 10;
             info!(
-                "Gas estimation for relayer: {} - base: {}, with 20% buffer: {}",
-                self.relayer.name,
+                "rrelayer_gas_estimate_ok {} base_gas={} final_gas={} buffer_pct=20",
+                tx_context,
                 estimated_gas_result.into_inner(),
                 estimated_gas.into_inner()
             );
@@ -1058,8 +1078,9 @@ impl TransactionsQueue {
         }
 
         info!(
-            "Gas estimation for noop transaction for relayer: {} - {}",
-            self.relayer.name,
+            "rrelayer_gas_estimate_ok {} base_gas={} final_gas={} buffer_pct=0",
+            tx_context,
+            estimated_gas_result.into_inner(),
             estimated_gas_result.into_inner()
         );
         Ok(estimated_gas_result)
@@ -1071,11 +1092,10 @@ impl TransactionsQueue {
         transaction: &mut Transaction,
     ) -> Result<TransactionSentWithRelayer, TransactionQueueSendTransactionError> {
         info!(
-            "Preparing to send transaction {} for relayer: {} with speed {:?}",
-            transaction.id, self.relayer.name, transaction.speed
+            "rrelayer_send_prepare {} speed={:?}",
+            transaction_context(transaction, &self.relayer),
+            transaction.speed
         );
-
-        info!("Sending transaction {:?} for relayer: {}", transaction, self.relayer.name);
 
         let gas_price = self
             .compute_gas_price_for_transaction(
@@ -1086,8 +1106,8 @@ impl TransactionsQueue {
 
         if !self.within_gas_price_bounds(&gas_price) {
             info!(
-                "Transaction {} rejected - gas price too high for relayer: {}",
-                transaction.id, self.relayer.name
+                "rrelayer_send_rejected_gas_price_high {}",
+                transaction_context(transaction, &self.relayer)
             );
             return Err(TransactionQueueSendTransactionError::GasPriceTooHigh);
         }
@@ -1175,20 +1195,12 @@ impl TransactionsQueue {
         let temp_gas_limit = GasLimit::new(10_000_000);
 
         let temp_transaction_request = if working_transaction.is_7702_transaction() {
-            info!(
-                "Creating EIP-7702 transaction for gas estimation for relayer: {}",
-                self.relayer.name
-            );
             working_transaction
                 .to_eip7702_typed_transaction_with_gas_limit(Some(&gas_price), Some(temp_gas_limit))
                 .map_err(|e| {
                     TransactionQueueSendTransactionError::TransactionConversionError(e.to_string())
                 })?
         } else if working_transaction.is_blob_transaction() {
-            info!(
-                "Creating blob transaction for gas estimation for relayer: {}",
-                self.relayer.name
-            );
             let blob_gas_price = self
                 .compute_blob_gas_price_for_transaction(
                     &working_transaction.speed,
@@ -1205,20 +1217,12 @@ impl TransactionsQueue {
                     TransactionQueueSendTransactionError::TransactionConversionError(e.to_string())
                 })?
         } else if self.is_legacy_transactions() {
-            info!(
-                "Creating legacy transaction for gas estimation for relayer: {}",
-                self.relayer.name
-            );
             working_transaction
                 .to_legacy_typed_transaction_with_gas_limit(Some(&gas_price), Some(temp_gas_limit))
                 .map_err(|e| {
                     TransactionQueueSendTransactionError::TransactionConversionError(e.to_string())
                 })?
         } else {
-            info!(
-                "Creating EIP-1559 transaction for gas estimation for relayer: {}",
-                self.relayer.name
-            );
             working_transaction
                 .to_eip1559_typed_transaction_with_gas_limit(Some(&gas_price), Some(temp_gas_limit))
                 .map_err(|e| {
@@ -1229,9 +1233,13 @@ impl TransactionsQueue {
         let mut estimated_gas_limit = if let Some(gas_limit) = transaction.gas_limit {
             gas_limit
         } else {
-            self.estimate_gas(&temp_transaction_request, working_transaction.is_noop)
-                .await
-                .map_err(TransactionQueueSendTransactionError::TransactionEstimateGasError)?
+            self.estimate_gas(
+                &temp_transaction_request,
+                working_transaction.is_noop,
+                Some(&working_transaction),
+            )
+            .await
+            .map_err(TransactionQueueSendTransactionError::TransactionEstimateGasError)?
         };
 
         if self
@@ -1255,8 +1263,8 @@ impl TransactionsQueue {
             estimated_gas_limit = estimated_gas_limit + safe_overhead;
 
             info!(
-                "Applied Safe proxy gas overhead for relayer: {} - original: {}, overhead: {}, final: {}",
-                self.relayer.name,
+                "rrelayer_safe_proxy_gas_overhead {} original_gas={} overhead_gas={} final_gas={}",
+                transaction_context(&working_transaction, &self.relayer),
                 original_estimate.into_inner(),
                 safe_overhead.into_inner(),
                 estimated_gas_limit.into_inner()
@@ -1270,7 +1278,6 @@ impl TransactionsQueue {
             TypedTransaction,
             Option<BlobGasPriceResult>,
         ) = if working_transaction.is_7702_transaction() {
-            info!("Creating final EIP-7702 transaction for relayer: {}", self.relayer.name);
             let tx_request = working_transaction
                 .to_eip7702_typed_transaction_with_gas_limit(
                     Some(&gas_price),
@@ -1281,7 +1288,6 @@ impl TransactionsQueue {
                 })?;
             (tx_request, None)
         } else if working_transaction.is_blob_transaction() {
-            info!("Creating final blob transaction for relayer: {}", self.relayer.name);
             let blob_gas_price = self
                 .compute_blob_gas_price_for_transaction(
                     &working_transaction.speed,
@@ -1299,7 +1305,6 @@ impl TransactionsQueue {
                 })?;
             (tx_request, Some(blob_gas_price))
         } else if self.is_legacy_transactions() {
-            info!("Creating final legacy transaction for relayer: {}", self.relayer.name);
             let tx_request = working_transaction
                 .to_legacy_typed_transaction_with_gas_limit(
                     Some(&gas_price),
@@ -1310,7 +1315,6 @@ impl TransactionsQueue {
                 })?;
             (tx_request, None)
         } else {
-            info!("Creating final EIP-1559 transaction for relayer: {}", self.relayer.name);
             let tx_request = working_transaction
                 .to_eip1559_typed_transaction_with_gas_limit(
                     Some(&gas_price),
@@ -1321,17 +1325,7 @@ impl TransactionsQueue {
                 })?;
             (tx_request, None)
         };
-        info!(
-            "Set gas limit {} for transaction {} on relayer: {}",
-            estimated_gas_limit.into_inner(),
-            transaction.id,
-            self.relayer.name
-        );
-
-        info!(
-            "Sending transaction {:?} to network for relayer: {}",
-            transaction_request, self.relayer.name
-        );
+        info!("rrelayer_send_network {}", transaction_context(&working_transaction, &self.relayer));
 
         let transaction_hash = self
             .evm_provider
@@ -1347,15 +1341,13 @@ impl TransactionsQueue {
         };
 
         info!(
-            "Transaction {} sent successfully with hash {} for relayer: {}",
-            transaction_sent.id, transaction_sent.hash, self.relayer.name
+            "rrelayer_send_ok {} hash={} gas_limit={}",
+            transaction_context(&working_transaction, &self.relayer),
+            transaction_sent.hash,
+            estimated_gas_limit.into_inner()
         );
 
         if transaction.sent_with_gas.is_none() || transaction.is_noop {
-            info!(
-                "Updating database for sent transaction {} on relayer: {}",
-                transaction.id, self.relayer.name
-            );
             if transaction.sent_with_gas.is_none() {
                 db.transaction_sent(
                     &transaction_sent.id,
