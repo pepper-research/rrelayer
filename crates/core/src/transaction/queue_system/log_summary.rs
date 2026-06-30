@@ -53,40 +53,14 @@ pub(super) fn compact_rpc_error<E>(error: &RpcError<E>) -> String
 where
     E: Debug,
 {
-    let debug = format!("{error:?}");
-    let mut output = String::with_capacity(debug.len().min(512));
-    let bytes = debug.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if i + 2 <= bytes.len() && bytes[i] == b'0' && matches!(bytes.get(i + 1), Some(b'x' | b'X'))
-        {
-            let start = i;
-            i += 2;
-            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
-                i += 1;
-            }
-
-            let candidate = &debug[start..i];
-            if candidate.len() > 74 {
-                output.push_str(&candidate[..74]);
-                output.push_str("...");
-            } else {
-                output.push_str(candidate);
-            }
-        } else {
-            output.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-
     const MAX_LEN: usize = 900;
-    if output.len() > MAX_LEN {
-        output.truncate(MAX_LEN);
-        output.push_str("...");
+    let debug = format!("{error:?}");
+    if debug.chars().count() > MAX_LEN {
+        let truncated: String = debug.chars().take(MAX_LEN).collect();
+        format!("{truncated}...")
+    } else {
+        debug
     }
-
-    output
 }
 
 fn transaction_type(transaction: &Transaction) -> &'static str {
