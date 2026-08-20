@@ -22,32 +22,30 @@
           "protocol": "tcp"
         }
       ],
-      "environment": [
-        {
-          "name": "AWS_REGION",
-          "value": "ap-northeast-1"
-        },
-        {
-          "name": "RUST_LOG",
-          "value": "info"
-        }
-      ],
       "secrets": [
         {
-          "name": "DATABASE_URL",
-          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:314429810762:secret:rrelayer/prod/database-url-KdvnD5"
+          "name": "AWS_REGION",
+          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:314429810762:secret:rrelayer-env-MszE32:AWS_REGION::"
         },
         {
-          "name": "RRELAYER_AUTH_USERNAME",
-          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:314429810762:secret:rrelayer/prod/auth-username-BZLavP"
+          "name": "DATABASE_URL",
+          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:314429810762:secret:rrelayer-env-MszE32:DATABASE_URL::"
         },
         {
           "name": "RRELAYER_AUTH_PASSWORD",
-          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:314429810762:secret:rrelayer/prod/auth-password-G2IAa1"
+          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:314429810762:secret:rrelayer-env-MszE32:RRELAYER_AUTH_PASSWORD::"
+        },
+        {
+          "name": "RRELAYER_AUTH_USERNAME",
+          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:314429810762:secret:rrelayer-env-MszE32:RRELAYER_AUTH_USERNAME::"
         },
         {
           "name": "RRELAYER_PRIVATE_KEY",
-          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:314429810762:secret:rrelayer/prod/private-key-Mua84b"
+          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:314429810762:secret:solver-key-b4v9mo"
+        },
+        {
+          "name": "RUST_LOG",
+          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:314429810762:secret:rrelayer-env-MszE32:RUST_LOG::"
         }
       ],
       "healthCheck": {
