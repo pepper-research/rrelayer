@@ -66,11 +66,19 @@ networks:
     enable_sending_blobs: true
     allowed_random_relayers: "*"
 
-  - name: base_mainnet
+  - name: base-mainnet
     chain_id: 8453
     provider_urls:
       - https://base-mainnet.g.alchemy.com/v2/ptbizDVrFOiQ2Fz7m1GH0
-    block_explorer_url: https://basescan.org
+    block_explorer_url: https://base.blockscout.com/
+    enable_sending_blobs: true
+    allowed_random_relayers: "*"
+
+  - name: base-sepolia
+    chain_id: 84532
+    provider_urls:
+      - https://base-sepolia.g.alchemy.com/v2/ptbizDVrFOiQ2Fz7m1GH0
+    block_explorer_url: https://base-sepolia.blockscout.com/
     enable_sending_blobs: true
     allowed_random_relayers: "*"
 
