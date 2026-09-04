@@ -24,6 +24,10 @@
       ],
       "secrets": [
         {
+          "name": "ALCHEMY_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:314429810762:secret:rrelayer-env-MszE32:ALCHEMY_API_KEY::"
+        },
+        {
           "name": "AWS_REGION",
           "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:314429810762:secret:rrelayer-env-MszE32:AWS_REGION::"
         },
