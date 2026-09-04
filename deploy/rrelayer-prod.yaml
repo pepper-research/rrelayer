@@ -13,7 +13,7 @@ networks:
   - name: ethereum
     chain_id: 1
     provider_urls:
-      - https://eth-mainnet.g.alchemy.com/v2/ptbizDVrFOiQ2Fz7m1GH0
+      - https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
     block_explorer_url: https://etherscan.io
     enable_sending_blobs: true
     allowed_random_relayers: "*"
@@ -21,7 +21,7 @@ networks:
   - name: bsc
     chain_id: 56
     provider_urls:
-      - https://bnb-mainnet.g.alchemy.com/v2/ptbizDVrFOiQ2Fz7m1GH0
+      - https://bnb-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
     block_explorer_url: https://bscscan.com
     enable_sending_blobs: true
     allowed_random_relayers: "*"
@@ -29,7 +29,7 @@ networks:
   - name: polygon
     chain_id: 137
     provider_urls:
-      - https://polygon-mainnet.g.alchemy.com/v2/ptbizDVrFOiQ2Fz7m1GH0
+      - https://polygon-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
     block_explorer_url: https://polygon.blockscout.com
     enable_sending_blobs: true
     allowed_random_relayers: "*"
@@ -37,7 +37,7 @@ networks:
   - name: monad
     chain_id: 143
     provider_urls:
-      - https://monad-mainnet.g.alchemy.com/v2/ptbizDVrFOiQ2Fz7m1GH0
+      - https://monad-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
     block_explorer_url: https://monadscan.com
     enable_sending_blobs: true
     allowed_random_relayers: "*"
@@ -45,7 +45,7 @@ networks:
   - name: citrea_mainnet
     chain_id: 4114
     provider_urls:
-      - https://citrea-mainnet.g.alchemy.com/v2/ptbizDVrFOiQ2Fz7m1GH0
+      - https://citrea-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
     block_explorer_url: https://explorer.mainnet.citrea.xyz
     enable_sending_blobs: true
     allowed_random_relayers: "*"
@@ -53,7 +53,7 @@ networks:
   - name: robinhood
     chain_id: 4663
     provider_urls:
-      - https://robinhood-mainnet.g.alchemy.com/v2/ptbizDVrFOiQ2Fz7m1GH0
+      - https://robinhood-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
     block_explorer_url: https://robinhoodchain.blockscout.com
     enable_sending_blobs: true
     allowed_random_relayers: "*"
@@ -61,7 +61,7 @@ networks:
   - name: arbitrum_one
     chain_id: 42161
     provider_urls:
-      - https://arb-mainnet.g.alchemy.com/v2/ptbizDVrFOiQ2Fz7m1GH0
+      - https://arb-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
     block_explorer_url: https://arbiscan.io
     enable_sending_blobs: true
     allowed_random_relayers: "*"
@@ -69,7 +69,7 @@ networks:
   - name: base-mainnet
     chain_id: 8453
     provider_urls:
-      - https://base-mainnet.g.alchemy.com/v2/ptbizDVrFOiQ2Fz7m1GH0
+      - https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
     block_explorer_url: https://base.blockscout.com/
     enable_sending_blobs: true
     allowed_random_relayers: "*"
@@ -77,7 +77,7 @@ networks:
   - name: base-sepolia
     chain_id: 84532
     provider_urls:
-      - https://base-sepolia.g.alchemy.com/v2/ptbizDVrFOiQ2Fz7m1GH0
+      - https://base-sepolia.g.alchemy.com/v2/${ALCHEMY_API_KEY}
     block_explorer_url: https://base-sepolia.blockscout.com/
     enable_sending_blobs: true
     allowed_random_relayers: "*"
@@ -85,7 +85,7 @@ networks:
   - name: robinhood-testnet
     chain_id: 46630
     provider_urls:
-      - https://robinhood-testnet.g.alchemy.com/v2/ptbizDVrFOiQ2Fz7m1GH0
+      - https://robinhood-testnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
     block_explorer_url: https://explorer.testnet.chain.robinhood.com/
     enable_sending_blobs: true
     allowed_random_relayers: "*"
