@@ -38,3 +38,10 @@ jobs:
           RRELAYER_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:5432/rrelayer_rep503
           RRELAYER_BIN: ${{ github.workspace }}/target/debug/rrelayer_cli
         run: bun scripts/test-idempotent-submission.mjs
+      - name: Preserve fixture process diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: idempotent-submission-process-logs
+          path: /tmp/rrelayer-idempotence-*/process-*.log
+          if-no-files-found: ignore

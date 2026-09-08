@@ -2,7 +2,7 @@
 // No Docker, broad process kills, real chain RPCs, or production keys are used.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, writeFile, open } from "node:fs/promises";
+import { mkdtemp, writeFile, open, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
@@ -19,6 +19,7 @@ const binary = process.env.RRELAYER_BIN;
 assert(binary, "Set RRELAYER_BIN to the built server binary");
 const fixture = await mkdtemp(join(tmpdir(), "rrelayer-idempotence-"));
 const children = new Set();
+const processLogs = [];
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function port() {
   const server = createServer();
@@ -28,7 +29,9 @@ async function port() {
   return value;
 }
 async function start(command, args, env = {}) {
-  const log = await open(join(fixture, `process-${children.size}.log`), "a");
+  const path = join(fixture, `process-${processLogs.length}.log`);
+  processLogs.push(path);
+  const log = await open(path, "a");
   const child = spawn(command, args, {
     env: { ...process.env, ...env },
     stdio: ["ignore", log.fd, log.fd],
@@ -106,7 +109,7 @@ try {
   await until(() => rpc("eth_chainId", []));
   await writeFile(
     join(fixture, "rrelayer.yaml"),
-    `name: idempotent-fixture\napi_config:\n  port: ${apiPort}\n  authentication_username: rep503\n  authentication_password: fixture-only\nsigning_provider:\n  raw:\n    mnemonic: test test test test test test test test test test test junk\nnetworks:\n  - name: local\n    chain_id: 31337\n    provider_urls:\n      - http://127.0.0.1:${rpcPort}\n    allowed_random_relayers: '*'\n`,
+    `name: idempotent-fixture\napi_config:\n  host: 127.0.0.1\n  port: ${apiPort}\n  authentication_username: rep503\n  authentication_password: fixture-only\nsigning_provider:\n  raw:\n    mnemonic: test test test test test test test test test test test junk\nnetworks:\n  - name: local\n    chain_id: 31337\n    provider_urls:\n      - http://127.0.0.1:${rpcPort}\n    allowed_random_relayers: '*'\n`,
   );
   const env = {
     DATABASE_URL: database,
@@ -229,6 +232,14 @@ try {
   console.log(
     "PASS: 12 concurrent submissions across two server processes, repeated acceptance, process restart, payload mismatch, auth; one native transfer",
   );
+} catch (error) {
+  // Only task-owned processes and public local fixture identities reach these logs.
+  for (const path of processLogs) {
+    console.error(
+      `Process diagnostic ${path}:\n${(await readFile(path, "utf8")).slice(-8000)}`,
+    );
+  }
+  throw error;
 } finally {
   await Promise.all([...children].map(stop));
   // Logs stay with the fixture if a test fails; they contain only public local test identities.
