@@ -20,6 +20,7 @@ mod get_transactions_pending_count;
 mod replace_transaction;
 mod send_transaction;
 pub use send_transaction::{RelayTransactionRequest, SendTransactionResult};
+mod send_idempotent_transaction;
 mod send_random_transaction;
 mod types;
 pub use types::TransactionSpeed;
@@ -38,6 +39,10 @@ pub fn create_transactions_routes() -> Router<Arc<AppState>> {
         .route(
             "/relayers/:chain_id/send-random",
             post(send_random_transaction::send_transaction_random),
+        )
+        .route(
+            "/relayers/:chain_id/send-idempotent",
+            post(send_idempotent_transaction::send_idempotent_transaction),
         )
         .route("/replace/:transaction_id", put(replace_transaction::replace_transaction))
         .route("/cancel/:transaction_id", put(cancel_transaction::cancel_transaction))

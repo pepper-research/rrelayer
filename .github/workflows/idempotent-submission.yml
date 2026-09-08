@@ -1,0 +1,40 @@
+name: Idempotent submission regression
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: rrelayer_rep503
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: foundry-rs/foundry-toolchain@v1
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - run: cargo build -p rrelayer_cli
+      - name: Exercise two servers and process restart
+        env:
+          RRELAYER_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:5432/rrelayer_rep503
+          RRELAYER_BIN: ${{ github.workspace }}/target/debug/rrelayer_cli
+        run: bun scripts/test-idempotent-submission.mjs

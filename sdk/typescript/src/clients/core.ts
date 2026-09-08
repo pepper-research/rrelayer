@@ -22,6 +22,7 @@ import {
   getNetwork,
   TransactionToSend,
   sendTransactionRandom,
+  sendTransactionIdempotent,
   TransactionSent,
 } from '../api';
 import { RelayerClient } from './relayer';
@@ -102,7 +103,13 @@ export class Client {
         keyId: string,
         address: string
       ): Promise<ImportRelayerResult> => {
-        return importRelayer(chainId, name, keyId, address, this._apiBaseConfig);
+        return importRelayer(
+          chainId,
+          name,
+          keyId,
+          address,
+          this._apiBaseConfig
+        );
       },
       /**
        * Delete a relayer
@@ -194,6 +201,18 @@ export class Client {
         rateLimitKey?: string | undefined
       ): Promise<TransactionSent> => {
         return sendTransactionRandom(
+          chainId,
+          transaction,
+          rateLimitKey,
+          this._apiBaseConfig
+        );
+      },
+      sendIdempotent: (
+        chainId: number,
+        transaction: TransactionToSend & { externalId: string },
+        rateLimitKey?: string | undefined
+      ): Promise<TransactionSent> => {
+        return sendTransactionIdempotent(
           chainId,
           transaction,
           rateLimitKey,

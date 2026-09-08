@@ -225,6 +225,14 @@ impl<'a> ClientTransactionApi<'a> {
     ) -> ApiResult<SendTransactionResult> {
         self.transaction_api.send_random(chain_id, transaction, rate_limit_key).await
     }
+    pub async fn send_idempotent(
+        &self,
+        chain_id: u64,
+        transaction: &RelayTransactionRequest,
+        rate_limit_key: Option<String>,
+    ) -> ApiResult<SendTransactionResult> {
+        self.transaction_api.send_idempotent(chain_id, transaction, rate_limit_key).await
+    }
 
     pub async fn wait_for_transaction_receipt_by_id(
         &self,

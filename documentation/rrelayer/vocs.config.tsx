@@ -449,6 +449,10 @@ export default defineConfig({
                       link: '/integration/sdk/transactions/node#send-transaction',
                     },
                     {
+                      text: 'Retry a Keyed Submission',
+                      link: '/integration/sdk/transactions/node#retry-a-keyed-submission',
+                    },
+                    {
                       text: 'Get Transaction',
                       link: '/integration/sdk/transactions/node#get-transaction',
                     },
@@ -478,6 +482,10 @@ export default defineConfig({
                     {
                       text: 'Send Transaction',
                       link: '/integration/sdk/transactions/rust#send-transaction',
+                    },
+                    {
+                      text: 'Retry a Keyed Submission',
+                      link: '/integration/sdk/transactions/rust#retry-a-keyed-submission',
                     },
                     {
                       text: 'Get Transaction',
@@ -713,6 +721,10 @@ export default defineConfig({
                 {
                   text: 'Send Transaction',
                   link: '/integration/api/transactions#send-transaction',
+                },
+                {
+                  text: 'Retry a Keyed Submission',
+                  link: '/integration/api/transactions#retry-a-keyed-submission',
                 },
                 {
                   text: 'Get Transaction',
