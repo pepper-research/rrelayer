@@ -1646,3 +1646,12 @@ async fn example() -> Result<()> {
     Ok(())
 }
 ```
+
+## Retry a keyed submission
+
+Use `send_idempotent` with a UUID saved before the first send. Repeat the identical payload after a timeout or restart; the server returns the original transaction instead of sending another one. Inspect terminal failures rather than changing the key automatically. This needs a server with the dedicated idempotent endpoint; never fall back to `send-random`.
+
+```rust
+// Set request.external_id to the persisted UUID first.
+client.transaction().send_idempotent(chain_id, &request, None).await?;
+```

@@ -1018,3 +1018,11 @@ let pending_queue_count = await relayerClient.transaction.getCount(TransactionCo
 // returns a number
 let inmempool_queue_count = await relayerClient.transaction.getCount(TransactionCountType.INMEMPOOL);
 ```
+
+## Retry a keyed submission
+
+Use `sendIdempotent` with a UUID saved before the first send. Repeat the identical payload after a timeout or restart; the server returns the original transaction instead of sending another one. Inspect terminal failures rather than changing the key automatically. This needs a server with the dedicated idempotent endpoint; never fall back to `send-random`.
+
+```typescript
+await client.transaction.sendIdempotent(chainId, { ...request, externalId: persistedUuid });
+```

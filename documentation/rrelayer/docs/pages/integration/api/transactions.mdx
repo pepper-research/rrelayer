@@ -598,3 +598,11 @@ curl -X POST https://your-rrelayer.com/transactions/relayers/0x742d35.../send \
   -H "Content-Type: application/json" \
   -d '{"to": "0x...", "value": "1000000000000000000"}'
 ```
+
+## Retry a keyed submission
+
+`POST /transactions/relayers/{chain_id}/send-idempotent` accepts the same request as `send-random`, with a required UUID `externalId`. Persist the UUID and payload before sending. After a lost response, repeat the same request: it returns the original transaction ID and current hash without allocating another transaction. Different chain, destination, value or calldata under the same UUID is rejected. Blob requests are rejected.
+
+Authentication, relayer permissions and rate limits for new sends match `send-random`. Replays authorize against the original relayer. A failed, cancelled, replaced or expired transaction is not recreated; inspect its status. Use a new UUID only for an intentionally new operation. Keep the database's transaction and audit records for as long as callers may retry.
+
+This endpoint is additive. Existing `send-random` external IDs remain correlation labels and are **not** idempotency keys. Clients must use the dedicated endpoint and must not fall back when an older server returns 404.
