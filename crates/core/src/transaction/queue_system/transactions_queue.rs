@@ -1066,13 +1066,15 @@ impl TransactionsQueue {
                 e
             })?;
 
+        let block_gas_limit = self.evm_provider.block_gas_limit().await?;
+        let estimated_gas = bounded_gas_estimate(estimated_gas_result, block_gas_limit, is_noop)?;
         if !is_noop {
-            let estimated_gas = estimated_gas_result * 12 / 10;
             info!(
-                "rrelayer_gas_estimate_ok {} base_gas={} final_gas={} buffer_pct=20",
+                "rrelayer_gas_estimate_ok {} base_gas={} final_gas={} max_buffer_pct=20 block_gas_limit={}",
                 tx_context,
                 estimated_gas_result.into_inner(),
-                estimated_gas.into_inner()
+                estimated_gas.into_inner(),
+                block_gas_limit.into_inner()
             );
             return Ok(estimated_gas);
         }
@@ -1191,8 +1193,11 @@ impl TransactionsQueue {
             working_transaction.value = TransactionValue::zero();
         }
 
-        // Estimate gas limit by creating a temporary transaction with a high gas limit to avoid failing the estimate
-        let temp_gas_limit = GasLimit::new(10_000_000);
+        // Validate again at send time: persisted estimates can predate this limit or this code.
+        let block_gas_limit = self.evm_provider.block_gas_limit().await.map_err(|error| {
+            TransactionQueueSendTransactionError::TransactionSendError(error.into())
+        })?;
+        let temp_gas_limit = block_gas_limit;
 
         let temp_transaction_request = if working_transaction.is_7702_transaction() {
             working_transaction
@@ -1230,17 +1235,17 @@ impl TransactionsQueue {
                 })?
         };
 
-        let mut estimated_gas_limit = if let Some(gas_limit) = transaction.gas_limit {
-            gas_limit
-        } else {
+        let mut estimated_gas_limit = gas_limit_for_send(
+            transaction.gas_limit,
+            block_gas_limit,
             self.estimate_gas(
                 &temp_transaction_request,
                 working_transaction.is_noop,
                 Some(&working_transaction),
-            )
-            .await
-            .map_err(TransactionQueueSendTransactionError::TransactionEstimateGasError)?
-        };
+            ),
+        )
+        .await
+        .map_err(TransactionQueueSendTransactionError::TransactionEstimateGasError)?;
 
         if self
             .safe_proxy_manager
@@ -1271,6 +1276,8 @@ impl TransactionsQueue {
             );
         }
 
+        // Safe overhead is optional headroom too; it must not invalidate a valid estimate.
+        estimated_gas_limit = std::cmp::min(estimated_gas_limit, block_gas_limit);
         working_transaction.gas_limit = Some(estimated_gas_limit);
         transaction.gas_limit = Some(estimated_gas_limit);
 
@@ -1436,5 +1443,106 @@ impl TransactionsQueue {
                 transaction.nonce = new_nonce;
             }
         }
+    }
+}
+
+// Re-estimate oversized stored limits instead of resending them or blindly lowering them.
+// Keep valid caller-supplied limits and avoid an unnecessary RPC on ordinary retries.
+async fn gas_limit_for_send(
+    stored: Option<GasLimit>,
+    block_limit: GasLimit,
+    estimate: impl std::future::Future<Output = Result<GasLimit, RpcError<TransportErrorKind>>>,
+) -> Result<GasLimit, RpcError<TransportErrorKind>> {
+    if let Some(limit) = stored.filter(|limit| *limit <= block_limit) {
+        return Ok(limit);
+    }
+    estimate.await
+}
+
+// Only trim optional headroom. An estimate that itself exceeds the block limit must fail.
+fn bounded_gas_estimate(
+    estimate: GasLimit,
+    block_limit: GasLimit,
+    is_noop: bool,
+) -> Result<GasLimit, RpcError<TransportErrorKind>> {
+    if estimate > block_limit {
+        return Err(RpcError::Transport(TransportErrorKind::Custom(
+            "Estimated gas exceeds the current block gas limit".to_string().into(),
+        )));
+    }
+    Ok(if is_noop { estimate } else { std::cmp::min(estimate * 12 / 10, block_limit) })
+}
+
+#[cfg(test)]
+mod gas_limit_tests {
+    use super::*;
+
+    #[test]
+    fn citrea_buffer_cannot_exceed_block_limit() {
+        assert_eq!(
+            bounded_gas_estimate(GasLimit::new(8_572_950), GasLimit::new(10_000_000), false)
+                .unwrap(),
+            GasLimit::new(10_000_000)
+        );
+    }
+
+    #[test]
+    fn ordinary_estimate_keeps_twenty_percent_headroom() {
+        assert_eq!(
+            bounded_gas_estimate(GasLimit::new(4_897_200), GasLimit::new(10_000_000), false)
+                .unwrap(),
+            GasLimit::new(5_876_640)
+        );
+    }
+
+    #[test]
+    fn cannot_hide_an_estimate_above_the_limit() {
+        assert!(bounded_gas_estimate(GasLimit::new(10_000_001), GasLimit::new(10_000_000), false)
+            .is_err());
+    }
+
+    #[test]
+    fn noop_does_not_add_headroom() {
+        assert_eq!(
+            bounded_gas_estimate(GasLimit::new(21_000), GasLimit::new(10_000_000), true).unwrap(),
+            GasLimit::new(21_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_oversized_limit_is_reestimated_before_send() {
+        let limit =
+            gas_limit_for_send(Some(GasLimit::new(10_287_540)), GasLimit::new(10_000_000), async {
+                bounded_gas_estimate(GasLimit::new(4_897_200), GasLimit::new(10_000_000), false)
+            })
+            .await
+            .unwrap();
+        assert_eq!(limit, GasLimit::new(5_876_640));
+    }
+
+    #[tokio::test]
+    async fn valid_persisted_limit_is_preserved_without_reestimation() {
+        let limit =
+            gas_limit_for_send(Some(GasLimit::new(10_000_000)), GasLimit::new(10_000_000), async {
+                panic!("valid stored limit must not trigger estimation")
+            })
+            .await
+            .unwrap();
+        assert_eq!(limit, GasLimit::new(10_000_000));
+    }
+
+    #[tokio::test]
+    async fn failed_reestimation_does_not_reuse_invalid_stored_limit() {
+        assert!(gas_limit_for_send(
+            Some(GasLimit::new(10_287_540)),
+            GasLimit::new(10_000_000),
+            async {
+                Err(RpcError::Transport(TransportErrorKind::Custom(
+                    "execution reverted".to_string().into(),
+                )))
+            },
+        )
+        .await
+        .is_err());
     }
 }
