@@ -430,6 +430,16 @@ impl EvmProvider {
             .await
     }
 
+    pub async fn block_gas_limit(&self) -> Result<GasLimit, RpcError<TransportErrorKind>> {
+        let block =
+            self.rpc_client().get_block(BlockId::Number(BlockNumberOrTag::Latest)).await?.ok_or(
+                RpcError::Transport(TransportErrorKind::Custom(
+                    "Latest block unavailable for gas limit validation".to_string().into(),
+                )),
+            )?;
+        Ok(GasLimit::from(block.header.gas_limit))
+    }
+
     pub async fn estimate_gas(
         &self,
         transaction: &TypedTransaction,
