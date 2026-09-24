@@ -46,7 +46,7 @@ use reqwest::Url;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 pub type RelayerProvider = Box<dyn Provider<AnyNetwork> + Send + Sync>;
 
@@ -395,9 +395,22 @@ impl EvmProvider {
         let provider = self.rpc_client();
         let tx_bytes = tx_envelope.encoded_2718();
 
-        let receipt = provider.send_raw_transaction(&tx_bytes).await?;
+        let error = match provider.send_raw_transaction(&tx_bytes).await {
+            Ok(pending) => return Ok(TransactionHash::from_alloy_hash(pending.tx_hash())),
+            Err(error) => error,
+        };
 
-        Ok(TransactionHash::from_alloy_hash(receipt.tx_hash()))
+        // A node can reject this exact signed transaction ("nonce too low", "already known")
+        // after it has already accepted it. If the node knows this hash, the send succeeded.
+        // Returning the error makes the queue re-send the payload at a new nonce, putting it
+        // on-chain twice.
+        let tx_hash = *tx_envelope.tx_hash();
+        if let Ok(Some(_)) = provider.get_transaction_by_hash(tx_hash).await {
+            warn!("rrelayer_send_already_known hash={} provider_error=\"{}\"", tx_hash, error);
+            return Ok(TransactionHash::from_alloy_hash(&tx_hash));
+        }
+
+        Err(error.into())
     }
 
     pub async fn sign_transaction(
@@ -516,5 +529,88 @@ impl EvmProvider {
 
     pub fn supports_blobs(&self) -> bool {
         self.wallet_manager.supports_blobs()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gas::CustomGasFeeEstimator;
+    use crate::relayer::RelayerId;
+    use alloy::consensus::TxEip1559;
+    use alloy::primitives::{address, TxKind, U256};
+    use std::process::{Child, Command};
+
+    struct Anvil(Child);
+
+    impl Drop for Anvil {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+        }
+    }
+
+    // Run with: cargo test -p rrelayer_core -- --ignored
+    #[tokio::test]
+    #[ignore = "requires anvil on PATH"]
+    async fn resending_a_mined_transaction_returns_its_hash() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let _anvil = Anvil(
+            Command::new("anvil")
+                .args(["--port", &port.to_string(), "--silent"])
+                .spawn()
+                .expect("anvil on PATH"),
+        );
+        for _ in 0..50 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let config: NetworkSetupConfig = serde_yaml::from_str(&format!(
+            "name: anvil\nchain_id: 31337\nprovider_urls: [\"http://127.0.0.1:{port}\"]"
+        ))
+        .unwrap();
+        let unused_gas_estimator = Arc::new(CustomGasFeeEstimator {
+            endpoint: String::new(),
+            supported_chains: vec![],
+            auth_header: None,
+        });
+        let provider = EvmProvider::new_with_mnemonic(
+            &config,
+            "test test test test test test test test test test test junk",
+            unused_gas_estimator,
+        )
+        .await
+        .unwrap();
+        let relayer = Relayer {
+            id: RelayerId::new(),
+            name: "anvil".to_string(),
+            chain_id: ChainId::new(31337),
+            cloned_from_chain_id: None,
+            address: provider.get_address(0).await.unwrap(),
+            wallet_index: 0,
+            max_gas_price: None,
+            paused: false,
+            eip_1559_enabled: true,
+            created_at: chrono::Utc::now(),
+            is_private_key: false,
+        };
+        let transaction = TypedTransaction::Eip1559(TxEip1559 {
+            chain_id: 31337,
+            nonce: 0,
+            gas_limit: 21_000,
+            max_fee_per_gas: 10_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(address!("000000000000000000000000000000000000dead")),
+            value: U256::from(1),
+            ..Default::default()
+        });
+
+        let sent = provider.send_transaction(&relayer, transaction.clone()).await.unwrap();
+        // anvil mines on receipt, so the node now answers this exact resend with "nonce too low"
+        let resent = provider.send_transaction(&relayer, transaction).await.unwrap();
+
+        assert_eq!(resent, sent);
     }
 }
