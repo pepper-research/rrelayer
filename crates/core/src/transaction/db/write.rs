@@ -54,6 +54,16 @@ impl PostgresClient {
                 .await?;
         }
 
+        // Only new admissions are proven unbroadcast. Legacy inserts keep the safe default.
+        if transaction.status == TransactionStatus::PENDING {
+            trans
+                .execute(
+                    "UPDATE relayer.transaction SET broadcast_attempted = FALSE WHERE id = $1",
+                    &[&transaction.id],
+                )
+                .await?;
+        }
+
         trans.commit().await?;
 
         Ok(())
@@ -488,6 +498,15 @@ impl PostgresClient {
         Ok(())
     }
 
+    /// Monotonic intent marker: absence of a send response never proves no broadcast.
+    pub async fn transaction_mark_broadcast_attempted(
+        &self,
+        id: &TransactionId,
+    ) -> Result<(), PostgresError> {
+        self.pool.get().await?.query_one("UPDATE relayer.transaction SET broadcast_attempted = TRUE WHERE id = $1 RETURNING id", &[id]).await?;
+        Ok(())
+    }
+
     /// Records the hash of a signed payload whose broadcast outcome is unknown (the
     /// transaction row stays PENDING). Restores the ability to recognise the broadcast
     /// as our own if it mines, even across a restart.
@@ -578,6 +597,22 @@ impl PostgresClient {
     }
 
     pub async fn transaction_update(&self, transaction: &Transaction) -> Result<(), PostgresError> {
+        self.transaction_update_if_unbroadcast(transaction, false).await.map(|_| ())
+    }
+
+    /// Atomically reject edits once a broadcast was attempted, including after restart.
+    pub async fn transaction_replace_unbroadcast(
+        &self,
+        transaction: &Transaction,
+    ) -> Result<bool, PostgresError> {
+        self.transaction_update_if_unbroadcast(transaction, true).await
+    }
+
+    async fn transaction_update_if_unbroadcast(
+        &self,
+        transaction: &Transaction,
+        require_unbroadcast: bool,
+    ) -> Result<bool, PostgresError> {
         let mut conn = self.pool.get().await?;
         let trans = conn.transaction().await.map_err(PostgresError::PgError)?;
 
@@ -596,7 +631,7 @@ impl PostgresClient {
             .as_ref()
             .map(|reason| reason.chars().take(2000).collect::<String>());
 
-        trans
+        let updated = trans
             .execute(
                 "
                     UPDATE relayer.transaction
@@ -625,7 +660,7 @@ impl PostgresClient {
                         blobs = $24,
                         failed_reason = $25,
                         failed_at = CASE WHEN $25::TEXT IS NULL THEN failed_at ELSE NOW() END
-                    WHERE id = $1
+                    WHERE id = $1 AND (NOT $26 OR NOT broadcast_attempted)
                 ",
                 &[
                     &transaction.id,
@@ -653,10 +688,15 @@ impl PostgresClient {
                     &transaction.cancelled_by_transaction_id,
                     &transaction.blobs,
                     &truncated_failed_reason,
+                    &require_unbroadcast,
                 ],
             )
             .await
             .map_err(PostgresError::PgError)?;
+
+        if updated == 0 {
+            return Ok(false);
+        }
 
         trans
             .execute(
@@ -683,6 +723,6 @@ impl PostgresClient {
             .map_err(PostgresError::PgError)?;
 
         trans.commit().await.map_err(PostgresError::PgError)?;
-        Ok(())
+        Ok(true)
     }
 }

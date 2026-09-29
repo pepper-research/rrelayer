@@ -772,6 +772,19 @@ impl TransactionsQueues {
                     EditableTransactionType::Pending => {
                         let original_transaction = result.transaction.clone();
                         self.transaction_replace(&mut result.transaction, replace_with);
+                        // This hash signed the old payload. Clear it only if the durable
+                        // conditional update proves no broadcast has ever been attempted.
+                        result.transaction.known_transaction_hash = None;
+                        if !self.db.transaction_replace_unbroadcast(&result.transaction).await? {
+                            return Err(ReplaceTransactionError::BroadcastAlreadyAttempted(
+                                transaction.id,
+                            ));
+                        }
+                        // The same queue lock serializes replacement with the sender's
+                        // pre-broadcast DB write and RPC, so it cannot send the old clone.
+                        transactions_queue
+                            .update_pending_transaction(result.transaction.clone())
+                            .await;
                         self.invalidate_transaction_cache(&transaction.id).await;
 
                         if let Some(webhook_manager) = &self.webhook_manager {
