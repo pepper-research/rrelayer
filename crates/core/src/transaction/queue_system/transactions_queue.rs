@@ -1668,6 +1668,16 @@ impl TransactionsQueue {
 
         let attempt_hash = Self::signed_transaction_hash(&transaction_request, signature);
 
+        // The queue lock also covers replacement. Commit the irreversible-attempt
+        // boundary before RPC; a failed write must prevent broadcast entirely.
+        // Keep known-hash recovery unchanged: rejected retries must not overwrite
+        // the hash of an earlier possibly accepted payload.
+        let is_queued =
+            self.pending_transactions.lock().await.iter().any(|tx| tx.id == transaction.id);
+        if is_queued {
+            db.transaction_mark_broadcast_attempted(&transaction.id).await?;
+        }
+
         let transaction_hash =
             match self.evm_provider.send_signed_transaction(transaction_request, signature).await {
                 Ok(hash) => hash,

@@ -18,6 +18,9 @@ use crate::{
 
 #[derive(Error, Debug)]
 pub enum ReplaceTransactionError {
+    #[error("Transaction {0} has already attempted broadcast; wait for its state to resolve before replacing")]
+    BroadcastAlreadyAttempted(TransactionId),
+
     #[error("Send transaction error: {0}")]
     SendTransactionError(#[from] TransactionQueueSendTransactionError),
 
@@ -39,7 +42,11 @@ pub enum ReplaceTransactionError {
 
 impl From<ReplaceTransactionError> for HttpError {
     fn from(value: ReplaceTransactionError) -> Self {
-        if matches!(value, ReplaceTransactionError::TransactionNotFound(_)) {
+        if matches!(
+            value,
+            ReplaceTransactionError::TransactionNotFound(_)
+                | ReplaceTransactionError::BroadcastAlreadyAttempted(_)
+        ) {
             return bad_request(value.to_string());
         }
 
