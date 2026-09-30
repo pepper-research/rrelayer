@@ -1207,6 +1207,7 @@ impl TransactionsQueues {
                                             new_nonce,
                                         )
                                         .await;
+                                    transactions_queue.move_next_pending_to_back().await;
 
                                     if let Err(db_error) = self
                                         .db
