@@ -38,7 +38,7 @@ use alloy::{
     hex,
     transports::{RpcError, TransportErrorKind},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use tracing::info;
 use tracing::{error, warn};
@@ -47,6 +47,8 @@ pub struct TransactionsQueue {
     pending_transactions: Mutex<VecDeque<Transaction>>,
     inmempool_transactions: Mutex<VecDeque<CompetitiveTransaction>>,
     mined_transactions: Mutex<HashMap<TransactionId, Transaction>>,
+    /// When a gas bump of each in-mempool transaction was first rejected for a used nonce.
+    nonce_used_since: Mutex<HashMap<TransactionId, DateTime<Utc>>>,
     evm_provider: EvmProvider,
     relayer: Relayer,
     pub nonce_manager: NonceManager,
@@ -73,6 +75,7 @@ impl TransactionsQueue {
             pending_transactions: Mutex::new(setup.pending_transactions),
             inmempool_transactions: Mutex::new(setup.inmempool_transactions),
             mined_transactions: Mutex::new(setup.mined_transactions),
+            nonce_used_since: Mutex::new(HashMap::new()),
             evm_provider: setup.evm_provider,
             relayer: setup.relayer,
             nonce_manager: setup.nonce_manager,
@@ -1443,6 +1446,16 @@ impl TransactionsQueue {
         self.evm_provider.get_mined_nonce_from_address(&self.relay_address()).await
     }
 
+    /// When a gas bump of `transaction_id` was first rejected because its nonce is used. The first
+    /// call records now.
+    pub async fn nonce_used_since(&self, transaction_id: &TransactionId) -> DateTime<Utc> {
+        *self.nonce_used_since.lock().await.entry(*transaction_id).or_insert_with(Utc::now)
+    }
+
+    pub async fn forget_nonce_used(&self, transaction_id: &TransactionId) {
+        self.nonce_used_since.lock().await.remove(transaction_id);
+    }
+
     /// Removes the in-mempool head if it is `transaction_id` and no cancel or replace competes
     /// for its nonce. Returns whether it was removed.
     pub async fn remove_inmempool_head_without_competitor(
@@ -1468,10 +1481,15 @@ impl TransactionsQueue {
     /// mined-but-unconfirmed transaction, and `highest_used` (the persisted high-water mark, which
     /// also covers confirmed transactions). A single lagging RPC read therefore cannot pull the
     /// queue down onto used nonces.
+    ///
+    /// With `lower_only` (after "nonce too high") nonces can only need to come down. A start above
+    /// the head contradicts the node's rejection, and the head may already have been broadcast, so
+    /// nothing moves.
     /// Returns the transactions whose nonce changed, for the caller to persist.
     pub async fn resync_pending_nonces(
         &self,
         highest_used: Option<TransactionNonce>,
+        lower_only: bool,
     ) -> Result<Vec<(TransactionId, TransactionNonce)>, RpcError<TransportErrorKind>> {
         let mut next = self.get_nonce().await?.into_inner();
         if let Some(highest_used) = highest_used {
@@ -1484,8 +1502,13 @@ impl TransactionsQueue {
             next = next.max(mined.nonce.into_inner() + 1);
         }
 
+        let mut pending = self.pending_transactions.lock().await;
+        if lower_only && pending.front().is_some_and(|head| next > head.nonce.into_inner()) {
+            return Ok(Vec::new());
+        }
+
         let mut changed = Vec::new();
-        for transaction in self.pending_transactions.lock().await.iter_mut() {
+        for transaction in pending.iter_mut() {
             let nonce = TransactionNonce::new(next);
             if transaction.nonce != nonce {
                 transaction.nonce = nonce;
@@ -1687,7 +1710,7 @@ mod nonce_resync_tests {
         // 4394-4399 waited behind it, so every send of the head was "nonce too high".
         let (_anvil, queue) = queue(&[6, 0, 1, 2, 3, 4, 5], &[], &[], 7).await;
 
-        let changed = queue.resync_pending_nonces(None).await.unwrap();
+        let changed = queue.resync_pending_nonces(None, false).await.unwrap();
 
         assert_eq!(pending_nonces(&queue).await, vec![0, 1, 2, 3, 4, 5, 6]);
         assert_eq!(changed.len(), 7);
@@ -1701,7 +1724,7 @@ mod nonce_resync_tests {
         // cancelled transaction or a restart that reloaded stale nonces.
         let (_anvil, queue) = queue(&[5], &[0], &[], 6).await;
 
-        queue.resync_pending_nonces(None).await.unwrap();
+        queue.resync_pending_nonces(None, false).await.unwrap();
 
         assert_eq!(pending_nonces(&queue).await, vec![1]);
         assert_eq!(queue.nonce_manager.get_current_nonce().await.into_inner(), 2);
@@ -1712,7 +1735,7 @@ mod nonce_resync_tests {
     async fn an_ordered_queue_is_left_alone() {
         let (_anvil, queue) = queue(&[0, 1, 2], &[], &[], 3).await;
 
-        let changed = queue.resync_pending_nonces(None).await.unwrap();
+        let changed = queue.resync_pending_nonces(None, false).await.unwrap();
 
         assert!(changed.is_empty());
         assert_eq!(pending_nonces(&queue).await, vec![0, 1, 2]);
@@ -1725,12 +1748,40 @@ mod nonce_resync_tests {
         // persisted high-water mark says 7 was used.
         let (_anvil, queue) = queue(&[1, 2], &[], &[3], 3).await;
 
-        queue.resync_pending_nonces(None).await.unwrap();
+        queue.resync_pending_nonces(None, false).await.unwrap();
         assert_eq!(pending_nonces(&queue).await, vec![4, 5]);
 
-        queue.resync_pending_nonces(Some(TransactionNonce::new(7))).await.unwrap();
+        queue.resync_pending_nonces(Some(TransactionNonce::new(7)), false).await.unwrap();
         assert_eq!(pending_nonces(&queue).await, vec![8, 9]);
         assert_eq!(queue.nonce_manager.get_current_nonce().await.into_inner(), 10);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires anvil on PATH"]
+    async fn a_nonce_too_high_resync_never_raises_the_head() {
+        // A read showing nonce 6 used contradicts "nonce too high" for a head at 5, and the head
+        // may already have been broadcast at 5.
+        let (_anvil, queue) = queue(&[5, 6], &[], &[6], 7).await;
+
+        let changed = queue.resync_pending_nonces(None, true).await.unwrap();
+
+        assert!(changed.is_empty());
+        assert_eq!(pending_nonces(&queue).await, vec![5, 6]);
+        assert_eq!(queue.nonce_manager.get_current_nonce().await.into_inner(), 7);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires anvil on PATH"]
+    async fn the_used_nonce_clock_starts_at_the_first_rejection() {
+        let (_anvil, queue) = queue(&[], &[0], &[], 1).await;
+        let id = queue.inmempool_transactions.lock().await[0].original.id;
+
+        let first = queue.nonce_used_since(&id).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(queue.nonce_used_since(&id).await, first);
+
+        queue.forget_nonce_used(&id).await;
+        assert!(queue.nonce_used_since(&id).await > first);
     }
 
     #[tokio::test]

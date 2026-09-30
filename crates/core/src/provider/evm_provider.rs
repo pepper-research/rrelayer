@@ -432,10 +432,13 @@ impl EvmProvider {
 
         // Right after inclusion a node can report the nonce as used before it serves the
         // transaction by hash (robinhood-pk-0, 2026-09-29), so hand the caller the hash to track.
+        // Nonce-specific wording only: "intrinsic gas too low" or "fee too low" leave the nonce
+        // unused, so a hash tracked for them could never land.
         let error_msg = error.to_string().to_lowercase();
-        if error_msg.contains("too low")
+        if error_msg.contains("nonce too low")
+            || error_msg.contains("nonce is too low")
             || error_msg.contains("already known")
-            || error_msg.contains("already been used")
+            || error_msg.contains("nonce has already been used")
         {
             return Err(SendTransactionError::NonceUsed {
                 hash: TransactionHash::from_alloy_hash(&tx_hash),
@@ -675,5 +678,21 @@ pub(crate) mod tests {
         assert_eq!(*hash, other_hash);
         // Callers that match on the message still see the node's rejection.
         assert!(error.to_string().to_lowercase().contains("nonce too low"), "{error}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires anvil on PATH"]
+    async fn a_too_low_rejection_that_is_not_about_the_nonce_is_not_a_used_nonce() {
+        let (_anvil, provider, relayer) = anvil_relayer().await;
+        let TypedTransaction::Eip1559(mut underfunded_gas) = transfer(0, 1) else { unreachable!() };
+        underfunded_gas.gas_limit = 20_000;
+
+        let error = provider
+            .send_transaction(&relayer, TypedTransaction::Eip1559(underfunded_gas))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().to_lowercase().contains("too low"), "{error}");
+        assert!(!matches!(error, SendTransactionError::NonceUsed { .. }), "{error}");
     }
 }

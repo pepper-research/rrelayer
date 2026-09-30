@@ -1012,16 +1012,17 @@ impl TransactionsQueues {
     }
 
     /// Returns how many pending nonces changed. Nothing is renumbered unless the persisted
-    /// high-water mark could be read.
+    /// high-water mark could be read. See `TransactionsQueue::resync_pending_nonces`.
     async fn resync_pending_nonces(
         &mut self,
         relayer_id: &RelayerId,
         transactions_queue: &mut TransactionsQueue,
+        lower_only: bool,
     ) -> Result<usize, String> {
         let highest_used =
             self.db.get_highest_used_nonce(relayer_id).await.map_err(|e| e.to_string())?;
         let changed = transactions_queue
-            .resync_pending_nonces(highest_used)
+            .resync_pending_nonces(highest_used, lower_only)
             .await
             .map_err(|e| e.to_string())?;
         for (transaction_id, nonce) in &changed {
@@ -1248,7 +1249,11 @@ impl TransactionsQueues {
                                     // The rest of the queue has never been sent, so it can safely move to
                                     // the nonces that are actually free.
                                     if let Err(sync_error) = self
-                                        .resync_pending_nonces(relayer_id, &mut transactions_queue)
+                                        .resync_pending_nonces(
+                                            relayer_id,
+                                            &mut transactions_queue,
+                                            false,
+                                        )
                                         .await
                                     {
                                         error!(
@@ -1268,7 +1273,7 @@ impl TransactionsQueues {
                                     // A gap below the head never fills by itself: a cancelled or failed
                                     // transaction left it, or a restart reloaded stale nonces.
                                     match self
-                                        .resync_pending_nonces(relayer_id, &mut transactions_queue)
+                                        .resync_pending_nonces(relayer_id, &mut transactions_queue, true)
                                         .await
                                     {
                                         Ok(changed) if changed > 0 => {
@@ -1425,6 +1430,7 @@ impl TransactionsQueues {
                 if let Some(known_transaction_hash) = transaction.known_transaction_hash {
                     match transactions_queue.get_receipt(&known_transaction_hash).await {
                         Ok(Some(receipt)) => {
+                            transactions_queue.forget_nonce_used(&transaction.id).await;
                             let competition_result = transactions_queue
                                 .move_inmempool_to_mining(&transaction.id, &receipt)
                                 .await.map_err(|e| ProcessInmempoolTransactionError::MoveInmempoolTransactionToMinedError(*relayer_id, relayer_address, e))?;
@@ -1571,9 +1577,12 @@ impl TransactionsQueues {
                                                 // of this payload whose hash is not tracked, or another signer. The
                                                 // tracked hash can then never land and this queue is FIFO, so waiting
                                                 // would hold back every later receipt: fail it for review instead.
-                                                // The grace period covers nodes that report a nonce as used before
-                                                // they serve the receipt.
-                                                if elapsed.num_seconds() > 60
+                                                // The grace period counts from the first rejection, not the last
+                                                // send, and every pass re-checks the receipt first, so a node that
+                                                // reports a nonce as used before serving the receipt gets that long.
+                                                let nonce_used_for = Utc::now()
+                                                    - transactions_queue.nonce_used_since(&transaction.id).await;
+                                                if nonce_used_for.num_seconds() > 60
                                                     && transactions_queue.get_mined_nonce().await.is_ok_and(
                                                         |mined| mined.into_inner() > transaction.nonce.into_inner(),
                                                     )
@@ -1601,6 +1610,7 @@ impl TransactionsQueues {
                                                         .await
                                                         .map_err(|e| ProcessInmempoolTransactionError::CouldNotUpdateTransactionStatusInTheDatabase(*relayer_id, relayer_address, transaction.clone(), TransactionStatus::FAILED, e))?;
                                                     self.invalidate_transaction_cache(&transaction.id).await;
+                                                    transactions_queue.forget_nonce_used(&transaction.id).await;
 
                                                     if let Some(webhook_manager) = &self.webhook_manager {
                                                         let webhook_manager = webhook_manager.clone();
