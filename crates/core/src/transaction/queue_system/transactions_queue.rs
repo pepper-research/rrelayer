@@ -308,6 +308,11 @@ impl TransactionsQueue {
         );
     }
 
+    /// For a head that was just given the next free nonce.
+    pub async fn move_next_pending_to_back(&mut self) {
+        move_head_to_back(&mut *self.pending_transactions.lock().await);
+    }
+
     pub async fn remove_pending_transaction_by_id(
         &mut self,
         transaction_id: &TransactionId,
@@ -1446,6 +1451,15 @@ impl TransactionsQueue {
     }
 }
 
+// The queue is sent front to back, so nonces have to follow queue order. A head that takes the
+// next free nonce is above every nonce queued behind it: left in front, the node rejects it as
+// "nonce too high" until they are sent, which is never (robinhood-pk-0 froze this way, 2026-09-29).
+fn move_head_to_back(pending: &mut VecDeque<Transaction>) {
+    if let Some(head) = pending.pop_front() {
+        pending.push_back(head);
+    }
+}
+
 // Re-estimate oversized stored limits instead of resending them or blindly lowering them.
 // Keep valid caller-supplied limits and avoid an unnecessary RPC on ordinary retries.
 async fn gas_limit_for_send(
@@ -1544,5 +1558,72 @@ mod gas_limit_tests {
         )
         .await
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod pending_order_tests {
+    use super::*;
+    use alloy::primitives::Address;
+
+    fn pending(nonce: u64) -> Transaction {
+        let relayer = EvmAddress::new(Address::ZERO);
+        Transaction {
+            id: TransactionId::new(),
+            relayer_id: RelayerId::new(),
+            authorization_list: None,
+            to: relayer,
+            from: relayer,
+            value: TransactionValue::zero(),
+            data: TransactionData::empty(),
+            nonce: TransactionNonce::new(nonce),
+            gas_limit: None,
+            status: TransactionStatus::PENDING,
+            blobs: None,
+            chain_id: ChainId::new(4663),
+            known_transaction_hash: None,
+            queued_at: Utc::now(),
+            expires_at: Utc::now(),
+            sent_at: None,
+            mined_at: None,
+            mined_at_block_number: None,
+            confirmed_at: None,
+            speed: TransactionSpeed::FAST,
+            sent_with_max_priority_fee_per_gas: None,
+            sent_with_max_fee_per_gas: None,
+            is_noop: false,
+            sent_with_gas: None,
+            sent_with_blob_gas: None,
+            external_id: None,
+            cancelled_by_transaction_id: None,
+        }
+    }
+
+    fn nonces(queue: &VecDeque<Transaction>) -> Vec<u64> {
+        queue.iter().map(|transaction| transaction.nonce.into_inner()).collect()
+    }
+
+    #[test]
+    fn a_head_given_the_next_free_nonce_is_sent_after_the_queue() {
+        // robinhood-pk-0, 2026-09-29: the head went from 4393 to 4400 with 4394-4399 behind it.
+        let mut queue: VecDeque<Transaction> =
+            [4400, 4394, 4395, 4396, 4397, 4398, 4399].into_iter().map(pending).collect();
+        let head = queue[0].id;
+
+        move_head_to_back(&mut queue);
+
+        assert_eq!(nonces(&queue), vec![4394, 4395, 4396, 4397, 4398, 4399, 4400]);
+        assert_eq!(queue[6].id, head);
+    }
+
+    #[test]
+    fn a_lone_or_missing_head_is_left_alone() {
+        let mut queue: VecDeque<Transaction> = [4400].into_iter().map(pending).collect();
+        move_head_to_back(&mut queue);
+        assert_eq!(nonces(&queue), vec![4400]);
+
+        let mut empty: VecDeque<Transaction> = VecDeque::new();
+        move_head_to_back(&mut empty);
+        assert!(empty.is_empty());
     }
 }
