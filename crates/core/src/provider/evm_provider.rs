@@ -405,9 +405,26 @@ impl EvmProvider {
         // Returning the error makes the queue re-send the payload at a new nonce, putting it
         // on-chain twice.
         let tx_hash = *tx_envelope.tx_hash();
-        if let Ok(Some(_)) = provider.get_transaction_by_hash(tx_hash).await {
-            warn!("rrelayer_send_already_known hash={} provider_error=\"{}\"", tx_hash, error);
-            return Ok(TransactionHash::from_alloy_hash(&tx_hash));
+        // Right after inclusion a node can report the nonce as used before it serves the
+        // transaction by hash (robinhood-pk-0, 2026-09-29: included, then "nonce too low" and a
+        // failed lookup within a second), so a nonce rejection gets a few more chances.
+        let error_msg = error.to_string().to_lowercase();
+        let lookups = if error_msg.contains("too low")
+            || error_msg.contains("already known")
+            || error_msg.contains("already been used")
+        {
+            5
+        } else {
+            1
+        };
+        for attempt in 0..lookups {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            if let Ok(Some(_)) = provider.get_transaction_by_hash(tx_hash).await {
+                warn!("rrelayer_send_already_known hash={} provider_error=\"{}\"", tx_hash, error);
+                return Ok(TransactionHash::from_alloy_hash(&tx_hash));
+            }
         }
 
         Err(error.into())
@@ -533,7 +550,7 @@ impl EvmProvider {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::gas::CustomGasFeeEstimator;
     use crate::relayer::RelayerId;
@@ -541,7 +558,7 @@ mod tests {
     use alloy::primitives::{address, TxKind, U256};
     use std::process::{Child, Command};
 
-    struct Anvil(Child);
+    pub(crate) struct Anvil(Child);
 
     impl Drop for Anvil {
         fn drop(&mut self) {
@@ -549,12 +566,10 @@ mod tests {
         }
     }
 
-    // Run with: cargo test -p rrelayer_core -- --ignored
-    #[tokio::test]
-    #[ignore = "requires anvil on PATH"]
-    async fn resending_a_mined_transaction_returns_its_hash() {
+    /// Starts anvil and returns a provider and relayer for its first dev account.
+    pub(crate) async fn anvil_relayer() -> (Anvil, EvmProvider, Relayer) {
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let _anvil = Anvil(
+        let anvil = Anvil(
             Command::new("anvil")
                 .args(["--port", &port.to_string(), "--silent"])
                 .spawn()
@@ -596,21 +611,44 @@ mod tests {
             created_at: chrono::Utc::now(),
             is_private_key: false,
         };
-        let transaction = TypedTransaction::Eip1559(TxEip1559 {
+        (anvil, provider, relayer)
+    }
+
+    fn transfer(nonce: u64, value: u64) -> TypedTransaction {
+        TypedTransaction::Eip1559(TxEip1559 {
             chain_id: 31337,
-            nonce: 0,
+            nonce,
             gas_limit: 21_000,
             max_fee_per_gas: 10_000_000_000,
             max_priority_fee_per_gas: 1_000_000_000,
             to: TxKind::Call(address!("000000000000000000000000000000000000dead")),
-            value: U256::from(1),
+            value: U256::from(value),
             ..Default::default()
-        });
+        })
+    }
+
+    // Run with: cargo test -p rrelayer_core -- --ignored
+    #[tokio::test]
+    #[ignore = "requires anvil on PATH"]
+    async fn resending_a_mined_transaction_returns_its_hash() {
+        let (_anvil, provider, relayer) = anvil_relayer().await;
+        let transaction = transfer(0, 1);
 
         let sent = provider.send_transaction(&relayer, transaction.clone()).await.unwrap();
         // anvil mines on receipt, so the node now answers this exact resend with "nonce too low"
         let resent = provider.send_transaction(&relayer, transaction).await.unwrap();
 
         assert_eq!(resent, sent);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires anvil on PATH"]
+    async fn a_different_transaction_at_a_used_nonce_is_still_rejected() {
+        let (_anvil, provider, relayer) = anvil_relayer().await;
+        provider.send_transaction(&relayer, transfer(0, 1)).await.unwrap();
+
+        let error = provider.send_transaction(&relayer, transfer(0, 2)).await.unwrap_err();
+
+        assert!(error.to_string().to_lowercase().contains("nonce too low"), "{error}");
     }
 }

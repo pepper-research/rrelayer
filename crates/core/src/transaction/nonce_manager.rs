@@ -25,6 +25,12 @@ impl NonceManager {
         }
     }
 
+    /// Unlike `sync_with_onchain_nonce`, this can move the nonce down. Only call it while holding
+    /// the queue lock, after re-assigning every pending nonce at or above `nonce`.
+    pub async fn set(&self, nonce: TransactionNonce) {
+        *self.nonce.lock().await = nonce;
+    }
+
     pub async fn get_current_nonce(&self) -> TransactionNonce {
         let nonce_guard = self.nonce.lock().await;
         *nonce_guard

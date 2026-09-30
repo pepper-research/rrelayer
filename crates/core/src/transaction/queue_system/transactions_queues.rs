@@ -1011,6 +1011,33 @@ impl TransactionsQueues {
         }
     }
 
+    /// Returns how many pending nonces changed.
+    async fn resync_pending_nonces(
+        &mut self,
+        relayer_id: &RelayerId,
+        transactions_queue: &mut TransactionsQueue,
+    ) -> Result<usize, RpcError<TransportErrorKind>> {
+        let changed = transactions_queue.resync_pending_nonces().await?;
+        for (transaction_id, nonce) in &changed {
+            if let Err(db_error) = self.db.transaction_update_nonce(transaction_id, nonce).await {
+                error!(
+                    "Failed to persist nonce update to database for transaction {}: {}",
+                    transaction_id, db_error
+                );
+            }
+            self.invalidate_transaction_cache(transaction_id).await;
+        }
+        if !changed.is_empty() {
+            info!(
+                "Resynced {} pending transaction nonces for relayer {}, next nonce {}",
+                changed.len(),
+                relayer_id,
+                transactions_queue.nonce_manager.get_current_nonce().await.into_inner()
+            );
+        }
+        Ok(changed.len())
+    }
+
     async fn recover_nonce_synchronization(
         &mut self,
         relayer_id: &RelayerId,
@@ -1180,48 +1207,81 @@ impl TransactionsQueues {
                                     || error_msg.contains("nonce has already been used")
                                     || error_msg.contains("already known")
                                 {
-                                    warn!("process_single_pending: nonce synchronization issue detected for relayer {}: {}", relayer_id, error);
-
-                                    if let Err(sync_error) = self
-                                        .recover_nonce_synchronization(
-                                            relayer_id,
-                                            &mut transactions_queue,
+                                    // The provider already looked this exact transaction up and did not
+                                    // find it, but the nonce is used and an earlier attempt of this payload
+                                    // may be what used it. Re-sending it at a new nonce can then execute it
+                                    // twice (robinhood-pk-0, 2026-09-29: it landed, the send still reported
+                                    // "nonce too low"), so fail it instead of re-sending.
+                                    error!("process_single_pending: transaction {} failed, its nonce {} is already used and it was not re-sent at a new nonce - error {}", transaction.id, transaction.nonce.into_inner(), error_msg);
+                                    self.db
+                                        .update_transaction_failed(
+                                            &transaction.id,
+                                            &format!("Nonce already used; not re-sent to avoid a duplicate: {}", error),
                                         )
                                         .await
+                                        .map_err(|e| {
+                                            ProcessPendingTransactionError::DbError(
+                                                *relayer_id,
+                                                relayer_address,
+                                                e,
+                                            )
+                                        })?;
+
+                                    transactions_queue.move_next_pending_to_failed().await;
+
+                                    self.invalidate_transaction_cache(&transaction.id).await;
+
+                                    // The rest of the queue has never been sent, so it can safely move to
+                                    // the nonces that are actually free.
+                                    if let Err(sync_error) = self
+                                        .resync_pending_nonces(relayer_id, &mut transactions_queue)
+                                        .await
                                     {
-                                        error!("Failed to recover nonce synchronization for relayer {}: {}", relayer_id, sync_error);
-                                        return Err(ProcessPendingTransactionError::SendTransactionError(
+                                        error!(
+                                            "Failed to resync pending nonces for relayer {}: {}",
+                                            relayer_id, sync_error
+                                        );
+                                    }
+
+                                    Err(ProcessPendingTransactionError::SendTransactionError(
+                                        *relayer_id,
+                                        relayer_address,
+                                        TransactionQueueSendTransactionError::TransactionSendError(
+                                            error,
+                                        ),
+                                    ))
+                                } else if error_msg.contains("nonce too high") {
+                                    // A gap below the head never fills by itself: a cancelled or failed
+                                    // transaction left it, or a restart reloaded stale nonces.
+                                    match self
+                                        .resync_pending_nonces(relayer_id, &mut transactions_queue)
+                                        .await
+                                    {
+                                        Ok(changed) if changed > 0 => {
+                                            Ok(ProcessResult::<ProcessPendingStatus>::other(
+                                                ProcessPendingStatus::NonceSynchronized,
+                                                Some(&100),
+                                            ))
+                                        }
+                                        // Nothing to move: the gap belongs to an in-flight transaction.
+                                        Ok(_) => Err(ProcessPendingTransactionError::SendTransactionError(
                                             *relayer_id,
                                             relayer_address,
-                                            TransactionQueueSendTransactionError::TransactionSendError(error),
-                                        ));
+                                            TransactionQueueSendTransactionError::TransactionSendError(
+                                                error,
+                                            ),
+                                        )),
+                                        Err(sync_error) => {
+                                            error!("Failed to resync pending nonces for relayer {}: {}", relayer_id, sync_error);
+                                            Err(ProcessPendingTransactionError::SendTransactionError(
+                                                *relayer_id,
+                                                relayer_address,
+                                                TransactionQueueSendTransactionError::TransactionSendError(
+                                                    error,
+                                                ),
+                                            ))
+                                        }
                                     }
-
-                                    let new_nonce =
-                                        transactions_queue.nonce_manager.get_and_increment().await;
-                                    transaction.nonce = new_nonce;
-
-                                    transactions_queue
-                                        .update_pending_transaction_nonce(
-                                            &transaction.id,
-                                            new_nonce,
-                                        )
-                                        .await;
-
-                                    if let Err(db_error) = self
-                                        .db
-                                        .transaction_update_nonce(&transaction.id, &new_nonce)
-                                        .await
-                                    {
-                                        error!("Failed to persist nonce update to database for transaction {}: {}", transaction.id, db_error);
-                                    }
-
-                                    info!("Nonce synchronization recovered for relayer {}, updated pending transaction nonce to {} in queue and database", relayer_id, new_nonce.into_inner());
-
-                                    Ok(ProcessResult::<ProcessPendingStatus>::other(
-                                        ProcessPendingStatus::NonceSynchronized,
-                                        Some(&100),
-                                    ))
                                 } else {
                                     // For other send errors (RPC down, etc), keep as temp issue
                                     Err(ProcessPendingTransactionError::SendTransactionError(

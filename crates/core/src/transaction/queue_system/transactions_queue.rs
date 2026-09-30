@@ -1419,15 +1419,31 @@ impl TransactionsQueue {
         self.evm_provider.get_balance(&address).await
     }
 
-    pub async fn update_pending_transaction_nonce(
+    /// Re-assigns pending nonces consecutively in queue order, starting at the first nonce that is
+    /// neither used on-chain nor held by an in-flight transaction, and resets the nonce manager
+    /// after the last one. The queue is sent front to back, so nonces must follow queue order: a
+    /// head whose nonce is above a queued one is rejected as "nonce too high" forever.
+    /// Returns the transactions whose nonce changed, for the caller to persist.
+    pub async fn resync_pending_nonces(
         &self,
-        transaction_id: &TransactionId,
-        new_nonce: TransactionNonce,
-    ) {
-        let mut pending = self.pending_transactions.lock().await;
-        if let Some(transaction) = pending.iter_mut().find(|tx| tx.id == *transaction_id) {
-            transaction.nonce = new_nonce;
+    ) -> Result<Vec<(TransactionId, TransactionNonce)>, RpcError<TransportErrorKind>> {
+        let mut next = self.get_nonce().await?.into_inner();
+        for in_flight in self.inmempool_transactions.lock().await.iter() {
+            next = next.max(in_flight.original.nonce.into_inner() + 1);
         }
+
+        let mut changed = Vec::new();
+        for transaction in self.pending_transactions.lock().await.iter_mut() {
+            let nonce = TransactionNonce::new(next);
+            if transaction.nonce != nonce {
+                transaction.nonce = nonce;
+                changed.push((transaction.id, nonce));
+            }
+            next += 1;
+        }
+        self.nonce_manager.set(TransactionNonce::new(next)).await;
+
+        Ok(changed)
     }
 
     pub async fn update_inmempool_transaction_nonce(
@@ -1544,5 +1560,116 @@ mod gas_limit_tests {
         )
         .await
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod nonce_resync_tests {
+    use super::*;
+    use crate::provider::{anvil_relayer, Anvil};
+
+    fn transaction(relayer: &Relayer, nonce: u64) -> Transaction {
+        Transaction {
+            id: TransactionId::new(),
+            relayer_id: relayer.id,
+            authorization_list: None,
+            to: relayer.address,
+            from: relayer.address,
+            value: TransactionValue::zero(),
+            data: TransactionData::empty(),
+            nonce: TransactionNonce::new(nonce),
+            gas_limit: None,
+            status: TransactionStatus::PENDING,
+            blobs: None,
+            chain_id: relayer.chain_id,
+            known_transaction_hash: None,
+            queued_at: Utc::now(),
+            expires_at: Utc::now(),
+            sent_at: None,
+            mined_at: None,
+            mined_at_block_number: None,
+            confirmed_at: None,
+            speed: TransactionSpeed::FAST,
+            sent_with_max_priority_fee_per_gas: None,
+            sent_with_max_fee_per_gas: None,
+            is_noop: false,
+            sent_with_gas: None,
+            sent_with_blob_gas: None,
+            external_id: None,
+            cancelled_by_transaction_id: None,
+        }
+    }
+
+    /// A queue for anvil's first dev account, which has not sent anything (on-chain nonce 0).
+    async fn queue(
+        pending_nonces: &[u64],
+        in_flight_nonces: &[u64],
+        next_nonce: u64,
+    ) -> (Anvil, TransactionsQueue) {
+        let (anvil, provider, relayer) = anvil_relayer().await;
+        let pending = pending_nonces.iter().map(|n| transaction(&relayer, *n)).collect();
+        let in_flight = in_flight_nonces
+            .iter()
+            .map(|n| CompetitiveTransaction::new(transaction(&relayer, *n)))
+            .collect();
+        let queue = TransactionsQueue::new(
+            TransactionsQueueSetup::new(
+                relayer,
+                provider,
+                NonceManager::new(TransactionNonce::new(next_nonce)),
+                pending,
+                in_flight,
+                HashMap::new(),
+                Arc::new(SafeProxyManager::new(vec![])),
+                GasBumpBlockConfig::default(),
+                2,
+            ),
+            Arc::new(Mutex::new(GasOracleCache::new())),
+            Arc::new(Mutex::new(BlobGasOracleCache::new())),
+        );
+        (anvil, queue)
+    }
+
+    async fn pending_nonces(queue: &TransactionsQueue) -> Vec<u64> {
+        queue.pending_transactions.lock().await.iter().map(|t| t.nonce.into_inner()).collect()
+    }
+
+    // Run with: cargo test -p rrelayer_core -- --ignored
+    #[tokio::test]
+    #[ignore = "requires anvil on PATH"]
+    async fn a_head_moved_past_the_queue_goes_back_into_order() {
+        // robinhood-pk-0, 2026-09-29: the head was given the next free nonce (4400) while
+        // 4394-4399 waited behind it, so every send of the head was "nonce too high".
+        let (_anvil, queue) = queue(&[6, 0, 1, 2, 3, 4, 5], &[], 7).await;
+
+        let changed = queue.resync_pending_nonces().await.unwrap();
+
+        assert_eq!(pending_nonces(&queue).await, vec![0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(changed.len(), 7);
+        assert_eq!(queue.nonce_manager.get_current_nonce().await.into_inner(), 7);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires anvil on PATH"]
+    async fn a_gap_closes_without_reusing_an_in_flight_nonce() {
+        // Nonce 0 is sent but not mined; the pending transaction sits above a gap, as after a
+        // cancelled transaction or a restart that reloaded stale nonces.
+        let (_anvil, queue) = queue(&[5], &[0], 6).await;
+
+        queue.resync_pending_nonces().await.unwrap();
+
+        assert_eq!(pending_nonces(&queue).await, vec![1]);
+        assert_eq!(queue.nonce_manager.get_current_nonce().await.into_inner(), 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires anvil on PATH"]
+    async fn an_ordered_queue_is_left_alone() {
+        let (_anvil, queue) = queue(&[0, 1, 2], &[], 3).await;
+
+        let changed = queue.resync_pending_nonces().await.unwrap();
+
+        assert!(changed.is_empty());
+        assert_eq!(pending_nonces(&queue).await, vec![0, 1, 2]);
     }
 }
