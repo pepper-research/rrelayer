@@ -47,7 +47,7 @@ pub struct TransactionsQueue {
     pending_transactions: Mutex<VecDeque<Transaction>>,
     inmempool_transactions: Mutex<VecDeque<CompetitiveTransaction>>,
     mined_transactions: Mutex<HashMap<TransactionId, Transaction>>,
-    /// When a gas bump of each in-mempool transaction was first rejected for a used nonce.
+    /// When the node first reported each in-mempool transaction's nonce as used.
     nonce_used_since: Mutex<HashMap<TransactionId, DateTime<Utc>>>,
     evm_provider: EvmProvider,
     relayer: Relayer,
@@ -1356,6 +1356,7 @@ impl TransactionsQueue {
                         hash,
                         error
                     );
+                    self.mark_nonce_used(&transaction.id).await;
                     hash
                 }
                 Err(error) => {
@@ -1446,10 +1447,13 @@ impl TransactionsQueue {
         self.evm_provider.get_mined_nonce_from_address(&self.relay_address()).await
     }
 
-    /// When a gas bump of `transaction_id` was first rejected because its nonce is used. The first
-    /// call records now.
-    pub async fn nonce_used_since(&self, transaction_id: &TransactionId) -> DateTime<Utc> {
-        *self.nonce_used_since.lock().await.entry(*transaction_id).or_insert_with(Utc::now)
+    /// Records, once, that the node reported `transaction_id`'s nonce as used.
+    pub async fn mark_nonce_used(&self, transaction_id: &TransactionId) {
+        self.nonce_used_since.lock().await.entry(*transaction_id).or_insert_with(Utc::now);
+    }
+
+    pub async fn nonce_used_since(&self, transaction_id: &TransactionId) -> Option<DateTime<Utc>> {
+        self.nonce_used_since.lock().await.get(transaction_id).copied()
     }
 
     pub async fn forget_nonce_used(&self, transaction_id: &TransactionId) {
@@ -1491,16 +1495,15 @@ impl TransactionsQueue {
         highest_used: Option<TransactionNonce>,
         lower_only: bool,
     ) -> Result<Vec<(TransactionId, TransactionNonce)>, RpcError<TransportErrorKind>> {
-        let mut next = self.get_nonce().await?.into_inner();
-        if let Some(highest_used) = highest_used {
-            next = next.max(highest_used.into_inner() + 1);
-        }
-        for in_flight in self.inmempool_transactions.lock().await.iter() {
-            next = next.max(in_flight.original.nonce.into_inner() + 1);
-        }
-        for mined in self.mined_transactions.lock().await.values() {
-            next = next.max(mined.nonce.into_inner() + 1);
-        }
+        let in_flight: Vec<TransactionNonce> =
+            self.inmempool_transactions.lock().await.iter().map(|c| c.original.nonce).collect();
+        let mined: Vec<TransactionNonce> =
+            self.mined_transactions.lock().await.values().map(|t| t.nonce).collect();
+        let mut next = first_free_nonce(
+            self.get_nonce().await?,
+            highest_used.into_iter().chain(in_flight).chain(mined),
+        )
+        .into_inner();
 
         let mut pending = self.pending_transactions.lock().await;
         if lower_only && pending.front().is_some_and(|head| next > head.nonce.into_inner()) {
@@ -1520,6 +1523,16 @@ impl TransactionsQueue {
 
         Ok(changed)
     }
+}
+
+/// The first nonce above the chain's nonce and every nonce in `used`.
+pub fn first_free_nonce(
+    onchain: TransactionNonce,
+    used: impl Iterator<Item = TransactionNonce>,
+) -> TransactionNonce {
+    TransactionNonce::new(
+        used.map(|nonce| nonce.into_inner() + 1).fold(onchain.into_inner(), u64::max),
+    )
 }
 
 // Re-estimate oversized stored limits instead of resending them or blindly lowering them.
@@ -1772,16 +1785,28 @@ mod nonce_resync_tests {
 
     #[tokio::test]
     #[ignore = "requires anvil on PATH"]
-    async fn the_used_nonce_clock_starts_at_the_first_rejection() {
+    async fn the_used_nonce_clock_starts_when_first_marked() {
         let (_anvil, queue) = queue(&[], &[0], &[], 1).await;
         let id = queue.inmempool_transactions.lock().await[0].original.id;
+        assert_eq!(queue.nonce_used_since(&id).await, None);
 
+        queue.mark_nonce_used(&id).await;
         let first = queue.nonce_used_since(&id).await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        queue.mark_nonce_used(&id).await;
         assert_eq!(queue.nonce_used_since(&id).await, first);
 
         queue.forget_nonce_used(&id).await;
-        assert!(queue.nonce_used_since(&id).await > first);
+        assert_eq!(queue.nonce_used_since(&id).await, None);
+    }
+
+    #[test]
+    fn new_transactions_are_numbered_after_loaded_rows() {
+        // A restart loads unsent rows at nonces 0-4 while the chain still reports 0; numbering
+        // from the chain would give the next submission a nonce a loaded row is about to use.
+        let loaded = (0..5).map(TransactionNonce::new);
+        assert_eq!(first_free_nonce(TransactionNonce::new(0), loaded).into_inner(), 5);
+        assert_eq!(first_free_nonce(TransactionNonce::new(9), std::iter::empty()).into_inner(), 9);
     }
 
     #[tokio::test]
