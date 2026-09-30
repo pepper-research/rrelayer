@@ -144,6 +144,11 @@ pub enum SendTransactionError {
 
     #[error("Internal error: {0}")]
     InternalError(String),
+
+    /// The node rejected this exact signed transaction because its nonce is used and could not
+    /// serve it by hash. `hash` is what was broadcast. The message matches `RpcError`'s.
+    #[error("Provider error: {error}")]
+    NonceUsed { hash: TransactionHash, error: RpcError<TransportErrorKind> },
 }
 
 #[derive(Error, Debug)]
@@ -405,26 +410,22 @@ impl EvmProvider {
         // Returning the error makes the queue re-send the payload at a new nonce, putting it
         // on-chain twice.
         let tx_hash = *tx_envelope.tx_hash();
+        if let Ok(Some(_)) = provider.get_transaction_by_hash(tx_hash).await {
+            warn!("rrelayer_send_already_known hash={} provider_error=\"{}\"", tx_hash, error);
+            return Ok(TransactionHash::from_alloy_hash(&tx_hash));
+        }
+
         // Right after inclusion a node can report the nonce as used before it serves the
-        // transaction by hash (robinhood-pk-0, 2026-09-29: included, then "nonce too low" and a
-        // failed lookup within a second), so a nonce rejection gets a few more chances.
+        // transaction by hash (robinhood-pk-0, 2026-09-29), so hand the caller the hash to track.
         let error_msg = error.to_string().to_lowercase();
-        let lookups = if error_msg.contains("too low")
+        if error_msg.contains("too low")
             || error_msg.contains("already known")
             || error_msg.contains("already been used")
         {
-            5
-        } else {
-            1
-        };
-        for attempt in 0..lookups {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            if let Ok(Some(_)) = provider.get_transaction_by_hash(tx_hash).await {
-                warn!("rrelayer_send_already_known hash={} provider_error=\"{}\"", tx_hash, error);
-                return Ok(TransactionHash::from_alloy_hash(&tx_hash));
-            }
+            return Err(SendTransactionError::NonceUsed {
+                hash: TransactionHash::from_alloy_hash(&tx_hash),
+                error,
+            });
         }
 
         Err(error.into())
@@ -643,12 +644,21 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[ignore = "requires anvil on PATH"]
-    async fn a_different_transaction_at_a_used_nonce_is_still_rejected() {
+    async fn a_used_nonce_that_is_not_found_returns_the_broadcast_hash() {
         let (_anvil, provider, relayer) = anvil_relayer().await;
         provider.send_transaction(&relayer, transfer(0, 1)).await.unwrap();
+        let other = transfer(0, 2);
+        let signature = provider.sign_transaction(&relayer, &other).await.unwrap();
+        let TypedTransaction::Eip1559(unsigned) = other.clone() else { unreachable!() };
+        let other_hash = TransactionHash::from_alloy_hash(unsigned.into_signed(signature).hash());
 
-        let error = provider.send_transaction(&relayer, transfer(0, 2)).await.unwrap_err();
+        let error = provider.send_transaction(&relayer, other).await.unwrap_err();
 
+        let SendTransactionError::NonceUsed { hash, .. } = &error else {
+            panic!("expected NonceUsed, got {error}");
+        };
+        assert_eq!(*hash, other_hash);
+        // Callers that match on the message still see the node's rejection.
         assert!(error.to_string().to_lowercase().contains("nonce too low"), "{error}");
     }
 }

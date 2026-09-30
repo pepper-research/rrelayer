@@ -1207,11 +1207,10 @@ impl TransactionsQueues {
                                     || error_msg.contains("nonce has already been used")
                                     || error_msg.contains("already known")
                                 {
-                                    // The provider already looked this exact transaction up and did not
-                                    // find it, but the nonce is used and an earlier attempt of this payload
-                                    // may be what used it. Re-sending it at a new nonce can then execute it
-                                    // twice (robinhood-pk-0, 2026-09-29: it landed, the send still reported
-                                    // "nonce too low"), so fail it instead of re-sending.
+                                    // A used nonce on a first send is normally tracked as sent by
+                                    // `send_transaction`; this is a nonce error it could not attribute to
+                                    // this broadcast (e.g. "invalid nonce"). Re-sending the payload at a new
+                                    // nonce could execute it twice, so fail it instead.
                                     error!("process_single_pending: transaction {} failed, its nonce {} is already used and it was not re-sent at a new nonce - error {}", transaction.id, transaction.nonce.into_inner(), error_msg);
                                     self.db
                                         .update_transaction_failed(
@@ -1546,31 +1545,15 @@ impl TransactionsQueues {
                                                 || error_msg.contains("nonce has already been used")
                                                 || error_msg.contains("already known")
                                             {
-                                                warn!("process_single_inmempool: nonce synchronization issue detected for relayer {} during gas bump: {}", relayer_id, error);
-
-                                                if let Err(sync_error) = self.recover_nonce_synchronization(relayer_id, &mut transactions_queue).await {
-                                                    error!("Failed to recover nonce synchronization for relayer {}: {}", relayer_id, sync_error);
-                                                    return Err(ProcessInmempoolTransactionError::SendTransactionError(
-                                                        *relayer_id,
-                                                        relayer_address,
-                                                        TransactionQueueSendTransactionError::TransactionSendError(error)
-                                                    ));
-                                                }
-
-                                                let new_nonce = transactions_queue.nonce_manager.get_and_increment().await;
-                                                transaction.nonce = new_nonce;
-
-                                                transactions_queue.update_inmempool_transaction_nonce(&transaction.id, new_nonce).await;
-
-                                                if let Err(db_error) = self.db.transaction_update_nonce(&transaction.id, &new_nonce).await {
-                                                    error!("Failed to persist nonce update to database for transaction {}: {}", transaction.id, db_error);
-                                                }
-
-                                                info!("Nonce synchronization recovered for relayer {}, updated gas bump transaction nonce {} in queue and database", relayer_id, new_nonce.into_inner());
+                                                // An earlier broadcast of this transaction used the nonce, most
+                                                // often one whose receipt the node is not serving yet.
+                                                // Re-sending the payload at a new nonce would execute it twice,
+                                                // so keep checking the receipt of the tracked hash instead.
+                                                warn!("process_single_inmempool: gas bump for transaction {} rejected, nonce {} already used; waiting for the tracked hash - error {}", transaction.id, transaction.nonce.into_inner(), error);
 
                                                 return Ok(ProcessResult::<ProcessInmempoolStatus>::other(
-                                                    ProcessInmempoolStatus::NonceSynchronized,
-                                                    Some(&100),
+                                                    ProcessInmempoolStatus::StillInmempool,
+                                                    self.relayer_block_times_ms.get(relayer_id),
                                                 ));
                                             }
                                             return Err(ProcessInmempoolTransactionError::SendTransactionError(

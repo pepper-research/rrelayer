@@ -20,7 +20,7 @@ use crate::{
     },
     network::ChainId,
     postgres::PostgresClient,
-    provider::EvmProvider,
+    provider::{EvmProvider, SendTransactionError},
     relayer::{Relayer, RelayerId},
     safe_proxy::SafeProxyManager,
     shared::common_types::EvmAddress,
@@ -40,8 +40,8 @@ use alloy::{
 };
 use chrono::Utc;
 use tokio::sync::Mutex;
-use tracing::error;
 use tracing::info;
+use tracing::{error, warn};
 
 pub struct TransactionsQueue {
     pending_transactions: Mutex<VecDeque<Transaction>>,
@@ -1334,11 +1334,30 @@ impl TransactionsQueue {
         };
         info!("rrelayer_send_network {}", transaction_context(&working_transaction, &self.relayer));
 
-        let transaction_hash = self
-            .evm_provider
-            .send_transaction(&self.relayer, transaction_request)
-            .await
-            .map_err(TransactionQueueSendTransactionError::TransactionSendError)?;
+        let transaction_hash =
+            match self.evm_provider.send_transaction(&self.relayer, transaction_request).await {
+                Ok(hash) => hash,
+                // A first send whose nonce the node reports as used was, in every case seen
+                // (robinhood-pk-0, 37 of 37 over 30 days to 2026-09-30), this payload already
+                // included. Track the broadcast hash and let the receipt check settle it;
+                // re-sending at a new nonce would execute the payload twice. A gas bump, cancel or
+                // replace getting this answer means an earlier broadcast won, which this hash does
+                // not track, so those keep the error.
+                Err(SendTransactionError::NonceUsed { hash, error })
+                    if transaction.sent_with_gas.is_none() =>
+                {
+                    warn!(
+                        "rrelayer_send_nonce_used_tracking {} hash={} provider_error=\"{}\"",
+                        transaction_context(&working_transaction, &self.relayer),
+                        hash,
+                        error
+                    );
+                    hash
+                }
+                Err(error) => {
+                    return Err(TransactionQueueSendTransactionError::TransactionSendError(error))
+                }
+            };
 
         let transaction_sent = TransactionSentWithRelayer {
             id: transaction.id,
@@ -1444,21 +1463,6 @@ impl TransactionsQueue {
         self.nonce_manager.set(TransactionNonce::new(next)).await;
 
         Ok(changed)
-    }
-
-    pub async fn update_inmempool_transaction_nonce(
-        &self,
-        transaction_id: &TransactionId,
-        new_nonce: TransactionNonce,
-    ) {
-        let mut inmempool = self.inmempool_transactions.lock().await;
-        if let Some(competitive_tx) =
-            inmempool.iter_mut().find(|ctx| ctx.get_transaction_by_id(transaction_id).is_some())
-        {
-            if let Some(transaction) = competitive_tx.get_transaction_by_id_mut(transaction_id) {
-                transaction.nonce = new_nonce;
-            }
-        }
     }
 }
 
