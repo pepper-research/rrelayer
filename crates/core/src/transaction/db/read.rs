@@ -3,7 +3,9 @@ use crate::{
     postgres::{PostgresClient, PostgresError},
     relayer::RelayerId,
     shared::common_types::{PagingContext, PagingResult},
-    transaction::types::{Transaction, TransactionHash, TransactionId, TransactionStatus},
+    transaction::types::{
+        Transaction, TransactionHash, TransactionId, TransactionNonce, TransactionStatus,
+    },
 };
 
 impl PostgresClient {
@@ -81,6 +83,34 @@ impl PostgresClient {
         let result_count = results.len();
 
         Ok(PagingResult::new(results, paging_context.next(result_count), paging_context.previous()))
+    }
+
+    /// The highest nonce this relayer has broadcast at, from transactions that are in the mempool,
+    /// mined or confirmed. Unlike the in-memory queues this still covers confirmed transactions.
+    pub async fn get_highest_used_nonce(
+        &self,
+        relayer_id: &RelayerId,
+    ) -> Result<Option<TransactionNonce>, PostgresError> {
+        let row = self
+            .query_one_or_none(
+                "
+                    SELECT MAX(nonce) AS nonce
+                    FROM relayer.transaction
+                    WHERE relayer_id = $1
+                    AND status IN ($2, $3, $4);
+                ",
+                &[
+                    relayer_id,
+                    &TransactionStatus::INMEMPOOL,
+                    &TransactionStatus::MINED,
+                    &TransactionStatus::CONFIRMED,
+                ],
+            )
+            .await?;
+
+        Ok(row
+            .and_then(|row| row.get::<_, Option<i64>>("nonce"))
+            .map(|nonce| TransactionNonce::new(nonce as u64)))
     }
 
     pub async fn get_transaction_by_hash(

@@ -144,6 +144,11 @@ pub enum SendTransactionError {
 
     #[error("Internal error: {0}")]
     InternalError(String),
+
+    /// The node rejected this exact signed transaction because its nonce is used and could not
+    /// serve it by hash. `hash` is what was broadcast. The message matches `RpcError`'s.
+    #[error("Provider error: {error}")]
+    NonceUsed { hash: TransactionHash, error: RpcError<TransportErrorKind> },
 }
 
 #[derive(Error, Debug)]
@@ -369,6 +374,21 @@ impl EvmProvider {
         Ok(TransactionNonce::new(nonce))
     }
 
+    /// Nonces used by mined transactions only, unlike `get_nonce_from_address` which also counts
+    /// the mempool.
+    pub async fn get_mined_nonce_from_address(
+        &self,
+        address: &EvmAddress,
+    ) -> Result<TransactionNonce, RpcError<TransportErrorKind>> {
+        let nonce = self
+            .rpc_client()
+            .get_transaction_count(address.into_address())
+            .block_id(BlockId::Number(BlockNumberOrTag::Latest))
+            .await?;
+
+        Ok(TransactionNonce::new(nonce))
+    }
+
     pub async fn send_transaction(
         &self,
         relayer: &Relayer,
@@ -408,6 +428,22 @@ impl EvmProvider {
         if let Ok(Some(_)) = provider.get_transaction_by_hash(tx_hash).await {
             warn!("rrelayer_send_already_known hash={} provider_error=\"{}\"", tx_hash, error);
             return Ok(TransactionHash::from_alloy_hash(&tx_hash));
+        }
+
+        // Right after inclusion a node can report the nonce as used before it serves the
+        // transaction by hash (robinhood-pk-0, 2026-09-29), so hand the caller the hash to track.
+        // Nonce-specific wording only: "intrinsic gas too low" or "fee too low" leave the nonce
+        // unused, so a hash tracked for them could never land.
+        let error_msg = error.to_string().to_lowercase();
+        if error_msg.contains("nonce too low")
+            || error_msg.contains("nonce is too low")
+            || error_msg.contains("already known")
+            || error_msg.contains("nonce has already been used")
+        {
+            return Err(SendTransactionError::NonceUsed {
+                hash: TransactionHash::from_alloy_hash(&tx_hash),
+                error,
+            });
         }
 
         Err(error.into())
@@ -533,7 +569,7 @@ impl EvmProvider {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::gas::CustomGasFeeEstimator;
     use crate::relayer::RelayerId;
@@ -541,7 +577,7 @@ mod tests {
     use alloy::primitives::{address, TxKind, U256};
     use std::process::{Child, Command};
 
-    struct Anvil(Child);
+    pub(crate) struct Anvil(Child);
 
     impl Drop for Anvil {
         fn drop(&mut self) {
@@ -549,12 +585,10 @@ mod tests {
         }
     }
 
-    // Run with: cargo test -p rrelayer_core -- --ignored
-    #[tokio::test]
-    #[ignore = "requires anvil on PATH"]
-    async fn resending_a_mined_transaction_returns_its_hash() {
+    /// Starts anvil and returns a provider and relayer for its first dev account.
+    pub(crate) async fn anvil_relayer() -> (Anvil, EvmProvider, Relayer) {
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let _anvil = Anvil(
+        let anvil = Anvil(
             Command::new("anvil")
                 .args(["--port", &port.to_string(), "--silent"])
                 .spawn()
@@ -596,21 +630,69 @@ mod tests {
             created_at: chrono::Utc::now(),
             is_private_key: false,
         };
-        let transaction = TypedTransaction::Eip1559(TxEip1559 {
+        (anvil, provider, relayer)
+    }
+
+    fn transfer(nonce: u64, value: u64) -> TypedTransaction {
+        TypedTransaction::Eip1559(TxEip1559 {
             chain_id: 31337,
-            nonce: 0,
+            nonce,
             gas_limit: 21_000,
             max_fee_per_gas: 10_000_000_000,
             max_priority_fee_per_gas: 1_000_000_000,
             to: TxKind::Call(address!("000000000000000000000000000000000000dead")),
-            value: U256::from(1),
+            value: U256::from(value),
             ..Default::default()
-        });
+        })
+    }
+
+    // Run with: cargo test -p rrelayer_core -- --ignored
+    #[tokio::test]
+    #[ignore = "requires anvil on PATH"]
+    async fn resending_a_mined_transaction_returns_its_hash() {
+        let (_anvil, provider, relayer) = anvil_relayer().await;
+        let transaction = transfer(0, 1);
 
         let sent = provider.send_transaction(&relayer, transaction.clone()).await.unwrap();
         // anvil mines on receipt, so the node now answers this exact resend with "nonce too low"
         let resent = provider.send_transaction(&relayer, transaction).await.unwrap();
 
         assert_eq!(resent, sent);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires anvil on PATH"]
+    async fn a_used_nonce_that_is_not_found_returns_the_broadcast_hash() {
+        let (_anvil, provider, relayer) = anvil_relayer().await;
+        provider.send_transaction(&relayer, transfer(0, 1)).await.unwrap();
+        let other = transfer(0, 2);
+        let signature = provider.sign_transaction(&relayer, &other).await.unwrap();
+        let TypedTransaction::Eip1559(unsigned) = other.clone() else { unreachable!() };
+        let other_hash = TransactionHash::from_alloy_hash(unsigned.into_signed(signature).hash());
+
+        let error = provider.send_transaction(&relayer, other).await.unwrap_err();
+
+        let SendTransactionError::NonceUsed { hash, .. } = &error else {
+            panic!("expected NonceUsed, got {error}");
+        };
+        assert_eq!(*hash, other_hash);
+        // Callers that match on the message still see the node's rejection.
+        assert!(error.to_string().to_lowercase().contains("nonce too low"), "{error}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires anvil on PATH"]
+    async fn a_too_low_rejection_that_is_not_about_the_nonce_is_not_a_used_nonce() {
+        let (_anvil, provider, relayer) = anvil_relayer().await;
+        let TypedTransaction::Eip1559(mut underfunded_gas) = transfer(0, 1) else { unreachable!() };
+        underfunded_gas.gas_limit = 20_000;
+
+        let error = provider
+            .send_transaction(&relayer, TypedTransaction::Eip1559(underfunded_gas))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().to_lowercase().contains("too low"), "{error}");
+        assert!(!matches!(error, SendTransactionError::NonceUsed { .. }), "{error}");
     }
 }

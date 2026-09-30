@@ -10,6 +10,8 @@ mod layer_extensions;
 use self::evm_provider::EvmProviderNewError;
 use crate::gas::GasEstimatorError;
 use crate::wallet::get_mnemonic_from_signing_key;
+#[cfg(test)]
+pub(crate) use evm_provider::tests::{anvil_relayer, Anvil};
 pub use evm_provider::{
     create_retry_client, EvmProvider, RelayerProvider, RetryClientError, SendTransactionError,
 };
