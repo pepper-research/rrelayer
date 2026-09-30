@@ -1011,13 +1011,19 @@ impl TransactionsQueues {
         }
     }
 
-    /// Returns how many pending nonces changed.
+    /// Returns how many pending nonces changed. Nothing is renumbered unless the persisted
+    /// high-water mark could be read.
     async fn resync_pending_nonces(
         &mut self,
         relayer_id: &RelayerId,
         transactions_queue: &mut TransactionsQueue,
-    ) -> Result<usize, RpcError<TransportErrorKind>> {
-        let changed = transactions_queue.resync_pending_nonces().await?;
+    ) -> Result<usize, String> {
+        let highest_used =
+            self.db.get_highest_used_nonce(relayer_id).await.map_err(|e| e.to_string())?;
+        let changed = transactions_queue
+            .resync_pending_nonces(highest_used)
+            .await
+            .map_err(|e| e.to_string())?;
         for (transaction_id, nonce) in &changed {
             if let Err(db_error) = self.db.transaction_update_nonce(transaction_id, nonce).await {
                 error!(
@@ -1166,6 +1172,14 @@ impl TransactionsQueues {
                                 let will_revert = error_msg.contains("execution reverted");
                                 let intrinsic_gas_too_low =
                                     error_msg.contains("intrinsic gas too low");
+                                // Some nodes answer "invalid nonce" for a future nonce, so it only
+                                // means "used" when the head is below the chain's nonce.
+                                let nonce_gap = error_msg.contains("nonce too high")
+                                    || (error_msg.contains("invalid nonce")
+                                        && matches!(
+                                            transactions_queue.get_nonce().await,
+                                            Ok(chain) if transaction.nonce.into_inner() >= chain.into_inner()
+                                        ));
                                 if insufficient_funds || will_revert || intrinsic_gas_too_low {
                                     if insufficient_funds {
                                         error!("process_single_pending: transaction {} failed due to insufficient funds moved to failed - error {}", transaction.id, error_msg);
@@ -1201,11 +1215,12 @@ impl TransactionsQueues {
                                             error,
                                         ),
                                     ))
-                                } else if error_msg.contains("nonce too low")
-                                    || error_msg.contains("nonce is too low")
-                                    || error_msg.contains("invalid nonce")
-                                    || error_msg.contains("nonce has already been used")
-                                    || error_msg.contains("already known")
+                                } else if !nonce_gap
+                                    && (error_msg.contains("nonce too low")
+                                        || error_msg.contains("nonce is too low")
+                                        || error_msg.contains("invalid nonce")
+                                        || error_msg.contains("nonce has already been used")
+                                        || error_msg.contains("already known"))
                                 {
                                     // A used nonce on a first send is normally tracked as sent by
                                     // `send_transaction`; this is a nonce error it could not attribute to
@@ -1249,7 +1264,7 @@ impl TransactionsQueues {
                                             error,
                                         ),
                                     ))
-                                } else if error_msg.contains("nonce too high") {
+                                } else if nonce_gap {
                                     // A gap below the head never fills by itself: a cancelled or failed
                                     // transaction left it, or a restart reloaded stale nonces.
                                     match self
@@ -1550,6 +1565,56 @@ impl TransactionsQueues {
                                                 // Re-sending the payload at a new nonce would execute it twice,
                                                 // so keep checking the receipt of the tracked hash instead.
                                                 warn!("process_single_inmempool: gas bump for transaction {} rejected, nonce {} already used; waiting for the tracked hash - error {}", transaction.id, transaction.nonce.into_inner(), error);
+
+                                                // If the tracked hash still has no receipt once the chain has mined
+                                                // past this nonce, another broadcast used it: an earlier send or bump
+                                                // of this payload whose hash is not tracked, or another signer. The
+                                                // tracked hash can then never land and this queue is FIFO, so waiting
+                                                // would hold back every later receipt: fail it for review instead.
+                                                // The grace period covers nodes that report a nonce as used before
+                                                // they serve the receipt.
+                                                if elapsed.num_seconds() > 60
+                                                    && transactions_queue.get_mined_nonce().await.is_ok_and(
+                                                        |mined| mined.into_inner() > transaction.nonce.into_inner(),
+                                                    )
+                                                    && matches!(
+                                                        transactions_queue
+                                                            .get_receipt(&known_transaction_hash)
+                                                            .await,
+                                                        Ok(None)
+                                                    )
+                                                    && transactions_queue
+                                                        .remove_inmempool_head_without_competitor(&transaction.id)
+                                                        .await
+                                                {
+                                                    let reason = format!(
+                                                        "Nonce {} was used on-chain but tracked hash {} has no receipt; the payload may have executed through another broadcast. Needs review; not re-sent.",
+                                                        transaction.nonce.into_inner(),
+                                                        known_transaction_hash
+                                                    );
+                                                    error!(
+                                                        "process_single_inmempool: transaction {} failed - {}",
+                                                        transaction.id, reason
+                                                    );
+                                                    self.db
+                                                        .update_transaction_failed(&transaction.id, &reason)
+                                                        .await
+                                                        .map_err(|e| ProcessInmempoolTransactionError::CouldNotUpdateTransactionStatusInTheDatabase(*relayer_id, relayer_address, transaction.clone(), TransactionStatus::FAILED, e))?;
+                                                    self.invalidate_transaction_cache(&transaction.id).await;
+
+                                                    if let Some(webhook_manager) = &self.webhook_manager {
+                                                        let webhook_manager = webhook_manager.clone();
+                                                        let failed_transaction = transaction.clone();
+                                                        tokio::spawn(async move {
+                                                            let webhook_manager = webhook_manager.lock().await;
+                                                            webhook_manager
+                                                                .on_transaction_failed(&failed_transaction)
+                                                                .await;
+                                                        });
+                                                    }
+
+                                                    return Ok(ProcessResult::<ProcessInmempoolStatus>::success());
+                                                }
 
                                                 return Ok(ProcessResult::<ProcessInmempoolStatus>::other(
                                                     ProcessInmempoolStatus::StillInmempool,

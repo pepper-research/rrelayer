@@ -1339,8 +1339,9 @@ impl TransactionsQueue {
                 Ok(hash) => hash,
                 // A first send whose nonce the node reports as used was, in every case seen
                 // (robinhood-pk-0, 37 of 37 over 30 days to 2026-09-30), this payload already
-                // included. Track the broadcast hash and let the receipt check settle it;
-                // re-sending at a new nonce would execute the payload twice. A gas bump, cancel or
+                // included. Track the broadcast hash and let the receipt check settle it (or fail
+                // it for review if it never lands); re-sending at a new nonce would execute the
+                // payload twice. A gas bump, cancel or
                 // replace getting this answer means an earlier broadcast won, which this hash does
                 // not track, so those keep the error.
                 Err(SendTransactionError::NonceUsed { hash, error })
@@ -1438,17 +1439,49 @@ impl TransactionsQueue {
         self.evm_provider.get_balance(&address).await
     }
 
-    /// Re-assigns pending nonces consecutively in queue order, starting at the first nonce that is
-    /// neither used on-chain nor held by an in-flight transaction, and resets the nonce manager
-    /// after the last one. The queue is sent front to back, so nonces must follow queue order: a
-    /// head whose nonce is above a queued one is rejected as "nonce too high" forever.
+    pub async fn get_mined_nonce(&self) -> Result<TransactionNonce, RpcError<TransportErrorKind>> {
+        self.evm_provider.get_mined_nonce_from_address(&self.relay_address()).await
+    }
+
+    /// Removes the in-mempool head if it is `transaction_id` and no cancel or replace competes
+    /// for its nonce. Returns whether it was removed.
+    pub async fn remove_inmempool_head_without_competitor(
+        &self,
+        transaction_id: &TransactionId,
+    ) -> bool {
+        let mut transactions = self.inmempool_transactions.lock().await;
+        match transactions.front() {
+            Some(head) if head.original.id == *transaction_id && head.competitive.is_none() => {
+                transactions.pop_front();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Re-assigns pending nonces consecutively in queue order and resets the nonce manager after
+    /// the last one. The queue is sent front to back, so nonces must follow queue order: a head
+    /// whose nonce is above a queued one is rejected as "nonce too high" forever.
+    ///
+    /// Pending transactions have never been sent, so they may move, but never onto a nonce that
+    /// could be used: numbering starts above the chain's nonce, every in-flight and
+    /// mined-but-unconfirmed transaction, and `highest_used` (the persisted high-water mark, which
+    /// also covers confirmed transactions). A single lagging RPC read therefore cannot pull the
+    /// queue down onto used nonces.
     /// Returns the transactions whose nonce changed, for the caller to persist.
     pub async fn resync_pending_nonces(
         &self,
+        highest_used: Option<TransactionNonce>,
     ) -> Result<Vec<(TransactionId, TransactionNonce)>, RpcError<TransportErrorKind>> {
         let mut next = self.get_nonce().await?.into_inner();
+        if let Some(highest_used) = highest_used {
+            next = next.max(highest_used.into_inner() + 1);
+        }
         for in_flight in self.inmempool_transactions.lock().await.iter() {
             next = next.max(in_flight.original.nonce.into_inner() + 1);
+        }
+        for mined in self.mined_transactions.lock().await.values() {
+            next = next.max(mined.nonce.into_inner() + 1);
         }
 
         let mut changed = Vec::new();
@@ -1608,6 +1641,7 @@ mod nonce_resync_tests {
     async fn queue(
         pending_nonces: &[u64],
         in_flight_nonces: &[u64],
+        mined_nonces: &[u64],
         next_nonce: u64,
     ) -> (Anvil, TransactionsQueue) {
         let (anvil, provider, relayer) = anvil_relayer().await;
@@ -1616,6 +1650,13 @@ mod nonce_resync_tests {
             .iter()
             .map(|n| CompetitiveTransaction::new(transaction(&relayer, *n)))
             .collect();
+        let mined = mined_nonces
+            .iter()
+            .map(|n| {
+                let mined = transaction(&relayer, *n);
+                (mined.id, mined)
+            })
+            .collect();
         let queue = TransactionsQueue::new(
             TransactionsQueueSetup::new(
                 relayer,
@@ -1623,7 +1664,7 @@ mod nonce_resync_tests {
                 NonceManager::new(TransactionNonce::new(next_nonce)),
                 pending,
                 in_flight,
-                HashMap::new(),
+                mined,
                 Arc::new(SafeProxyManager::new(vec![])),
                 GasBumpBlockConfig::default(),
                 2,
@@ -1644,9 +1685,9 @@ mod nonce_resync_tests {
     async fn a_head_moved_past_the_queue_goes_back_into_order() {
         // robinhood-pk-0, 2026-09-29: the head was given the next free nonce (4400) while
         // 4394-4399 waited behind it, so every send of the head was "nonce too high".
-        let (_anvil, queue) = queue(&[6, 0, 1, 2, 3, 4, 5], &[], 7).await;
+        let (_anvil, queue) = queue(&[6, 0, 1, 2, 3, 4, 5], &[], &[], 7).await;
 
-        let changed = queue.resync_pending_nonces().await.unwrap();
+        let changed = queue.resync_pending_nonces(None).await.unwrap();
 
         assert_eq!(pending_nonces(&queue).await, vec![0, 1, 2, 3, 4, 5, 6]);
         assert_eq!(changed.len(), 7);
@@ -1658,9 +1699,9 @@ mod nonce_resync_tests {
     async fn a_gap_closes_without_reusing_an_in_flight_nonce() {
         // Nonce 0 is sent but not mined; the pending transaction sits above a gap, as after a
         // cancelled transaction or a restart that reloaded stale nonces.
-        let (_anvil, queue) = queue(&[5], &[0], 6).await;
+        let (_anvil, queue) = queue(&[5], &[0], &[], 6).await;
 
-        queue.resync_pending_nonces().await.unwrap();
+        queue.resync_pending_nonces(None).await.unwrap();
 
         assert_eq!(pending_nonces(&queue).await, vec![1]);
         assert_eq!(queue.nonce_manager.get_current_nonce().await.into_inner(), 2);
@@ -1669,11 +1710,47 @@ mod nonce_resync_tests {
     #[tokio::test]
     #[ignore = "requires anvil on PATH"]
     async fn an_ordered_queue_is_left_alone() {
-        let (_anvil, queue) = queue(&[0, 1, 2], &[], 3).await;
+        let (_anvil, queue) = queue(&[0, 1, 2], &[], &[], 3).await;
 
-        let changed = queue.resync_pending_nonces().await.unwrap();
+        let changed = queue.resync_pending_nonces(None).await.unwrap();
 
         assert!(changed.is_empty());
         assert_eq!(pending_nonces(&queue).await, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires anvil on PATH"]
+    async fn a_lagging_chain_read_cannot_pull_the_queue_onto_used_nonces() {
+        // anvil reports nonce 0, as a lagging node would, but nonces up to 3 were mined and the
+        // persisted high-water mark says 7 was used.
+        let (_anvil, queue) = queue(&[1, 2], &[], &[3], 3).await;
+
+        queue.resync_pending_nonces(None).await.unwrap();
+        assert_eq!(pending_nonces(&queue).await, vec![4, 5]);
+
+        queue.resync_pending_nonces(Some(TransactionNonce::new(7))).await.unwrap();
+        assert_eq!(pending_nonces(&queue).await, vec![8, 9]);
+        assert_eq!(queue.nonce_manager.get_current_nonce().await.into_inner(), 10);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires anvil on PATH"]
+    async fn only_an_uncontested_in_flight_head_is_removed() {
+        let (_anvil, queue) = queue(&[], &[0, 1], &[], 2).await;
+        let (head, second) = {
+            let in_flight = queue.inmempool_transactions.lock().await;
+            (in_flight[0].original.id, in_flight[1].original.id)
+        };
+
+        assert!(!queue.remove_inmempool_head_without_competitor(&second).await);
+        {
+            let mut in_flight = queue.inmempool_transactions.lock().await;
+            let competitor = in_flight[0].original.clone();
+            in_flight[0].competitive = Some((competitor, CompetitionType::Cancel));
+        }
+        assert!(!queue.remove_inmempool_head_without_competitor(&head).await);
+        queue.inmempool_transactions.lock().await[0].competitive = None;
+        assert!(queue.remove_inmempool_head_without_competitor(&head).await);
+        assert_eq!(queue.inmempool_transactions.lock().await[0].original.id, second);
     }
 }

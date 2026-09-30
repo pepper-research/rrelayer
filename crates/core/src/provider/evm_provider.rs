@@ -374,6 +374,21 @@ impl EvmProvider {
         Ok(TransactionNonce::new(nonce))
     }
 
+    /// Nonces used by mined transactions only, unlike `get_nonce_from_address` which also counts
+    /// the mempool.
+    pub async fn get_mined_nonce_from_address(
+        &self,
+        address: &EvmAddress,
+    ) -> Result<TransactionNonce, RpcError<TransportErrorKind>> {
+        let nonce = self
+            .rpc_client()
+            .get_transaction_count(address.into_address())
+            .block_id(BlockId::Number(BlockNumberOrTag::Latest))
+            .await?;
+
+        Ok(TransactionNonce::new(nonce))
+    }
+
     pub async fn send_transaction(
         &self,
         relayer: &Relayer,
