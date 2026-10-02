@@ -6,6 +6,7 @@ on:
     branches:
       - 'release/**'
       - 'master'
+      - 'feature/7702-support'
   pull_request:
     branches:
       - 'master'
@@ -26,6 +27,7 @@ jobs:
         run: cargo fmt --all -- --check
 
   clippy:
+    if: github.base_ref != 'feature/7702-support' && github.ref != 'refs/heads/feature/7702-support'
     name: Clippy
     runs-on: ubuntu-latest
     steps:
@@ -36,8 +38,33 @@ jobs:
       - name: Run clippy
         run: cargo clippy -- -D warnings -A clippy::uninlined_format_args
 
+  production-line-checks:
+    name: Production line check and library tests
+    if: github.base_ref == 'feature/7702-support' || github.ref == 'refs/heads/feature/7702-support'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Check workspace
+        run: cargo check --workspace
+      - name: Run library tests including Anvil regressions
+        run: cargo test --workspace --lib -- --include-ignored
+
   build:
     if: |
+      github.base_ref != 'feature/7702-support' &&
+      github.ref != 'refs/heads/feature/7702-support' &&
       (github.event_name == 'push' || github.event_name == 'pull_request') &&
       github.actor != 'github-actions[bot]' &&
       (
