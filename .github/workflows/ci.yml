@@ -781,6 +781,9 @@ jobs:
 
   docker:
     name: Build and Publish Docker Image
+    permissions:
+      contents: read
+      packages: write
     needs: release
     if: |
       github.actor != 'github-actions[bot]' &&
