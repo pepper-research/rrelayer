@@ -5,7 +5,7 @@ use crate::{
     network::ChainId,
     postgres::{PostgresClient, PostgresError},
     provider::EvmProvider,
-    relayer::types::{Relayer, RelayerId},
+    relayer::types::{Relayer, RelayerId, WalletIndex},
 };
 use std::error::Error;
 use thiserror::Error;
@@ -192,8 +192,8 @@ impl PostgresClient {
                 .map_err(|e| CreateRelayerError::CouldNotSaveRelayerDb(name.to_string(), *chain_id, e))?
             }
             CreateRelayerMode::PrivateKeyImport(wallet_index) => {
-                // Convert negative wallet index to positive private key index for address lookup
-                let private_key_index = (-wallet_index - 1) as u32;
+                // Probe the same private-key manager used by the persisted relayer.
+                let private_key_index = WalletIndex::PrivateKey(*wallet_index).index();
                 let address = evm_provider.get_address(private_key_index).await.map_err(|e| {
                     CreateRelayerError::WalletError(name.to_string(), *chain_id, Box::new(e))
                 })?;

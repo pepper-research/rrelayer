@@ -68,11 +68,22 @@ networks:
 
   - name: base-mainnet
     chain_id: 8453
+    # Keep existing private-key custody while adding one isolated gas wallet.
+    # Its KMS role can use only the precreated wallet-0-8453 key.
+    signing_provider:
+      aws_kms:
+        region: "us-east-1"
+        danger_override_alias: "spice-stocks-limits"
+      private_keys:
+        - raw: ${RRELAYER_PRIVATE_KEY}
     provider_urls:
       - https://base.drpc.org
     block_explorer_url: https://base.blockscout.com/
     enable_sending_blobs: true
-    allowed_random_relayers: "*"
+    # Preserve both existing Base members; the limit wallet is fixed-ID only.
+    allowed_random_relayers:
+      - "0x11136a187522408579af502dffc778780daa1022"
+      - "0x279b834717c32a6cbce841f05434736c53457a21"
 
   - name: base-sepolia
     chain_id: 84532
