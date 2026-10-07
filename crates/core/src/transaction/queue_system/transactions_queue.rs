@@ -43,6 +43,41 @@ use tokio::sync::Mutex;
 use tracing::error;
 use tracing::info;
 
+fn fixed_envelope_matches_hash(bytes: &[u8], hash: TransactionHash) -> bool {
+    alloy::primitives::keccak256(bytes) == hash.into_alloy_hash()
+}
+
+fn fixed_nonce_available(
+    latest: TransactionNonce,
+    pending: TransactionNonce,
+    signed: TransactionNonce,
+) -> bool {
+    latest.into_inner() <= signed.into_inner() && pending == signed
+}
+
+#[cfg(test)]
+mod fixed_envelope_tests {
+    use super::{fixed_envelope_matches_hash, fixed_nonce_available};
+    use crate::transaction::types::{TransactionHash, TransactionNonce};
+
+    #[test]
+    fn restart_recovery_accepts_only_original_signed_bytes() {
+        let original = [0x02, 0x80, 0x01, 0x00];
+        let hash = TransactionHash::from_alloy_hash(&alloy::primitives::keccak256(original));
+        assert!(fixed_envelope_matches_hash(&original, hash));
+        assert!(!fixed_envelope_matches_hash(&[0x02, 0x80, 0x01, 0x01], hash));
+    }
+
+    #[test]
+    fn consumed_nonce_blocks_rebroadcast_of_original() {
+        let nonce = TransactionNonce::new(7);
+        assert!(fixed_nonce_available(nonce, nonce, nonce));
+        assert!(!fixed_nonce_available(TransactionNonce::new(8), nonce, nonce));
+        assert!(!fixed_nonce_available(nonce, TransactionNonce::new(8), nonce));
+        assert!(!fixed_nonce_available(nonce, TransactionNonce::new(6), nonce));
+    }
+}
+
 pub struct TransactionsQueue {
     pending_transactions: Mutex<VecDeque<Transaction>>,
     inmempool_transactions: Mutex<VecDeque<CompetitiveTransaction>>,
@@ -59,6 +94,39 @@ pub struct TransactionsQueue {
 }
 
 impl TransactionsQueue {
+    pub fn is_isolated_limit_base(&self) -> bool {
+        self.evm_provider.is_isolated_limit_base()
+    }
+
+    pub async fn prepare_fixed_signed_transaction(
+        &self,
+        transaction: &TypedTransaction,
+    ) -> Result<(Vec<u8>, TransactionHash), WalletError> {
+        let (bytes, hash) = self
+            .evm_provider
+            .sign_raw_transaction(&self.relayer, transaction.clone())
+            .await
+            .map_err(|error| WalletError::GenericSignerError(error.to_string()))?;
+        Ok((bytes, hash))
+    }
+
+    async fn gas_price_for_speed(&self, speed: &TransactionSpeed) -> Option<GasPriceResult> {
+        if self.is_isolated_limit_base() {
+            let prices = self.evm_provider.calculate_gas_price().await.ok()?;
+            return Some(match speed {
+                TransactionSpeed::SUPER => prices.super_fast,
+                TransactionSpeed::FAST => prices.fast,
+                TransactionSpeed::MEDIUM => prices.medium,
+                TransactionSpeed::SLOW => prices.slow,
+            });
+        }
+        self.gas_oracle_cache
+            .lock()
+            .await
+            .get_gas_price_for_speed(&self.relayer.chain_id, speed)
+            .await
+    }
+
     pub fn new(
         setup: TransactionsQueueSetup,
         gas_oracle_cache: Arc<Mutex<GasOracleCache>>,
@@ -111,12 +179,7 @@ impl TransactionsQueue {
     /// Checks if a transaction has reached the maximum gas price cap and shouldn't be bumped further
     pub async fn is_at_max_gas_price_cap(&self, sent_gas: &GasPriceResult) -> bool {
         // Get SUPER speed gas price for cap calculation
-        let super_gas_price = {
-            let gas_oracle = self.gas_oracle_cache.lock().await;
-            gas_oracle
-                .get_gas_price_for_speed(&self.relayer.chain_id, &TransactionSpeed::SUPER)
-                .await
-        };
+        let super_gas_price = self.gas_price_for_speed(&TransactionSpeed::SUPER).await;
 
         if let Some(super_price) = super_gas_price {
             let max_allowed_max_fee =
@@ -755,13 +818,10 @@ impl TransactionsQueue {
             transaction_speed, self.relayer.name
         );
 
-        let mut gas_price = {
-            let gas_oracle = self.gas_oracle_cache.lock().await;
-            gas_oracle
-                .get_gas_price_for_speed(&self.relayer.chain_id, transaction_speed)
-                .await
-                .ok_or(SendTransactionGasPriceError::GasCalculationError)?
-        };
+        let mut gas_price = self
+            .gas_price_for_speed(transaction_speed)
+            .await
+            .ok_or(SendTransactionGasPriceError::GasCalculationError)?;
 
         if let Some(sent_gas) = sent_last_with {
             info!("Adjusting gas price based on previous attempt for relayer: {}. Previous max_fee: {}, max_priority_fee: {}",
@@ -775,12 +835,7 @@ impl TransactionsQueue {
                         self.relayer.name, transaction_speed, next_speed
                     );
                     // Get gas price for the next speed level
-                    if let Some(escalated_gas_price) = {
-                        let gas_oracle = self.gas_oracle_cache.lock().await;
-                        gas_oracle
-                            .get_gas_price_for_speed(&self.relayer.chain_id, &next_speed)
-                            .await
-                    } {
+                    if let Some(escalated_gas_price) = self.gas_price_for_speed(&next_speed).await {
                         gas_price = escalated_gas_price;
                         info!(
                             "Escalated gas price for relayer: {} - max_fee: {}, max_priority_fee: {}",
@@ -840,12 +895,7 @@ impl TransactionsQueue {
             }
 
             // Get SUPER speed gas price for cap calculation
-            let super_gas_price = {
-                let gas_oracle = self.gas_oracle_cache.lock().await;
-                gas_oracle
-                    .get_gas_price_for_speed(&self.relayer.chain_id, &TransactionSpeed::SUPER)
-                    .await
-            };
+            let super_gas_price = self.gas_price_for_speed(&TransactionSpeed::SUPER).await;
 
             if let Some(super_price) = super_gas_price {
                 let max_allowed_max_fee =
@@ -1097,6 +1147,76 @@ impl TransactionsQueue {
         db: &mut PostgresClient,
         transaction: &mut Transaction,
     ) -> Result<TransactionSentWithRelayer, TransactionQueueSendTransactionError> {
+        if self.is_isolated_limit_base() {
+            let hash = transaction.known_transaction_hash.ok_or_else(|| {
+                TransactionQueueSendTransactionError::TransactionConversionError(
+                    "Fixed Base transaction has no signed hash".to_string(),
+                )
+            })?;
+            let gas = transaction.sent_with_gas.clone().ok_or_else(|| {
+                TransactionQueueSendTransactionError::TransactionConversionError(
+                    "Fixed Base transaction has no signed gas quote".to_string(),
+                )
+            })?;
+            let bytes = db.get_fixed_signed_envelope(&transaction.id).await?.ok_or_else(|| {
+                TransactionQueueSendTransactionError::TransactionConversionError(
+                    "Fixed Base transaction has no durable signed envelope".to_string(),
+                )
+            })?;
+            if !fixed_envelope_matches_hash(&bytes, hash) {
+                return Err(TransactionQueueSendTransactionError::TransactionConversionError(
+                    "Fixed Base signed envelope hash mismatch".to_string(),
+                ));
+            }
+            let receipt = self
+                .evm_provider
+                .get_receipt(&hash)
+                .await
+                .map_err(TransactionQueueSendTransactionError::TransactionEstimateGasError)?;
+            let known = if receipt.is_some() {
+                true
+            } else {
+                self.evm_provider
+                    .has_transaction_hash(&hash)
+                    .await
+                    .map_err(TransactionQueueSendTransactionError::TransactionEstimateGasError)?
+            };
+            if !known {
+                let latest = self
+                    .evm_provider
+                    .get_latest_nonce_from_address(&self.relayer.address)
+                    .await
+                    .map_err(TransactionQueueSendTransactionError::TransactionEstimateGasError)?;
+                let pending =
+                    self.evm_provider.get_nonce_from_address(&self.relayer.address).await.map_err(
+                        TransactionQueueSendTransactionError::TransactionEstimateGasError,
+                    )?;
+                if !fixed_nonce_available(latest, pending, transaction.nonce) {
+                    return Err(TransactionQueueSendTransactionError::TransactionConversionError(
+                        "Fixed Base nonce consumed while original hash is absent; holding request"
+                            .to_string(),
+                    ));
+                }
+                let returned = self
+                    .evm_provider
+                    .send_raw_signed(&bytes, hash)
+                    .await
+                    .map_err(TransactionQueueSendTransactionError::TransactionSendError)?;
+                if returned != hash {
+                    return Err(TransactionQueueSendTransactionError::TransactionConversionError(
+                        "Fixed Base gateway returned a different transaction hash".to_string(),
+                    ));
+                }
+            }
+            let sent = TransactionSentWithRelayer {
+                id: transaction.id,
+                hash,
+                sent_with_gas: gas,
+                sent_with_blob_gas: None,
+            };
+            db.transaction_sent(&sent.id, &sent.hash, &sent.sent_with_gas, None, false).await?;
+            return Ok(sent);
+        }
         info!(
             "rrelayer_send_prepare {} speed={:?}",
             transaction_context(transaction, &self.relayer),

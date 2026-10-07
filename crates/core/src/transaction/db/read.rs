@@ -7,6 +7,19 @@ use crate::{
 };
 
 impl PostgresClient {
+    pub async fn get_fixed_signed_envelope(
+        &self,
+        id: &TransactionId,
+    ) -> Result<Option<Vec<u8>>, PostgresError> {
+        let row = self
+            .query_one_or_none(
+                "SELECT signed_envelope FROM relayer.transaction WHERE id = $1",
+                &[id],
+            )
+            .await?;
+        Ok(row.and_then(|row| row.get::<_, Option<Vec<u8>>>("signed_envelope")))
+    }
+
     pub async fn get_transaction(
         &self,
         id: &TransactionId,

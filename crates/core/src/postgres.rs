@@ -47,6 +47,9 @@ pub enum PostgresError {
 
     #[error("Connection pool error: {0}")]
     ConnectionPoolError(#[from] RunError<tokio_postgres::Error>),
+
+    #[error("Fixed Base relayer has an unresolved original transaction")]
+    FixedBaseLaneBusy,
 }
 
 pub struct PostgresClient {
@@ -54,6 +57,19 @@ pub struct PostgresClient {
 }
 
 impl PostgresClient {
+    #[cfg(test)]
+    pub async fn for_test_url(url: &str) -> Result<Self, PostgresConnectionError> {
+        let mut config: Config =
+            url.parse().map_err(|_| PostgresConnectionError::CouldNotParseConnectionString)?;
+        config.ssl_mode(SslMode::Disable);
+        let connector = TlsConnector::builder()
+            .build()
+            .map_err(|_| PostgresConnectionError::CouldNotCreateTlsConnector)?;
+        let manager = PostgresConnectionManager::new(config, MakeTlsConnector::new(connector));
+        let pool = Pool::builder().build(manager).await?;
+        Ok(PostgresClient { pool })
+    }
+
     /// Creates a new PostgreSQL client with connection pooling.
     pub async fn new() -> Result<Self, PostgresConnectionError> {
         async fn _new(disable_ssl: bool) -> Result<PostgresClient, PostgresConnectionError> {

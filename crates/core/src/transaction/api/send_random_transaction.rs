@@ -50,6 +50,7 @@ async fn select_random_relayer(
         .into_iter()
         .filter(|r| {
             !r.paused
+                && !crate::provider::is_limit_base_address(&r.chain_id, &r.address)
                 && !state.relayer_internal_only.restricted(&r.address, &r.chain_id)
                 && state.relayers_allowed_for_random.is_allowed(&r.address, &r.chain_id)
         })

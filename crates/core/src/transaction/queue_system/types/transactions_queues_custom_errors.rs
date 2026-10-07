@@ -65,6 +65,9 @@ pub enum AddTransactionError {
     #[error("Relayer {0} is paused")]
     RelayerIsPaused(RelayerId),
 
+    #[error("Fixed Base relayer has an unresolved original transaction")]
+    FixedBaseLaneBusy,
+
     #[error("{0}")]
     TransactionGasPriceError(#[from] SendTransactionGasPriceError),
 
@@ -96,6 +99,10 @@ impl From<AddTransactionError> for HttpError {
 
         if matches!(value, AddTransactionError::UnsupportedTransactionType { .. }) {
             return bad_request(value.to_string());
+        }
+
+        if matches!(value, AddTransactionError::FixedBaseLaneBusy) {
+            return forbidden(value.to_string());
         }
 
         internal_server_error(Some(value.to_string()))
