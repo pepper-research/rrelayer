@@ -8,6 +8,7 @@ pub use shutdown::{enter_critical_operation, is_shutdown_in_progress, request_gr
 mod middleware;
 pub mod network;
 mod postgres;
+mod sender_handoff;
 pub use postgres::{PostgresClient, PostgresConnectionError};
 mod provider;
 pub use provider::create_retry_client;

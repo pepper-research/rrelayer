@@ -1,4 +1,4 @@
-name: Deploy rrelayer dev
+name: Build rrelayer dev candidate
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ env:
 
 jobs:
   deploy:
-    name: Build and deploy
+    name: Build immutable candidate
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
 
@@ -50,9 +50,11 @@ jobs:
           file: ./Dockerfile.aws-dev
           platforms: linux/arm64
           push: true
+          build-args: |
+            RRELAYER_CONFIG=deploy/rrelayer-dev.yaml
+            SOURCE_REVISION=${{ github.sha }}
           tags: |
-            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
-            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:dev
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}-${{ github.run_id }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -62,12 +64,27 @@ jobs:
         with:
           task-definition: ${{ env.ECS_TASK_DEFINITION }}
           container-name: ${{ env.ECS_CONTAINER_NAME }}
-          image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}@${{ steps.build-image.outputs.digest }}
+          environment-variables: |
+            RRELAYER_RELEASE_ID=${{ github.sha }}
 
-      - name: Deploy ECS service
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      # Deployment consumes the same digest after dev acceptance. Merging source
+      # must never start a second, unverified sender or bypass legacy bootstrap.
+      - name: Save promotion identity
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          IMAGE_DIGEST: ${{ steps.build-image.outputs.digest }}
+          TASK_FILE: ${{ steps.render-task.outputs.task-definition }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, shutil
+          shutil.copyfile(os.environ['TASK_FILE'], 'candidate-task-definition.json')
+          with open('candidate.json', 'w') as f:
+              json.dump({'source':os.environ['SOURCE_SHA'], 'image_digest':os.environ['IMAGE_DIGEST'], 'protocol':1, 'accepted':False}, f)
+          PYTHON
+      - uses: actions/upload-artifact@v4
         with:
-          task-definition: ${{ steps.render-task.outputs.task-definition }}
-          service: ${{ env.ECS_SERVICE }}
-          cluster: ${{ env.ECS_CLUSTER }}
-          wait-for-service-stability: true
+          name: rrelayer-candidate-${{ github.sha }}
+          path: |
+            candidate.json
+            candidate-task-definition.json

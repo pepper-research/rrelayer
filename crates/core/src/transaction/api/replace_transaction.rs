@@ -41,8 +41,8 @@ pub async fn replace_transaction(
     state.network_permission_validate(
         &transaction.from,
         &transaction.chain_id,
-        &transaction.to,
-        &transaction.value,
+        &replace_with.to,
+        &replace_with.value,
         NetworkValidateAction::Transaction,
     )?;
 

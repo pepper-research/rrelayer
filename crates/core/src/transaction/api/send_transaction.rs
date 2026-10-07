@@ -84,6 +84,16 @@ pub async fn send_transaction(
     state: &Arc<AppState>,
     headers: &HeaderMap,
 ) -> Result<SendTransactionResult, HttpError> {
+    send_transaction_with_id(relayer, transaction, state, headers, None).await
+}
+
+pub(super) async fn send_transaction_with_id(
+    relayer: Relayer,
+    transaction: RelayTransactionRequest,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    id: Option<TransactionId>,
+) -> Result<SendTransactionResult, HttpError> {
     state.validate_auth_basic_or_api_key(headers, &relayer.address, &relayer.chain_id)?;
 
     if state.relayer_internal_only.restricted(&relayer.address, &relayer.chain_id) {
@@ -120,7 +130,7 @@ pub async fn send_transaction(
     )
     .await?;
 
-    let transaction_to_send = TransactionToSend::new(
+    let mut transaction_to_send = TransactionToSend::new(
         transaction.authorization_list,
         transaction.to,
         transaction.value,
@@ -129,6 +139,10 @@ pub async fn send_transaction(
         convert_blob_strings_to_blobs(transaction.blobs)?,
         transaction.external_id,
     );
+
+    if let Some(id) = id {
+        transaction_to_send.id = id;
+    }
 
     let transaction = state
         .transactions_queues

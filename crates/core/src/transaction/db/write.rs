@@ -32,6 +32,25 @@ impl PostgresClient {
         transaction: &Transaction,
         signed_envelope: Option<&[u8]>,
     ) -> Result<(), PostgresError> {
+        self.save_transaction_and_link(relayer_id, transaction, signed_envelope, None).await
+    }
+
+    pub async fn save_competitor(
+        &mut self,
+        original: &TransactionId,
+        transaction: &Transaction,
+    ) -> Result<(), PostgresError> {
+        self.save_transaction_and_link(&transaction.relayer_id, transaction, None, Some(original))
+            .await
+    }
+
+    async fn save_transaction_and_link(
+        &mut self,
+        relayer_id: &RelayerId,
+        transaction: &Transaction,
+        signed_envelope: Option<&[u8]>,
+        original: Option<&TransactionId>,
+    ) -> Result<(), PostgresError> {
         let mut conn = self.pool.get().await?;
         let trans = conn.transaction().await.map_err(PostgresError::PgError)?;
 
@@ -71,8 +90,8 @@ impl PostgresClient {
         for table_name in TRANSACTION_TABLES.iter() {
             trans.execute(
                 format!("
-                INSERT INTO {}(id, relayer_id, authorization_list, \"to\", \"from\", nonce, chain_id, data, value, blobs, gas_limit, speed, status, expires_at, queued_at, hash, external_id, cancelled_by_transaction_id, signed_envelope, sent_with_gas)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20);
+                INSERT INTO {}(id, relayer_id, authorization_list, \"to\", \"from\", nonce, chain_id, data, value, blobs, gas_limit, speed, status, expires_at, queued_at, hash, external_id, cancelled_by_transaction_id, signed_envelope, sent_with_gas, broadcast_attempted)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, FALSE);
             ", table_name).as_str(),
                 &[&transaction.id,
                     &relayer_id,
@@ -99,6 +118,9 @@ impl PostgresClient {
                 .await?;
         }
 
+        if let Some(original) = original {
+            trans.query_one("UPDATE relayer.transaction SET cancelled_by_transaction_id=$2, status='INMEMPOOL', competition_kind=$3 WHERE id=$1 AND cancelled_by_transaction_id IS NULL AND status IN ('PENDING','INMEMPOOL') RETURNING id", &[original, &transaction.id, &if transaction.is_noop { "cancel" } else { "replace" }]).await?;
+        }
         trans.commit().await?;
 
         Ok(())
@@ -204,8 +226,8 @@ impl PostgresClient {
         for table_name in TRANSACTION_TABLES.iter() {
             trans.execute(
                 format!("
-                INSERT INTO {}(id, relayer_id, authorization_list, \"to\", \"from\", nonce, chain_id, data, value, blobs, speed, status, expires_at, queued_at, failed_at, failed_reason, external_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), $15, $16);
+                INSERT INTO {}(id, relayer_id, authorization_list, \"to\", \"from\", nonce, chain_id, data, value, blobs, speed, status, expires_at, queued_at, failed_at, failed_reason, external_id, broadcast_attempted)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), $15, $16, FALSE);
                 ", table_name).as_str(),
                 &[
                     &transaction.id,
@@ -341,6 +363,7 @@ impl PostgresClient {
         &mut self,
         transaction: &Transaction,
         transaction_receipt: &AnyTransactionReceipt,
+        loser: Option<&Transaction>,
     ) -> Result<(), PostgresError> {
         let mut conn = self.pool.get().await?;
         let trans = conn.transaction().await.map_err(PostgresError::PgError)?;
@@ -380,7 +403,7 @@ impl PostgresClient {
             ",
                 &[
                     &transaction.id,
-                    &TransactionStatus::MINED,
+                    &transaction.status,
                     &authorization_list_json,
                     &transaction.to,
                     &transaction.from,
@@ -420,7 +443,7 @@ impl PostgresClient {
             ",
                 &[
                     &transaction.id,
-                    &TransactionStatus::MINED,
+                    &transaction.status,
                     &authorization_list_json,
                     &transaction.to,
                     &transaction.from,
@@ -432,7 +455,7 @@ impl PostgresClient {
                     &block_hash,
                     &block_number,
                     &transaction.speed,
-                    &transaction.known_transaction_hash,
+                    &hash,
                     &transaction.sent_with_max_fee_per_gas,
                     &transaction.sent_with_max_priority_fee_per_gas,
                     &transaction.external_id,
@@ -440,6 +463,15 @@ impl PostgresClient {
             )
             .await?;
 
+        if let Some(loser) = loser {
+            trans
+                .execute(
+                    "UPDATE relayer.transaction SET status=$2 WHERE id=$1",
+                    &[&loser.id, &loser.status],
+                )
+                .await?;
+            trans.execute("INSERT INTO relayer.transaction_audit_log(id,relayer_id,\"to\",\"from\",nonce,chain_id,data,value,speed,status,expires_at,queued_at,hash,cancelled_by_transaction_id) SELECT id,relayer_id,\"to\",\"from\",nonce,chain_id,data,value,speed,status,expires_at,queued_at,hash,cancelled_by_transaction_id FROM relayer.transaction WHERE id=$1", &[&loser.id]).await?;
+        }
         trans.commit().await?;
         Ok(())
     }
@@ -582,6 +614,21 @@ impl PostgresClient {
     }
 
     pub async fn transaction_update(&self, transaction: &Transaction) -> Result<(), PostgresError> {
+        self.transaction_update_if_unbroadcast(transaction, false).await.map(|_| ())
+    }
+
+    pub async fn transaction_replace_unbroadcast(
+        &self,
+        transaction: &Transaction,
+    ) -> Result<bool, PostgresError> {
+        self.transaction_update_if_unbroadcast(transaction, true).await
+    }
+
+    async fn transaction_update_if_unbroadcast(
+        &self,
+        transaction: &Transaction,
+        require_unbroadcast: bool,
+    ) -> Result<bool, PostgresError> {
         let mut conn = self.pool.get().await?;
         let trans = conn.transaction().await.map_err(PostgresError::PgError)?;
 
@@ -600,7 +647,7 @@ impl PostgresClient {
             .as_ref()
             .map(|list| serde_json::to_value(list).unwrap_or(serde_json::Value::Null));
 
-        trans
+        let updated = trans
             .execute(
                 "
                     UPDATE relayer.transaction
@@ -626,8 +673,8 @@ impl PostgresClient {
                         sent_with_gas = $21,
                         sent_with_blob_gas = $22,
                         external_id = $23,
-                        cancelled_by_transaction_id = $24
-                    WHERE id = $1
+                        cancelled_by_transaction_id = $24, blobs = $25
+                    WHERE id = $1 AND (NOT $26 OR NOT broadcast_attempted)
                 ",
                 &[
                     &transaction.id,
@@ -654,11 +701,16 @@ impl PostgresClient {
                     &sent_with_blob_gas_json,
                     &transaction.external_id,
                     &transaction.cancelled_by_transaction_id,
+                    &transaction.blobs,
+                    &require_unbroadcast,
                 ],
             )
             .await
             .map_err(PostgresError::PgError)?;
 
+        if updated == 0 {
+            return Ok(false);
+        }
         trans
             .execute(
                 "
@@ -684,7 +736,7 @@ impl PostgresClient {
             .map_err(PostgresError::PgError)?;
 
         trans.commit().await.map_err(PostgresError::PgError)?;
-        Ok(())
+        Ok(true)
     }
 }
 

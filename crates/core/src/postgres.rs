@@ -42,6 +42,10 @@ pub enum PostgresConnectionError {
 
 #[derive(thiserror::Error, Debug)]
 pub enum PostgresError {
+    #[error("Sender is standby or busy")]
+    SenderUnavailable,
+    #[error("Sender handoff: {0}")]
+    Handoff(String),
     #[error("PgError {0}")]
     PgError(#[from] PgError),
 
@@ -52,8 +56,70 @@ pub enum PostgresError {
     FixedBaseLaneBusy,
 }
 
+// A failed advisory unlock must destroy the session, never return it to the pool.
+pub struct ManagedConnection {
+    pub(crate) client: tokio_postgres::Client,
+    pub(crate) discard: bool,
+}
+impl std::ops::Deref for ManagedConnection {
+    type Target = tokio_postgres::Client;
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+impl std::ops::DerefMut for ManagedConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.client
+    }
+}
+pub struct ConnectionManager(PostgresConnectionManager<MakeTlsConnector>);
+#[async_trait::async_trait]
+impl bb8::ManageConnection for ConnectionManager {
+    type Connection = ManagedConnection;
+    type Error = PgError;
+    async fn connect(&self) -> Result<ManagedConnection, PgError> {
+        Ok(ManagedConnection { client: self.0.connect().await?, discard: false })
+    }
+    async fn is_valid(&self, conn: &mut ManagedConnection) -> Result<(), PgError> {
+        self.0.is_valid(&mut conn.client).await
+    }
+    fn has_broken(&self, conn: &mut ManagedConnection) -> bool {
+        conn.discard || self.0.has_broken(&mut conn.client)
+    }
+}
+
 pub struct PostgresClient {
-    pub pool: Pool<PostgresConnectionManager<MakeTlsConnector>>,
+    pub pool: FencedPool,
+}
+
+// Set the operation's fencing token on every checked-out connection, including
+// connections used by the existing multi-statement transaction writers.
+pub struct FencedPool {
+    pub(crate) inner: Pool<ConnectionManager>,
+    pub(crate) token: String,
+}
+
+impl FencedPool {
+    pub async fn get(
+        &self,
+    ) -> Result<bb8::PooledConnection<'_, ConnectionManager>, RunError<PgError>> {
+        let conn = self.inner.get().await?;
+        conn.batch_execute(
+            "SET statement_timeout = '10s'; SET idle_in_transaction_session_timeout = '10s'",
+        )
+        .await
+        .map_err(RunError::User)?;
+        conn.query_one("SELECT set_config('rrelayer.sender_token', $1, false)", &[&self.token])
+            .await
+            .map_err(RunError::User)?;
+        Ok(conn)
+    }
+}
+
+impl From<Pool<ConnectionManager>> for FencedPool {
+    fn from(inner: Pool<ConnectionManager>) -> Self {
+        Self { inner, token: String::new() }
+    }
 }
 
 impl PostgresClient {
@@ -66,8 +132,8 @@ impl PostgresClient {
             .build()
             .map_err(|_| PostgresConnectionError::CouldNotCreateTlsConnector)?;
         let manager = PostgresConnectionManager::new(config, MakeTlsConnector::new(connector));
-        let pool = Pool::builder().build(manager).await?;
-        Ok(PostgresClient { pool })
+        let pool = Pool::builder().build(ConnectionManager(manager)).await?;
+        Ok(PostgresClient { pool: pool.into() })
     }
 
     /// Creates a new PostgreSQL client with connection pooling.
@@ -125,9 +191,9 @@ impl PostgresClient {
 
             let manager = PostgresConnectionManager::new(config, tls_connector);
 
-            let pool = Pool::builder().build(manager).await?;
+            let pool = Pool::builder().build(ConnectionManager(manager)).await?;
 
-            Ok(PostgresClient { pool })
+            Ok(PostgresClient { pool: pool.into() })
         }
 
         _new(false).await

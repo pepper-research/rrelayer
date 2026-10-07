@@ -128,6 +128,7 @@ async fn continuously_process_pending_transactions(
                     }
                     Err(e) => {
                         match e {
+                            ProcessPendingTransactionError::Handoff(PostgresError::SenderUnavailable) => { sleep_ms(&250).await; }
                             ProcessPendingTransactionError::RelayerTransactionsQueueNotFound(_) => {
                                 // the queue has been deleted so kill out the loop
                                 info!(
@@ -138,7 +139,7 @@ async fn continuously_process_pending_transactions(
                             }
                             _ => {
                                 error!("Relayer id {} - PENDING QUEUE ERROR: {}", relayer_id, e);
-                                if isolated { sleep_ms(&5_000).await; }
+                                sleep_ms(&250).await;
                             }
                         }
                     }
@@ -175,6 +176,7 @@ async fn continuously_process_inmempool_transactions(
                     }
                     Err(e) => {
                         match e {
+                            ProcessInmempoolTransactionError::Handoff(PostgresError::SenderUnavailable) => { sleep_ms(&250).await; }
                             ProcessInmempoolTransactionError::RelayerTransactionsQueueNotFound(_) => {
                                 // the queue has been deleted so kill out the loop
                                 info!(
@@ -185,7 +187,7 @@ async fn continuously_process_inmempool_transactions(
                             }
                             _ => {
                                 error!("Relayer id {} - INMEMPOOL QUEUE ERROR: {}", relayer_id, e);
-                                if isolated { sleep_ms(&5_000).await; }
+                                sleep_ms(&250).await;
                             }
                         }
                     }
@@ -222,6 +224,7 @@ async fn continuously_process_mined_transactions(
                     }
                     Err(e) => {
                         match e {
+                            ProcessMinedTransactionError::Handoff(PostgresError::SenderUnavailable) => { sleep_ms(&250).await; }
                             ProcessMinedTransactionError::RelayerTransactionsQueueNotFound(_) => {
                                 // the queue has been deleted so kill out the loop
                                 info!(
@@ -232,7 +235,7 @@ async fn continuously_process_mined_transactions(
                             }
                             _ => {
                                 error!("Relayer id {} - MINED QUEUE ERROR: {}", relayer_id, e);
-                                if isolated { sleep_ms(&5_000).await; }
+                                sleep_ms(&250).await;
                             }
                         }
                     }
@@ -252,7 +255,7 @@ pub enum RepopulateTransactionsQueueError {
 ///
 /// Loads all transactions with the given status for a relayer from the database,
 /// maintaining their nonce order in the queue.
-async fn repopulate_transaction_queue(
+pub(super) async fn repopulate_transaction_queue(
     db: &PostgresClient,
     relayer_id: &RelayerId,
     status: &TransactionStatus,
@@ -296,7 +299,7 @@ async fn repopulate_transaction_queue(
 /// 2. Identifying competitions via cancelled_by_transaction_id linkage
 /// 3. Determining competition type based on transaction content
 /// 4. Building proper CompetitiveTransaction objects
-async fn repopulate_competitive_transaction_queue(
+pub(super) async fn repopulate_competitive_transaction_queue(
     db: &PostgresClient,
     relayer_id: &RelayerId,
 ) -> Result<VecDeque<CompetitiveTransaction>, RepopulateTransactionsQueueError> {
@@ -317,17 +320,22 @@ async fn repopulate_competitive_transaction_queue(
         if let Some(cancel_tx_id) = &transaction.cancelled_by_transaction_id {
             // This is an original transaction with a competitor
             // Find the competitor transaction
-            if let Some(competitor) =
-                inmempool_transactions.iter().find(|tx| tx.id == *cancel_tx_id)
-            {
-                // Determine competition type based on transaction content
-                let is_empty_data = competitor.data.clone().into_inner().is_empty();
-                let competition_type =
-                    if competitor.is_noop || (competitor.value.is_zero() && is_empty_data) {
-                        CompetitionType::Cancel
-                    } else {
-                        CompetitionType::Replace
-                    };
+            let competitor = db.get_transaction(cancel_tx_id).await.map_err(|e| {
+                RepopulateTransactionsQueueError::CouldNotGetTransactionsByStatusFromDatabase(
+                    TransactionStatus::INMEMPOOL,
+                    *relayer_id,
+                    e,
+                )
+            })?;
+            if let Some(competitor) = competitor.filter(|tx| {
+                matches!(tx.status, TransactionStatus::PENDING | TransactionStatus::INMEMPOOL)
+            }) {
+                let kind = db.query_one("SELECT competition_kind FROM relayer.transaction WHERE id=$1", &[&transaction.id]).await.map_err(|e| RepopulateTransactionsQueueError::CouldNotGetTransactionsByStatusFromDatabase(TransactionStatus::INMEMPOOL, *relayer_id, e))?.get::<_,Option<String>>(0);
+                let competition_type = if kind.as_deref() == Some("cancel") {
+                    CompetitionType::Cancel
+                } else {
+                    CompetitionType::Replace
+                };
 
                 // Create competitive transaction with original and competitor
                 let mut comp_tx = CompetitiveTransaction::new(transaction.clone());
@@ -339,7 +347,7 @@ async fn repopulate_competitive_transaction_queue(
                 processed_transaction_ids.insert(transaction.id);
                 processed_transaction_ids.insert(competitor.id);
 
-                info!("Reconstructed competitive transaction: original {} with competitor {} (type: {:?})",
+                tracing::debug!("Reconstructed competitive transaction: original {} with competitor {} (type: {:?})",
                     transaction.id, competitor.id, competition_type);
             } else {
                 warn!("Transaction {} has cancelled_by_transaction_id {} but competitor not found in INMEMPOOL",
@@ -364,7 +372,7 @@ async fn repopulate_competitive_transaction_queue(
         }
     }
 
-    info!(
+    tracing::debug!(
         "Reconstructed {} competitive transactions for relayer {}",
         competitive_queue.len(),
         relayer_id

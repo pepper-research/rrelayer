@@ -21,5 +21,7 @@ pub async fn apply_schema(client: &PostgresClient) -> Result<(), PostgresError> 
     apply_v1_0_3_schema(client).await?;
     apply_v1_0_4_schema(client).await?;
 
+    client.batch_execute(include_str!("v1_0_5.sql")).await?;
+
     Ok(())
 }

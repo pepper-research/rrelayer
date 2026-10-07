@@ -50,6 +50,16 @@ impl TestModule for TransactionTests {
             TestDefinition::new("transaction_replace", "Transaction replace operation", |runner| {
                 Box::pin(runner.transaction_replace())
             }),
+            TestDefinition::new(
+                "transaction_replace_pending",
+                "Persist Pending replacement before sending",
+                |runner| Box::pin(runner.transaction_replace_pending()),
+            ),
+            TestDefinition::new(
+                "transaction_replace_ambiguous",
+                "Reject replacement after ambiguous broadcast",
+                |runner| Box::pin(runner.transaction_replace_ambiguous()),
+            ),
             TestDefinition::new("transaction_cancel", "Transaction cancel operation", |runner| {
                 Box::pin(runner.transaction_cancel())
             }),
