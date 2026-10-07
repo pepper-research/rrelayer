@@ -29,23 +29,40 @@ pub async fn spawn_processing_tasks_for_relayer(
     transaction_queue: Arc<Mutex<TransactionsQueues>>,
     relayer_id: &RelayerId,
 ) {
+    let isolated = {
+        let queues = transaction_queue.lock().await;
+        match queues.get_transactions_queue(relayer_id) {
+            Some(queue) => queue.lock().await.is_isolated_limit_base(),
+            None => false,
+        }
+    };
     let queue_clone_pending = transaction_queue.clone();
     let relayer_id_pending = *relayer_id;
     tokio::spawn(async move {
-        continuously_process_pending_transactions(queue_clone_pending, &relayer_id_pending).await;
+        continuously_process_pending_transactions(
+            queue_clone_pending,
+            &relayer_id_pending,
+            isolated,
+        )
+        .await;
     });
 
     let queue_clone_inmempool = transaction_queue.clone();
     let relayer_id_inmempool = *relayer_id;
     tokio::spawn(async move {
-        continuously_process_inmempool_transactions(queue_clone_inmempool, &relayer_id_inmempool)
-            .await;
+        continuously_process_inmempool_transactions(
+            queue_clone_inmempool,
+            &relayer_id_inmempool,
+            isolated,
+        )
+        .await;
     });
 
     let queue_clone_mined = transaction_queue.clone();
     let relayer_id_mined = *relayer_id;
     tokio::spawn(async move {
-        continuously_process_mined_transactions(queue_clone_mined, &relayer_id_mined).await;
+        continuously_process_mined_transactions(queue_clone_mined, &relayer_id_mined, isolated)
+            .await;
     });
 }
 
@@ -64,6 +81,26 @@ async fn processes_next_break(process_again_after_ms: &u64) {
     sleep_ms(process_again_after_ms).await
 }
 
+fn queue_break_ms(requested_ms: u64, isolated: bool) -> u64 {
+    if isolated {
+        requested_ms.max(1_000)
+    } else {
+        requested_ms
+    }
+}
+
+#[cfg(test)]
+mod gateway_queue_tests {
+    use super::queue_break_ms;
+
+    #[test]
+    fn fixed_lane_has_poll_floor_without_changing_ordinary_queue() {
+        assert_eq!(queue_break_ms(10, true), 1_000);
+        assert_eq!(queue_break_ms(30_000, true), 30_000);
+        assert_eq!(queue_break_ms(10, false), 10);
+    }
+}
+
 /// Continuously processes pending transactions for a specific relayer.
 ///
 /// Runs in an infinite loop, processing one pending transaction at a time
@@ -71,6 +108,7 @@ async fn processes_next_break(process_again_after_ms: &u64) {
 async fn continuously_process_pending_transactions(
     queue: Arc<Mutex<TransactionsQueues>>,
     relayer_id: &RelayerId,
+    isolated: bool,
 ) {
     let mut shutdown_rx = subscribe_to_shutdown();
 
@@ -86,7 +124,7 @@ async fn continuously_process_pending_transactions(
             } => {
                 match result {
                     Ok(result) => {
-                        processes_next_break(&result.process_again_after).await;
+                        processes_next_break(&queue_break_ms(result.process_again_after, isolated)).await;
                     }
                     Err(e) => {
                         match e {
@@ -100,6 +138,7 @@ async fn continuously_process_pending_transactions(
                             }
                             _ => {
                                 error!("Relayer id {} - PENDING QUEUE ERROR: {}", relayer_id, e);
+                                if isolated { sleep_ms(&5_000).await; }
                             }
                         }
                     }
@@ -116,6 +155,7 @@ async fn continuously_process_pending_transactions(
 async fn continuously_process_inmempool_transactions(
     queue: Arc<Mutex<TransactionsQueues>>,
     relayer_id: &RelayerId,
+    isolated: bool,
 ) {
     let mut shutdown_rx = subscribe_to_shutdown();
 
@@ -131,7 +171,7 @@ async fn continuously_process_inmempool_transactions(
             } => {
                 match result {
                     Ok(result) => {
-                        processes_next_break(&result.process_again_after).await;
+                        processes_next_break(&queue_break_ms(result.process_again_after, isolated)).await;
                     }
                     Err(e) => {
                         match e {
@@ -145,6 +185,7 @@ async fn continuously_process_inmempool_transactions(
                             }
                             _ => {
                                 error!("Relayer id {} - INMEMPOOL QUEUE ERROR: {}", relayer_id, e);
+                                if isolated { sleep_ms(&5_000).await; }
                             }
                         }
                     }
@@ -161,6 +202,7 @@ async fn continuously_process_inmempool_transactions(
 async fn continuously_process_mined_transactions(
     queue: Arc<Mutex<TransactionsQueues>>,
     relayer_id: &RelayerId,
+    isolated: bool,
 ) {
     let mut shutdown_rx = subscribe_to_shutdown();
 
@@ -176,7 +218,7 @@ async fn continuously_process_mined_transactions(
             } => {
                 match result {
                     Ok(result) => {
-                        processes_next_break(&result.process_again_after).await;
+                        processes_next_break(&queue_break_ms(result.process_again_after, isolated)).await;
                     }
                     Err(e) => {
                         match e {
@@ -190,6 +232,7 @@ async fn continuously_process_mined_transactions(
                             }
                             _ => {
                                 error!("Relayer id {} - MINED QUEUE ERROR: {}", relayer_id, e);
+                                if isolated { sleep_ms(&5_000).await; }
                             }
                         }
                     }
@@ -521,7 +564,14 @@ pub async fn startup_transactions_queues(
                 continue;
             }
             Some(provider) => {
-                let evm_provider = provider.clone();
+                let evm_provider = match provider.for_relayer(&relayer) {
+                    Ok(Some(provider)) => provider,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        warn!("Could not start fixed Base relayer {}: {}", relayer.id, error);
+                        continue;
+                    }
+                };
 
                 let relayer_id = relayer.id;
 

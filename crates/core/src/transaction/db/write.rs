@@ -23,19 +23,56 @@ impl PostgresClient {
         relayer_id: &RelayerId,
         transaction: &Transaction,
     ) -> Result<(), PostgresError> {
+        self.save_transaction_with_signed_envelope(relayer_id, transaction, None).await
+    }
+
+    pub async fn save_transaction_with_signed_envelope(
+        &mut self,
+        relayer_id: &RelayerId,
+        transaction: &Transaction,
+        signed_envelope: Option<&[u8]>,
+    ) -> Result<(), PostgresError> {
         let mut conn = self.pool.get().await?;
         let trans = conn.transaction().await.map_err(PostgresError::PgError)?;
+
+        if signed_envelope.is_some() {
+            // Serialize admissions across overlapping ECS tasks using the durable
+            // relayer identity. The lock is released with this DB transaction.
+            trans
+                .query_one(
+                    "SELECT pg_advisory_xact_lock(8453, hashtext($1::uuid::text))",
+                    &[relayer_id],
+                )
+                .await?;
+            let active = trans
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM relayer.transaction
+                 WHERE relayer_id = $1 AND (
+                   status IN ('PENDING', 'INMEMPOOL')
+                   OR (signed_envelope IS NOT NULL AND nonce = $2)))",
+                    &[relayer_id, &transaction.nonce],
+                )
+                .await?
+                .get::<_, bool>(0);
+            if active {
+                return Err(PostgresError::FixedBaseLaneBusy);
+            }
+        }
 
         let authorization_list_json = transaction
             .authorization_list
             .as_ref()
             .map(|list| serde_json::to_value(list).unwrap_or(serde_json::Value::Null));
+        let signed_gas_json = transaction
+            .sent_with_gas
+            .as_ref()
+            .map(|gas| serde_json::to_value(gas).unwrap_or(serde_json::Value::Null));
 
         for table_name in TRANSACTION_TABLES.iter() {
             trans.execute(
                 format!("
-                INSERT INTO {}(id, relayer_id, authorization_list, \"to\", \"from\", nonce, chain_id, data, value, blobs, gas_limit, speed, status, expires_at, queued_at, hash, external_id, cancelled_by_transaction_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18);
+                INSERT INTO {}(id, relayer_id, authorization_list, \"to\", \"from\", nonce, chain_id, data, value, blobs, gas_limit, speed, status, expires_at, queued_at, hash, external_id, cancelled_by_transaction_id, signed_envelope, sent_with_gas)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20);
             ", table_name).as_str(),
                 &[&transaction.id,
                     &relayer_id,
@@ -54,7 +91,9 @@ impl PostgresClient {
                     &transaction.queued_at,
                     &transaction.known_transaction_hash,
                     &transaction.external_id,
-                    &transaction.cancelled_by_transaction_id
+                    &transaction.cancelled_by_transaction_id,
+                    &signed_envelope,
+                    &signed_gas_json
                 ],
             )
                 .await?;
@@ -645,6 +684,145 @@ impl PostgresClient {
             .map_err(PostgresError::PgError)?;
 
         trans.commit().await.map_err(PostgresError::PgError)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fixed_base_admission_postgres_tests {
+    use super::*;
+    use crate::{network::ChainId, schema::apply_schema, transaction::types::TransactionSpeed};
+    use chrono::Utc;
+    use tokio_postgres::error::SqlState;
+
+    fn pending(relayer_id: RelayerId, nonce: u64) -> Transaction {
+        Transaction {
+            id: TransactionId::new(),
+            relayer_id,
+            authorization_list: None,
+            to: EvmAddress::zero(),
+            from: EvmAddress::zero(),
+            value: TransactionValue::zero(),
+            data: TransactionData::empty(),
+            nonce: TransactionNonce::new(nonce),
+            chain_id: ChainId::new(8453),
+            gas_limit: None,
+            status: TransactionStatus::PENDING,
+            blobs: None,
+            known_transaction_hash: None,
+            queued_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            sent_at: None,
+            confirmed_at: None,
+            sent_with_gas: None,
+            sent_with_blob_gas: None,
+            mined_at: None,
+            mined_at_block_number: None,
+            speed: TransactionSpeed::FAST,
+            sent_with_max_priority_fee_per_gas: None,
+            sent_with_max_fee_per_gas: None,
+            is_noop: false,
+            external_id: None,
+            cancelled_by_transaction_id: None,
+        }
+    }
+
+    async fn record_relayer(db: &PostgresClient, id: RelayerId) -> Result<(), PostgresError> {
+        let name = format!("test-{}", id);
+        db.execute(
+            "INSERT INTO relayer.record (id, name, chain_id, wallet_index)
+             VALUES ($1, $2, 8453, 0)",
+            &[&id, &name],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn count(db: &PostgresClient, table: &str, id: RelayerId) -> Result<i64, PostgresError> {
+        let rows = db
+            .query(&format!("SELECT COUNT(*)::BIGINT FROM {table} WHERE relayer_id = $1"), &[&id])
+            .await?;
+        Ok(rows[0].get(0))
+    }
+
+    #[tokio::test]
+    async fn fixed_base_admission_is_atomic_across_postgres_connections(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(url) =
+            std::env::var("RRELAYER_TEST_DATABASE_URL").ok().filter(|url| !url.is_empty())
+        else {
+            return Ok(());
+        };
+        let mut first = PostgresClient::for_test_url(&url).await?;
+        let mut second = PostgresClient::for_test_url(&url).await?;
+        apply_schema(&first).await?;
+
+        let fixed_id = RelayerId::new();
+        record_relayer(&first, fixed_id).await?;
+        let one = pending(fixed_id, 0);
+        let two = pending(fixed_id, 0);
+        let (a, b) = tokio::join!(
+            first.save_transaction_with_signed_envelope(&fixed_id, &one, Some(&[0x02, 0x01])),
+            second.save_transaction_with_signed_envelope(&fixed_id, &two, Some(&[0x02, 0x02])),
+        );
+        assert!(a.is_ok() ^ b.is_ok());
+        assert!(matches!(
+            a.as_ref().err().or(b.as_ref().err()),
+            Some(PostgresError::FixedBaseLaneBusy)
+        ));
+        assert_eq!(count(&first, "relayer.transaction", fixed_id).await?, 1);
+        assert_eq!(count(&first, "relayer.transaction_audit_log", fixed_id).await?, 1);
+
+        // A pending row without an envelope must also hold the fixed identity.
+        let legacy_id = RelayerId::new();
+        record_relayer(&first, legacy_id).await?;
+        first.save_transaction(&legacy_id, &pending(legacy_id, 0)).await?;
+        assert!(matches!(
+            first
+                .save_transaction_with_signed_envelope(
+                    &legacy_id,
+                    &pending(legacy_id, 1),
+                    Some(&[0x02, 0x03])
+                )
+                .await,
+            Err(PostgresError::FixedBaseLaneBusy)
+        ));
+        // Ordinary NULL-envelope records keep their existing replacement behavior.
+        first.save_transaction(&legacy_id, &pending(legacy_id, 0)).await?;
+        assert_eq!(count(&first, "relayer.transaction", legacy_id).await?, 2);
+
+        first.execute(
+            "UPDATE relayer.transaction SET status = 'CONFIRMED'::relayer.tx_status WHERE relayer_id = $1",
+            &[&fixed_id],
+        ).await?;
+        assert!(matches!(
+            first
+                .save_transaction_with_signed_envelope(
+                    &fixed_id,
+                    &pending(fixed_id, 0),
+                    Some(&[0x02, 0x04])
+                )
+                .await,
+            Err(PostgresError::FixedBaseLaneBusy)
+        ));
+        // Even a writer bypassing the admission helper cannot reuse a signed nonce.
+        let original_id = if a.is_ok() { one.id } else { two.id };
+        let direct_id = TransactionId::new();
+        let direct = first
+            .execute(
+                "INSERT INTO relayer.transaction
+             (id, relayer_id, \"to\", \"from\", nonce, value, chain_id, speed, status,
+              expires_at, queued_at, signed_envelope)
+             SELECT $2::uuid, relayer_id, \"to\", \"from\", nonce, value, chain_id, speed,
+                    'CONFIRMED'::relayer.tx_status, expires_at, queued_at, signed_envelope
+             FROM relayer.transaction WHERE id = $1",
+                &[&original_id, &direct_id],
+            )
+            .await;
+        assert!(matches!(direct, Err(PostgresError::PgError(ref error))
+            if error.code() == Some(&SqlState::UNIQUE_VIOLATION)));
+        assert_eq!(count(&first, "relayer.transaction", fixed_id).await?, 1);
+        assert_eq!(count(&first, "relayer.transaction_audit_log", fixed_id).await?, 1);
         Ok(())
     }
 }

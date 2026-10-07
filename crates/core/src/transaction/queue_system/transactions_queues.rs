@@ -48,7 +48,10 @@ use crate::{
         cache::invalidate_transaction_no_state_cache,
         nonce_manager::NonceManager,
         queue_system::types::TransactionQueueSendTransactionError,
-        types::{Transaction, TransactionData, TransactionId, TransactionStatus, TransactionValue},
+        types::{
+            Transaction, TransactionData, TransactionId, TransactionNonce, TransactionStatus,
+            TransactionValue,
+        },
     },
     webhooks::WebhookManager,
 };
@@ -81,7 +84,36 @@ impl TransactionsQueues {
         let mut relayer_block_times_ms = HashMap::new();
 
         for setup in setups {
-            let current_nonce = setup.evm_provider.get_nonce(&setup.relayer).await?;
+            let current_nonce = match setup.evm_provider.get_nonce(&setup.relayer).await {
+                Ok(nonce) => nonce,
+                Err(error) if setup.evm_provider.is_isolated_limit_base() => {
+                    warn!("Fixed Base gateway nonce unavailable for relayer {}; leaving its queue offline: {}", setup.relayer.id, error);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let reserved_nonce = if setup.evm_provider.is_isolated_limit_base() {
+                let highest = setup
+                    .pending_transactions
+                    .iter()
+                    .map(|tx| tx.nonce.into_inner())
+                    .chain(
+                        setup
+                            .inmempool_transactions
+                            .iter()
+                            .map(|tx| tx.original.nonce.into_inner()),
+                    )
+                    .max();
+                highest
+                    .map(|nonce| {
+                        TransactionNonce::new(
+                            current_nonce.into_inner().max(nonce.saturating_add(1)),
+                        )
+                    })
+                    .unwrap_or(current_nonce)
+            } else {
+                current_nonce
+            };
 
             info!(
                 "Startup nonce synchronization for relayer {} ({}): synchronizing nonce manager with on-chain nonce {}",
@@ -96,7 +128,7 @@ impl TransactionsQueues {
                     TransactionsQueueSetup::new(
                         setup.relayer,
                         setup.evm_provider,
-                        NonceManager::new(current_nonce),
+                        NonceManager::new(reserved_nonce),
                         setup.pending_transactions,
                         setup.inmempool_transactions,
                         setup.mined_transactions,
@@ -372,6 +404,13 @@ impl TransactionsQueues {
             return Err(AddTransactionError::RelayerIsPaused(*relayer_id));
         }
 
+        if transactions_queue.is_isolated_limit_base()
+            && (transactions_queue.get_pending_transaction_count().await > 0
+                || transactions_queue.get_inmempool_transaction_count().await > 0)
+        {
+            return Err(AddTransactionError::FixedBaseLaneBusy);
+        }
+
         // Check if this is a blob transaction and if the wallet manager supports blobs
         if transaction_to_send.blobs.is_some() && !transactions_queue.supports_blobs() {
             return Err(AddTransactionError::UnsupportedTransactionType {
@@ -462,7 +501,12 @@ impl TransactionsQueues {
             }
         };
 
-        let assigned_nonce = transactions_queue.nonce_manager.get_and_increment().await;
+        let fixed_lane = transactions_queue.is_isolated_limit_base();
+        let assigned_nonce = if fixed_lane {
+            transactions_queue.nonce_manager.get_current_nonce().await
+        } else {
+            transactions_queue.nonce_manager.get_and_increment().await
+        };
         transaction.nonce = assigned_nonce;
         transaction.gas_limit = Some(estimated_gas_limit);
 
@@ -474,13 +518,37 @@ impl TransactionsQueues {
             estimated_gas_limit,
         )?;
 
-        transaction.known_transaction_hash =
-            Some(transactions_queue.compute_tx_hash(&transaction_request).await?);
+        let fixed_signed_envelope = if fixed_lane {
+            let (bytes, hash) =
+                transactions_queue.prepare_fixed_signed_transaction(&transaction_request).await?;
+            transaction.known_transaction_hash = Some(hash);
+            transaction.sent_with_gas = Some(gas_price);
+            Some(bytes)
+        } else {
+            transaction.known_transaction_hash =
+                Some(transactions_queue.compute_tx_hash(&transaction_request).await?);
+            None
+        };
 
-        self.db
-            .save_transaction(relayer_id, &transaction)
-            .await
-            .map_err(AddTransactionError::CouldNotSaveTransactionDb)?;
+        let save_result = self
+            .db
+            .save_transaction_with_signed_envelope(
+                relayer_id,
+                &transaction,
+                fixed_signed_envelope.as_deref(),
+            )
+            .await;
+        match save_result {
+            Ok(()) => {
+                if fixed_lane {
+                    let _ = transactions_queue.nonce_manager.get_and_increment().await;
+                }
+            }
+            Err(crate::postgres::PostgresError::FixedBaseLaneBusy) => {
+                return Err(AddTransactionError::FixedBaseLaneBusy);
+            }
+            Err(error) => return Err(AddTransactionError::CouldNotSaveTransactionDb(error)),
+        }
 
         transactions_queue.add_pending_transaction(transaction.clone()).await;
         self.invalidate_transaction_cache(&transaction.id).await;
@@ -1066,7 +1134,7 @@ impl TransactionsQueues {
                     );
                     ProcessPendingTransactionError::RelayerTransactionsQueueNotFound(*relayer_id)
                 })?;
-                if self.has_expired(&transaction) {
+                if !transactions_queue.is_isolated_limit_base() && self.has_expired(&transaction) {
                     self.transaction_to_noop(&mut transactions_queue, &mut transaction);
                 }
 
@@ -1109,6 +1177,15 @@ impl TransactionsQueues {
                             TransactionQueueSendTransactionError::TransactionEstimateGasError(
                                 error,
                             ) => {
+                                if transactions_queue.is_isolated_limit_base() {
+                                    return Err(
+                                        ProcessPendingTransactionError::TransactionEstimateGasError(
+                                            *relayer_id,
+                                            relayer_address,
+                                            error,
+                                        ),
+                                    );
+                                }
                                 self.db
                                     .update_transaction_failed(&transaction.id, &error.to_string())
                                     .await
@@ -1131,6 +1208,13 @@ impl TransactionsQueues {
                                 ))
                             }
                             TransactionQueueSendTransactionError::TransactionSendError(error) => {
+                                if transactions_queue.is_isolated_limit_base() {
+                                    return Err(ProcessPendingTransactionError::SendTransactionError(
+                                        *relayer_id,
+                                        relayer_address,
+                                        TransactionQueueSendTransactionError::TransactionSendError(error),
+                                    ));
+                                }
                                 let error_msg = error.to_string().to_lowercase();
                                 // Check if this is an insufficient funds error - auto-fail these
                                 let insufficient_funds = error_msg.contains("insufficient funds")
@@ -1263,6 +1347,17 @@ impl TransactionsQueues {
                             TransactionQueueSendTransactionError::TransactionConversionError(
                                 error,
                             ) => {
+                                if transactions_queue.is_isolated_limit_base() {
+                                    return Err(
+                                        ProcessPendingTransactionError::TransactionEstimateGasError(
+                                            *relayer_id,
+                                            relayer_address,
+                                            RpcError::Transport(TransportErrorKind::Custom(
+                                                error.into(),
+                                            )),
+                                        ),
+                                    );
+                                }
                                 self.db
                                     .update_transaction_failed(&transaction.id, &error)
                                     .await
@@ -1285,6 +1380,17 @@ impl TransactionsQueues {
                                 ))
                             }
                             TransactionQueueSendTransactionError::SafeProxyError(error) => {
+                                if transactions_queue.is_isolated_limit_base() {
+                                    return Err(
+                                        ProcessPendingTransactionError::TransactionEstimateGasError(
+                                            *relayer_id,
+                                            relayer_address,
+                                            RpcError::Transport(TransportErrorKind::Custom(
+                                                error.into(),
+                                            )),
+                                        ),
+                                    );
+                                }
                                 self.db
                                     .update_transaction_failed(&transaction.id, &error.to_string())
                                     .await
@@ -1436,6 +1542,12 @@ impl TransactionsQueues {
                             Ok(ProcessResult::<ProcessInmempoolStatus>::success())
                         }
                         Ok(None) => {
+                            if transactions_queue.is_isolated_limit_base() {
+                                return Ok(ProcessResult::<ProcessInmempoolStatus>::other(
+                                    ProcessInmempoolStatus::StillInmempool,
+                                    Some(&1_000),
+                                ));
+                            }
                             if let Some(sent_at) = transaction.sent_at {
                                 let elapsed = Utc::now() - sent_at;
 

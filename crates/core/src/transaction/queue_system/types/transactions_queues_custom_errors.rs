@@ -30,6 +30,9 @@ pub enum ReplaceTransactionError {
     #[error("Relayer {0} is paused")]
     RelayerIsPaused(RelayerId),
 
+    #[error("Fixed Base relayer has an unresolved original transaction")]
+    FixedBaseLaneBusy,
+
     #[error("Relayer could not update the transaction in the db {0}")]
     CouldNotUpdateTransactionInDb(#[from] PostgresError),
 
@@ -96,6 +99,10 @@ impl From<AddTransactionError> for HttpError {
 
         if matches!(value, AddTransactionError::UnsupportedTransactionType { .. }) {
             return bad_request(value.to_string());
+        }
+
+        if matches!(value, AddTransactionError::FixedBaseLaneBusy) {
+            return forbidden(value.to_string());
         }
 
         internal_server_error(Some(value.to_string()))

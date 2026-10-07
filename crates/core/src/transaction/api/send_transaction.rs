@@ -69,6 +69,10 @@ pub async fn handle_send_transaction(
         .await?
         .ok_or(not_found("Relayer does not exist".to_string()))?;
 
+    if crate::provider::is_limit_base_relayer(&relayer) {
+        state.validate_basic_auth_valid(&headers)?;
+    }
+
     let result = send_transaction(relayer, transaction, &state, &headers).await?;
 
     Ok(Json(result))

@@ -79,6 +79,21 @@ jobs:
     env:
       BUILD_TYPE: release
 
+    services:
+      postgres:
+        image: ${{ matrix.platform == 'linux' && 'postgres:16' || '' }}
+        env:
+          POSTGRES_USER: rrelayer_test
+          POSTGRES_PASSWORD: rrelayer_test
+          POSTGRES_DB: rrelayer_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rrelayer_test -d rrelayer_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -234,6 +249,8 @@ jobs:
 
       - name: Run tests
         shell: bash
+        env:
+          RRELAYER_TEST_DATABASE_URL: ${{ matrix.platform == 'linux' && 'postgres://rrelayer_test:rrelayer_test@127.0.0.1:5432/rrelayer_test' || '' }}
         run: |
           set -eo pipefail
           target="${{ matrix.target }}"

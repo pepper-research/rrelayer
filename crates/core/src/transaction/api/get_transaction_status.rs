@@ -68,6 +68,16 @@ pub async fn get_transaction_status(
     let provider = find_provider_for_chain_id(&state.evm_providers, &relayer.chain_id)
         .await
         .ok_or(internal_server_error(Some("Evm provider can not be found".to_string())))?;
+    let provider = provider.for_relayer(&relayer).map_err(|_| {
+        internal_server_error(Some("Fixed Base gateway configuration invalid".to_string()))
+    })?;
+    let Some(provider) = provider else {
+        return Ok(Json(RelayTransactionStatusResult {
+            hash: Some(hash),
+            status: transaction.status,
+            receipt: None,
+        }));
+    };
 
     let receipt = provider
         .get_receipt(&hash)
