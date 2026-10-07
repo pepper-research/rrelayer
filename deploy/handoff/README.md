@@ -115,6 +115,11 @@ python3 deploy/handoff/promote.py \
   --acceptance <exact-image-acceptance.json> --journal <private-journal.json>
 ```
 
+The named ECS dev cluster was absent when checked on 2026-10-07; the active
+shared Flow/Edge dev relayer is a Hetzner systemd service. Provision and verify
+an ECS dev target before claiming this controller has been rehearsed there.
+The dev build role also rejected OIDC from the PR branch; no image was built.
+
 For the initial dev acceptance run, add `--dev-validation`. That mode is
 restricted to `rrelayer-dev-cluster` / `rrelayer-dev` / container `rrelayer-dev`
 in ap-northeast-1. It still requires the exact-image local recovery checks and
@@ -190,3 +195,25 @@ latency separately from request latency and queue-drain time. Verify EIP-7702,
 blob signing and the restricted Base gateway on their supported dev lanes.
 Production is unchanged until that engineering evidence and scoped release
 execution are complete.
+
+## Isolated Hetzner rehearsal
+
+On the Linux dev host, `scripts/handoff/test_dev_proxy.py` exercises an optimized
+release binary behind its own Nginx listener, with disposable PostgreSQL/Anvil
+and separate ports. It covers continuous admission through failed warmup,
+standby registration, processing activation, old-worker drain and compatible
+rollback. It does not modify the host's shared Nginx, Flow/Edge services or
+signers. Nginx and PostgreSQL/Foundry must already be available on PATH.
+
+```sh
+LAB_PG_BIN=/usr/lib/postgresql/16/bin \
+LAB_ANVIL_PORT=28957 LAB_PROXY_PORT=28958 \
+LAB_API_PORT=28959 LAB_API_PORT_B=28960 LAB_PG_PORT=28961 \
+HANDOFF_PROXY_PORT=28962 python3 scripts/handoff/test_dev_proxy.py \
+  --binary <optimized-rrelayer-cli> --out <private-evidence-directory>
+```
+
+Run as an unprivileged user; all listeners are loopback. This is a dev-host
+rehearsal using a controlled local chain, **not** ECS/ALB, the shared live dev
+stack, or full downstream settlement acceptance. It cannot satisfy those
+production-promotion checks.

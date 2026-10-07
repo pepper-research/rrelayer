@@ -63,3 +63,47 @@ coverage does not replace the supported dev-chain check. Existing PR6 native E2E
 cases and PR3 SDK/docs are retained; their release acceptance is carried forward.
 No ECS execution, full rollup settlement, funded transaction, merge or deployment
 was performed. Automatic top-up remains explicitly unsupported by protocol 1.
+
+## Hetzner dev-host rehearsal — 2026-10-07
+
+The exact `fd334cf13dcc3e54489f3b30ee448e33059324fd` runtime source was built on
+the Hetzner dev host with Rust 1.96.1, `cargo build --locked --release --features
+jemalloc -p rrelayer_cli`. Optimized binary SHA256:
+`2b4e2952736e6118a6b8a4870cde44c8b0ef1881428e693dc51c0af1b76fd5a0`.
+No runtime product code changed for this test.
+
+Fourteen optimized-binary recovery scenarios passed, plus the actual legacy
+dev binary duplicate-send control and drained bootstrap. The legacy baseline
+SHA256 is `ecf594327ec682fe15553669ee8eddfa6dd75c90735551f564932a19240764c3`;
+it is the running Hetzner binary, not a claim that it equals production source.
+See `evidence/hetzner-process-verdicts.json`.
+
+The isolated Nginx rehearsal passed 72/72 requests with HTTP 200, each producing
+exactly one on-chain transfer. It exercised failed warmup while the old sender
+served, standby intake, ownership transfer with pending/in-flight work, draining
+and stopping the old backend, and compatible rollback. Both release labels use the same candidate binary; this
+checks protocol ownership reversal, not compatibility between different code
+versions. Max admission was
+164.62 ms; max accepted-to-first-RPC-attempt was 371.51 ms. Original final rows,
+receipts and events are in `evidence/hetzner-proxy-verdict.json`.
+
+The actual API journal/client/refund-guard boundary was repeated against PR109
+source `28d91ca86dcecb30271980591a92f7c051f0619d`, with the dev host's existing
+Node 22.22.2 and installed dependency tree. Package dependency declarations
+match; installed-lock/artifact parity was not fully verified. Its 135.84-second run crossed
+the 120-second timeout, blocked cancellation and recovered one credit/same hash;
+see `evidence/hetzner-api-boundary-verdict.json`.
+
+These were separate processes, disposable databases, loopback ports and Anvil on
+the real Linux dev host. They did not modify the shared Flow/Edge services or
+use their live signers, rollup, escrows or funds. **This is not an ECS/ALB or full
+dev-stack settlement pass.** Four debug-only crash barriers retain their earlier
+debug evidence and are not claimed on this optimized binary.
+
+Actual ECS rehearsal remains unavailable: the named `rrelayer-dev-cluster` does
+not exist in ap-northeast-1. The dev candidate workflow run `37642467856` failed
+before build/publication because `rrelayer-dev-gha` trusts only the
+`feature/7702-support` branch and rejected the PR branch's OIDC identity. No
+trust policy was changed and no branch was merged to bypass it. The API109 full
+parent gate also retains five original non-7702 failures. Those limitations
+remain separate prerequisites; local-chain results do not waive them.
