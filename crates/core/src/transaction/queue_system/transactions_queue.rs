@@ -277,8 +277,8 @@ impl TransactionsQueue {
                 Err(MovePendingTransactionToInmempoolError::TransactionIdDoesNotMatch(
                     self.relayer.id,
                     self.relayer.address,
-                    transaction_sent.clone(),
-                    transaction.clone(),
+                    Box::new(transaction_sent.clone()),
+                    Box::new(transaction.clone()),
                 ))
             }
         } else {
@@ -287,7 +287,7 @@ impl TransactionsQueue {
             Err(MovePendingTransactionToInmempoolError::TransactionNotFound(
                 self.relayer.id,
                 self.relayer.address,
-                transaction_sent.clone(),
+                Box::new(transaction_sent.clone()),
             ))
         }
     }
@@ -556,7 +556,7 @@ impl TransactionsQueue {
                         self.relayer.id,
                         self.relayer.address,
                         *id,
-                        comp_tx.original,
+                        Box::new(comp_tx.original),
                     ));
                 };
 
@@ -600,7 +600,7 @@ impl TransactionsQueue {
                     self.relayer.id,
                     self.relayer.address,
                     *id,
-                    comp_tx.original,
+                    Box::new(comp_tx.original),
                 ))
             }
         } else {
@@ -1053,22 +1053,21 @@ impl TransactionsQueue {
             .evm_provider
             .estimate_gas(transaction_request, &self.relayer.address)
             .await
-            .map_err(|e| {
-                if let Some(decoded) = summarize_rpc_error(&e) {
+            .inspect_err(|e| {
+                if let Some(decoded) = summarize_rpc_error(e) {
                     error!(
                         "rrelayer_gas_estimate_failed {} decoded_revert=\"{}\" provider_error=\"{}\"",
                         tx_context,
                         decoded,
-                        compact_rpc_error(&e)
+                        compact_rpc_error(e)
                     );
                 } else {
                     error!(
                         "rrelayer_gas_estimate_failed {} provider_error=\"{}\"",
                         tx_context,
-                        compact_rpc_error(&e)
+                        compact_rpc_error(e)
                     );
                 }
-                e
             })?;
 
         let block_gas_limit = self.evm_provider.block_gas_limit().await?;

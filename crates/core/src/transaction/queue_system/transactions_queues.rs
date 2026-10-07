@@ -1073,7 +1073,7 @@ impl TransactionsQueues {
                 match transactions_queue.send_transaction(&mut self.db, &mut transaction).await {
                     Ok(transaction_sent) => {
                         transactions_queue.move_pending_to_inmempool(&transaction_sent).await
-                            .map_err(|e| ProcessPendingTransactionError::MovePendingTransactionToInmempoolError(*relayer_id, relayer_address, e))?;
+                            .map_err(|e| ProcessPendingTransactionError::MovePendingTransactionToInmempoolError(*relayer_id, relayer_address, Box::new(e)))?;
 
                         self.invalidate_transaction_cache(&transaction.id).await;
 
@@ -1103,7 +1103,7 @@ impl TransactionsQueues {
                                 Err(ProcessPendingTransactionError::GasCalculationError(
                                     *relayer_id,
                                     relayer_address,
-                                    transaction.clone(),
+                                    Box::new(transaction.clone()),
                                 ))
                             }
                             TransactionQueueSendTransactionError::TransactionEstimateGasError(
@@ -1354,14 +1354,14 @@ impl TransactionsQueues {
                         Ok(Some(receipt)) => {
                             let competition_result = transactions_queue
                                 .move_inmempool_to_mining(&transaction.id, &receipt)
-                                .await.map_err(|e| ProcessInmempoolTransactionError::MoveInmempoolTransactionToMinedError(*relayer_id, relayer_address, e))?;
+                                .await.map_err(|e| ProcessInmempoolTransactionError::MoveInmempoolTransactionToMinedError(*relayer_id, relayer_address, Box::new(e)))?;
 
                             // Save the winning transaction to database
                             match competition_result.winner_status {
                                 TransactionStatus::MINED => {
                                     self.db
                                         .transaction_mined(&competition_result.winner, &receipt)
-                                        .await.map_err(|e| ProcessInmempoolTransactionError::CouldNotUpdateTransactionStatusInTheDatabase(*relayer_id, relayer_address, competition_result.winner.clone(), TransactionStatus::MINED, e))?;
+                                        .await.map_err(|e| ProcessInmempoolTransactionError::CouldNotUpdateTransactionStatusInTheDatabase(*relayer_id, relayer_address, Box::new(competition_result.winner.clone()), TransactionStatus::MINED, e))?;
                                     self.invalidate_transaction_cache(
                                         &competition_result.winner.id,
                                     )
@@ -1371,7 +1371,7 @@ impl TransactionsQueues {
                                     if let Some(loser) = &competition_result.loser {
                                         self.db
                                             .transaction_update(loser)
-                                            .await.map_err(|e| ProcessInmempoolTransactionError::CouldNotUpdateTransactionStatusInTheDatabase(*relayer_id, relayer_address, loser.clone(), loser.status, e))?;
+                                            .await.map_err(|e| ProcessInmempoolTransactionError::CouldNotUpdateTransactionStatusInTheDatabase(*relayer_id, relayer_address, Box::new(loser.clone()), loser.status, e))?;
                                         self.invalidate_transaction_cache(&loser.id).await;
 
                                         info!("Updated loser transaction {} with status {:?} in database", loser.id, loser.status);
@@ -1393,7 +1393,7 @@ impl TransactionsQueues {
                                     }
                                 }
                                 TransactionStatus::EXPIRED => {
-                                    self.db.transaction_expired(&competition_result.winner.id).await.map_err(|e| ProcessInmempoolTransactionError::CouldNotUpdateTransactionStatusInTheDatabase(*relayer_id, relayer_address, competition_result.winner.clone(), TransactionStatus::EXPIRED, e))?;
+                                    self.db.transaction_expired(&competition_result.winner.id).await.map_err(|e| ProcessInmempoolTransactionError::CouldNotUpdateTransactionStatusInTheDatabase(*relayer_id, relayer_address, Box::new(competition_result.winner.clone()), TransactionStatus::EXPIRED, e))?;
                                     self.invalidate_transaction_cache(
                                         &competition_result.winner.id,
                                     )
@@ -1413,7 +1413,7 @@ impl TransactionsQueues {
                                 TransactionStatus::FAILED => {
                                     self.db
                                         .update_transaction_failed(&competition_result.winner.id, "Failed onchain")
-                                        .await.map_err(|e| ProcessInmempoolTransactionError::CouldNotUpdateTransactionStatusInTheDatabase(*relayer_id, relayer_address, competition_result.winner.clone(), TransactionStatus::FAILED, e))?;
+                                        .await.map_err(|e| ProcessInmempoolTransactionError::CouldNotUpdateTransactionStatusInTheDatabase(*relayer_id, relayer_address, Box::new(competition_result.winner.clone()), TransactionStatus::FAILED, e))?;
                                     self.invalidate_transaction_cache(
                                         &competition_result.winner.id,
                                     )
@@ -1574,7 +1574,7 @@ impl TransactionsQueues {
                             Err(ProcessInmempoolTransactionError::CouldNotGetTransactionReceipt(
                                 *relayer_id,
                                 relayer_address,
-                                transaction.clone(),
+                                Box::new(transaction.clone()),
                                 e,
                             ))
                         }
@@ -1583,7 +1583,7 @@ impl TransactionsQueues {
                     Err(ProcessInmempoolTransactionError::UnknownTransactionHash(
                         *relayer_id,
                         relayer_address,
-                        transaction.clone(),
+                        Box::new(transaction.clone()),
                     ))
                 }
             } else {
@@ -1627,7 +1627,7 @@ impl TransactionsQueues {
                                     ProcessMinedTransactionError::CouldNotGetTransactionReceipt(
                                         *relayer_id,
                                         relayer_address,
-                                        transaction.clone(),
+                                        Box::new(transaction.clone()),
                                         e,
                                     )
                                 })?
@@ -1635,7 +1635,7 @@ impl TransactionsQueues {
                                     ProcessMinedTransactionError::CouldNotGetTransactionReceipt(
                                         *relayer_id,
                                         relayer_address,
-                                        transaction.clone(),
+                                        Box::new(transaction.clone()),
                                         RpcError::Transport(TransportErrorKind::Custom(
                                             "No receipt".to_string().into(),
                                         )),
@@ -1646,7 +1646,7 @@ impl TransactionsQueues {
                                 ProcessMinedTransactionError::CouldNotGetTransactionReceipt(
                                     *relayer_id,
                                     relayer_address,
-                                    transaction.clone(),
+                                    Box::new(transaction.clone()),
                                     RpcError::Transport(TransportErrorKind::Custom(
                                         "Transaction hash not found".to_string().into(),
                                     )),
@@ -1658,7 +1658,7 @@ impl TransactionsQueues {
                             ProcessMinedTransactionError::TransactionConfirmedNotSaveToDatabase(
                                 *relayer_id,
                                 relayer_address,
-                                transaction.clone(),
+                                Box::new(transaction.clone()),
                                 e,
                             )
                         })?;
@@ -1697,7 +1697,7 @@ impl TransactionsQueues {
                     Err(ProcessMinedTransactionError::NoMinedAt(
                         *relayer_id,
                         relayer_address,
-                        transaction.clone(),
+                        Box::new(transaction.clone()),
                     ))
                 }
             } else {
