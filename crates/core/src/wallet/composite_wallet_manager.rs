@@ -108,3 +108,106 @@ impl WalletManagerTrait for CompositeWalletManager {
         primary_supports || private_key_supports
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::ChainId;
+    use crate::relayer::WalletIndex;
+    use crate::wallet::PrivateKeyWalletManager;
+    use alloy::primitives::Address;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct PrimaryMock {
+        seen_indexes: Mutex<Vec<u32>>,
+    }
+
+    #[async_trait]
+    impl WalletManagerTrait for PrimaryMock {
+        async fn create_wallet(
+            &self,
+            index: u32,
+            _chain_id: WalletManagerChainId,
+        ) -> Result<EvmAddress, WalletError> {
+            self.seen_indexes.lock().unwrap().push(index);
+            Ok(EvmAddress::new(Address::ZERO))
+        }
+
+        async fn get_address(
+            &self,
+            index: u32,
+            _chain_id: WalletManagerChainId,
+        ) -> Result<EvmAddress, WalletError> {
+            self.seen_indexes.lock().unwrap().push(index);
+            Ok(EvmAddress::new(Address::ZERO))
+        }
+
+        async fn sign_transaction(
+            &self,
+            _index: u32,
+            _transaction: &TypedTransaction,
+            _chain_id: WalletManagerChainId,
+        ) -> Result<Signature, WalletError> {
+            panic!("primary signature is outside this routing test")
+        }
+
+        async fn sign_text(
+            &self,
+            _index: u32,
+            _text: &str,
+            _chain_id: WalletManagerChainId,
+        ) -> Result<Signature, WalletError> {
+            panic!("primary signature is outside this routing test")
+        }
+
+        async fn sign_typed_data(
+            &self,
+            _index: u32,
+            _typed_data: &TypedData,
+            _chain_id: WalletManagerChainId,
+        ) -> Result<Signature, WalletError> {
+            panic!("primary signature is outside this routing test")
+        }
+
+        fn supports_blobs(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_private_key_addresses_survive_composite_restart_and_new_primary_index() {
+        let keys = [1u8, 2u8].map(|value| format!("0x{value:064x}")).to_vec();
+        let chain = ChainId::new(8453);
+        let standalone = PrivateKeyWalletManager::new(keys.clone());
+        let original = [
+            standalone.get_address(0, chain.into()).await.unwrap(),
+            standalone.get_address(1, chain.into()).await.unwrap(),
+        ];
+        assert_ne!(original[0], original[1]);
+
+        for _restart in 0..2 {
+            let primary = Arc::new(PrimaryMock::default());
+            let private_keys = Arc::new(PrivateKeyWalletManager::new(keys.clone()));
+            let composite = CompositeWalletManager::new(primary.clone(), Some(private_keys));
+
+            for (index, expected) in original.iter().enumerate() {
+                let persisted_index = -((index + 1) as i32);
+                let manager_index = WalletIndex::PrivateKey(persisted_index).index();
+                assert_eq!(
+                    composite.get_address(manager_index, chain.into()).await.unwrap(),
+                    *expected
+                );
+                assert_eq!(
+                    composite.create_wallet(manager_index, chain.into()).await.unwrap(),
+                    *expected
+                );
+            }
+            assert_eq!(
+                composite.create_wallet(0, chain.into()).await.unwrap(),
+                EvmAddress::new(Address::ZERO)
+            );
+            assert_eq!(*primary.seen_indexes.lock().unwrap(), vec![0]);
+        }
+    }
+}

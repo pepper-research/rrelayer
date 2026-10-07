@@ -14,7 +14,7 @@ use crate::{
     gas::{BlobGasOracleCache, GasOracleCache},
     postgres::{PostgresClient, PostgresConnectionError, PostgresError},
     provider::{find_provider_for_chain_id, EvmProvider},
-    relayer::{Relayer, RelayerId},
+    relayer::{Relayer, RelayerId, WalletIndex},
     safe_proxy::SafeProxyManager,
     shared::{
         cache::Cache,
@@ -399,7 +399,10 @@ async fn import_private_keys_as_relayers(
                 // Use negative wallet indexes for private keys to avoid conflicts with mnemonic wallets
                 // Private key index 0 becomes wallet_index -1, index 1 becomes -2, etc.
                 let private_key_wallet_index = -((index + 1) as i32);
-                match provider.get_address(index as u32).await {
+                match provider
+                    .get_address(WalletIndex::PrivateKey(private_key_wallet_index).index())
+                    .await
+                {
                     Ok(address) => {
                         // Check if a relayer with this address already exists on this chain
                         if let Ok(Some(existing_relayer)) =
