@@ -30,9 +30,6 @@ pub enum ReplaceTransactionError {
     #[error("Relayer {0} is paused")]
     RelayerIsPaused(RelayerId),
 
-    #[error("Fixed Base relayer has an unresolved original transaction")]
-    FixedBaseLaneBusy,
-
     #[error("Relayer could not update the transaction in the db {0}")]
     CouldNotUpdateTransactionInDb(#[from] PostgresError),
 
@@ -67,6 +64,9 @@ pub enum AddTransactionError {
 
     #[error("Relayer {0} is paused")]
     RelayerIsPaused(RelayerId),
+
+    #[error("Fixed Base relayer has an unresolved original transaction")]
+    FixedBaseLaneBusy,
 
     #[error("{0}")]
     TransactionGasPriceError(#[from] SendTransactionGasPriceError),
