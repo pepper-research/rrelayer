@@ -251,6 +251,8 @@ async fn start_api(
 
     let app = Router::new()
         .route("/health", get(health_check))
+        .route("/ready", get(crate::sender_handoff::readiness))
+        .route("/handoff/activate", axum::routing::post(crate::sender_handoff::activate))
         .merge(api_routes)
         .layer(middleware::from_fn(inject_basic_auth_status))
         .layer(middleware::from_fn(activity_logger))
@@ -326,6 +328,8 @@ async fn start_api(
 #[derive(Error, Debug)]
 #[allow(clippy::enum_variant_names)]
 pub enum StartError {
+    #[error("Sender handoff does not yet support automatic_top_up producers; use a configuration without automatic top-ups")]
+    UnfencedAutomaticTopUp,
     #[error("Failed to find the yaml file")]
     NoYamlFileFound,
 
@@ -376,6 +380,17 @@ pub async fn start(project_path: &Path) -> Result<(), StartError> {
 
     if config.networks.is_empty() {
         return Err(StartError::NoNetworksDefinedInYaml);
+    }
+
+    // These periodic producers create fresh requests independently in every
+    // process. Reject them before any DB/background work, rather than duplicate
+    // transfers during warm overlap. The production configuration has none.
+    if config
+        .networks
+        .iter()
+        .any(|network| network.automatic_top_up.as_ref().is_some_and(|items| !items.is_empty()))
+    {
+        return Err(StartError::UnfencedAutomaticTopUp);
     }
 
     let postgres = PostgresClient::new().await?;

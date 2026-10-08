@@ -94,6 +94,41 @@ pub struct TransactionsQueue {
 }
 
 impl TransactionsQueue {
+    pub async fn reload(
+        &mut self,
+        db: &PostgresClient,
+    ) -> Result<(), crate::postgres::PostgresError> {
+        use super::start::{
+            repopulate_competitive_transaction_queue, repopulate_transaction_queue,
+        };
+        let map_error = |e: super::start::RepopulateTransactionsQueueError| {
+            crate::postgres::PostgresError::Handoff(e.to_string())
+        };
+        *self.pending_transactions.get_mut() =
+            repopulate_transaction_queue(db, &self.relayer.id, &TransactionStatus::PENDING)
+                .await
+                .map_err(map_error)?;
+        *self.inmempool_transactions.get_mut() =
+            repopulate_competitive_transaction_queue(db, &self.relayer.id)
+                .await
+                .map_err(map_error)?;
+        *self.mined_transactions.get_mut() =
+            repopulate_transaction_queue(db, &self.relayer.id, &TransactionStatus::MINED)
+                .await
+                .map_err(map_error)?
+                .into_iter()
+                .map(|tx| (tx.id, tx))
+                .collect();
+        self.relayer = db
+            .get_relayer(&self.relayer.id)
+            .await?
+            .ok_or_else(|| crate::postgres::PostgresError::Handoff("Relayer removed".into()))?;
+        // All durable admissions reserve their nonce, including unresolved attempts.
+        let row = db.query_one("SELECT COALESCE(MAX(nonce)+1,0) AS next FROM relayer.transaction WHERE chain_id=$1 AND \"from\"=$2 AND (status <> 'FAILED' OR broadcast_attempted)", &[&self.relayer.chain_id, &self.relayer.address]).await?;
+        self.nonce_manager = NonceManager::new(TransactionNonce::new(row.get::<_, i64>(0) as u64));
+        Ok(())
+    }
+
     pub fn is_isolated_limit_base(&self) -> bool {
         self.evm_provider.is_isolated_limit_base()
     }
@@ -232,6 +267,14 @@ impl TransactionsQueue {
         }
 
         false
+    }
+
+    pub async fn update_pending_transaction(&mut self, transaction: Transaction) {
+        if let Some(item) =
+            self.pending_transactions.lock().await.iter_mut().find(|tx| tx.id == transaction.id)
+        {
+            *item = transaction;
+        }
     }
 
     pub async fn add_pending_transaction(&mut self, transaction: Transaction) {
@@ -582,21 +625,27 @@ impl TransactionsQueue {
                         ..comp_tx.original
                     };
 
-                    (winner, comp_tx.competitive.map(|(tx, _)| tx), loser_status)
+                    (
+                        winner,
+                        comp_tx
+                            .competitive
+                            .map(|(tx, _)| Transaction { status: loser_status, ..tx }),
+                        loser_status,
+                    )
                 } else if let Some((competitor, comp_type)) = comp_tx.competitive {
                     let (loser_status, loser_transaction) = match comp_type {
                         CompetitionType::Cancel => {
-                            // When cancel wins, original transaction becomes a cancelled no-op
+                            let status = if comp_tx.original.expires_at <= competitor.queued_at {
+                                TransactionStatus::EXPIRED
+                            } else {
+                                TransactionStatus::CANCELLED
+                            };
                             let cancelled_original = Transaction {
-                                status: TransactionStatus::CANCELLED,
-                                is_noop: true,
-                                to: self.relay_address(),
-                                value: TransactionValue::zero(),
-                                data: TransactionData::empty(),
+                                status,
                                 cancelled_by_transaction_id: Some(competitor.id),
                                 ..comp_tx.original
                             };
-                            (TransactionStatus::CANCELLED, cancelled_original)
+                            (status, cancelled_original)
                         }
                         CompetitionType::Replace => {
                             let replaced_original = Transaction {
@@ -1147,6 +1196,11 @@ impl TransactionsQueue {
         db: &mut PostgresClient,
         transaction: &mut Transaction,
     ) -> Result<TransactionSentWithRelayer, TransactionQueueSendTransactionError> {
+        if transaction.status == TransactionStatus::PENDING {
+            if let Some(attempt) = db.last_attempt(&transaction.id).await? {
+                return self.broadcast_attempt(db, transaction, attempt).await;
+            }
+        }
         if self.is_isolated_limit_base() {
             let hash = transaction.known_transaction_hash.ok_or_else(|| {
                 TransactionQueueSendTransactionError::TransactionConversionError(
@@ -1197,6 +1251,11 @@ impl TransactionsQueue {
                             .to_string(),
                     ));
                 }
+                db.execute(
+                    "UPDATE relayer.transaction SET broadcast_attempted=TRUE WHERE id=$1",
+                    &[&transaction.id],
+                )
+                .await?;
                 let returned = self
                     .evm_provider
                     .send_raw_signed(&bytes, hash)
@@ -1458,51 +1517,119 @@ impl TransactionsQueue {
         };
         info!("rrelayer_send_network {}", transaction_context(&working_transaction, &self.relayer));
 
-        let transaction_hash = self
-            .evm_provider
-            .send_transaction(&self.relayer, transaction_request)
-            .await
-            .map_err(TransactionQueueSendTransactionError::TransactionSendError)?;
-
-        let transaction_sent = TransactionSentWithRelayer {
-            id: transaction.id,
-            hash: transaction_hash,
-            sent_with_gas: gas_price,
-            sent_with_blob_gas,
+        let (bytes, hash) =
+            self.evm_provider.sign_raw_transaction(&self.relayer, transaction_request).await?;
+        let attempt = crate::transaction::db::attempt::SignedAttempt {
+            bytes,
+            hash,
+            gas: gas_price,
+            blob_gas: sent_with_blob_gas,
         };
+        db.save_attempt(transaction, &attempt).await?;
+        self.broadcast_attempt(db, transaction, attempt).await
+    }
 
-        info!(
-            "rrelayer_send_ok {} hash={} gas_limit={}",
-            transaction_context(&working_transaction, &self.relayer),
-            transaction_sent.hash,
-            estimated_gas_limit.into_inner()
-        );
-
-        if transaction.sent_with_gas.is_none() || transaction.is_noop {
-            if transaction.sent_with_gas.is_none() {
-                db.transaction_sent(
-                    &transaction_sent.id,
-                    &transaction_sent.hash,
-                    &transaction_sent.sent_with_gas,
-                    transaction_sent.sent_with_blob_gas.as_ref(),
-                    self.is_legacy_transactions(),
-                )
-                .await?;
-            } else if transaction.is_noop {
-                db.update_transaction_noop(&transaction.id, &transaction.to).await?;
-            }
-        } else {
-            info!(
-                "Skipping DB update for gas bump transaction {} on relayer: {}",
-                transaction.id, self.relayer.name
-            );
+    async fn broadcast_attempt(
+        &self,
+        db: &mut PostgresClient,
+        transaction: &Transaction,
+        attempt: crate::transaction::db::attempt::SignedAttempt,
+    ) -> Result<TransactionSentWithRelayer, TransactionQueueSendTransactionError> {
+        use alloy::eips::eip2718::Decodable2718;
+        let mut encoded = attempt.bytes.as_slice();
+        let valid = alloy::consensus::TxEnvelope::decode_2718(&mut encoded)
+            .map(|envelope| {
+                encoded.is_empty() && envelope.tx_hash() == &attempt.hash.into_alloy_hash()
+            })
+            .unwrap_or(false);
+        if !valid {
+            return Err(TransactionQueueSendTransactionError::TransactionConversionError(
+                "Durable envelope hash mismatch".into(),
+            ));
         }
+        // Recheck the fence immediately before the network boundary. It cannot
+        // retract an RPC already in flight; identical nonce/payload recovery does.
+        db.execute(
+            "UPDATE relayer.transaction SET broadcast_attempted=TRUE WHERE id=$1",
+            &[&transaction.id],
+        )
+        .await?;
+        #[cfg(debug_assertions)]
+        crate::sender_handoff::test_barrier("before_broadcast").await;
+        let send = async {
+            if self
+                .evm_provider
+                .get_receipt(&attempt.hash)
+                .await
+                .map_err(TransactionQueueSendTransactionError::TransactionEstimateGasError)?
+                .is_none()
+            {
+                let hash = self.evm_provider.send_raw_signed(&attempt.bytes, attempt.hash).await?;
+                if hash != attempt.hash {
+                    return Err(TransactionQueueSendTransactionError::TransactionConversionError(
+                        "RPC returned a different signed hash".into(),
+                    ));
+                }
+            }
+            Ok::<_, TransactionQueueSendTransactionError>(())
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(3), send).await.map_err(|_| {
+            TransactionQueueSendTransactionError::TransactionConversionError(
+                "Broadcast outcome unknown; recovering persisted attempt".into(),
+            )
+        })??;
+        #[cfg(debug_assertions)]
+        crate::sender_handoff::test_barrier("after_broadcast").await;
+        db.transaction_sent(
+            &transaction.id,
+            &attempt.hash,
+            &attempt.gas,
+            attempt.blob_gas.as_ref(),
+            self.is_legacy_transactions(),
+        )
+        .await?;
+        Ok(TransactionSentWithRelayer {
+            id: transaction.id,
+            hash: attempt.hash,
+            sent_with_gas: attempt.gas,
+            sent_with_blob_gas: attempt.blob_gas,
+        })
+    }
 
-        info!(
-            "Successfully processed transaction {} for relayer: {}",
-            transaction.id, self.relayer.name
-        );
-        Ok(transaction_sent)
+    pub async fn receipt_for_competition(
+        &mut self,
+        db: &PostgresClient,
+        active: &Transaction,
+    ) -> Result<Option<(Transaction, AnyTransactionReceipt)>, RpcError<TransportErrorKind>> {
+        let competition = self.inmempool_transactions.lock().await.front().cloned();
+        if let Some(competition) = competition {
+            if let Some(receipt) = self.receipt_for_transaction(db, &competition.original).await? {
+                return Ok(Some((competition.original, receipt)));
+            }
+        }
+        Ok(self.receipt_for_transaction(db, active).await?.map(|r| (active.clone(), r)))
+    }
+
+    pub async fn receipt_for_transaction(
+        &mut self,
+        db: &PostgresClient,
+        transaction: &Transaction,
+    ) -> Result<Option<AnyTransactionReceipt>, RpcError<TransportErrorKind>> {
+        let mut hashes = db
+            .attempt_hashes(&transaction.id)
+            .await
+            .map_err(|e| RpcError::Transport(TransportErrorKind::Custom(e.to_string().into())))?;
+        if let Some(hash) = transaction.known_transaction_hash {
+            if !hashes.contains(&hash) {
+                hashes.push(hash);
+            }
+        }
+        for hash in hashes {
+            if let Some(receipt) = self.get_receipt(&hash).await? {
+                return Ok(Some(receipt));
+            }
+        }
+        Ok(None)
     }
 
     pub async fn get_receipt(

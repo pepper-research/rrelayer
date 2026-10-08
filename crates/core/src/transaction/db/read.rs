@@ -105,7 +105,7 @@ impl PostgresClient {
                 "
                     SELECT *
                     FROM relayer.transaction
-                    WHERE hash = $1;
+                    WHERE hash = $1 OR id IN (SELECT transaction_id FROM relayer.transaction_attempt WHERE hash=$1);
                 ",
                 &[hash],
             )

@@ -21,7 +21,7 @@ pub async fn get_transactions_inmempool_count(
     state.validate_auth_basic_or_api_key(&headers, &relayer.address, &relayer.chain_id)?;
 
     let count =
-        state.transactions_queues.lock().await.inmempool_transactions_count(&relayer_id).await;
+        state.transactions_queues.lock().await.inmempool_transactions_count(&relayer_id).await?;
 
     Ok(Json(count))
 }

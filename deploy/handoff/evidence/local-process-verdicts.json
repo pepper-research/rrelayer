@@ -1,0 +1,974 @@
+[
+  {
+    "scenario": "inmem_replacement",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "recipientBalanceWei": 171002,
+    "rows": {
+      "65d1f1ab-69bb-4430-93a1-80ba36330fe3": {
+        "id": "65d1f1ab-69bb-4430-93a1-80ba36330fe3",
+        "nonce": 0,
+        "status": "REPLACED",
+        "hash": "0x8682a224421f7e7a21a7ba6df456d0aca0dbcf9be404765bcf6f9c218aafc6e7",
+        "value": 171001,
+        "failed_reason": null
+      },
+      "834371ba-9254-4c26-9854-c1f60e2be889": {
+        "id": "834371ba-9254-4c26-9854-c1f60e2be889",
+        "nonce": 0,
+        "status": "MINED",
+        "hash": "0x7a12c7e630d6d205389e2bbda71a82afa64f0eed801277ee68b700f96187b642",
+        "value": 171002,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 5,
+        "hash": "0x7a12c7e630d6d205389e2bbda71a82afa64f0eed801277ee68b700f96187b642",
+        "nonce": 0,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 171002,
+        "status": 1
+      }
+    ]
+  },
+  {
+    "scenario": "reverted_receipt",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "rows": {
+      "ab00859c-5824-4fcb-b198-5ee3ff9bd2a7": {
+        "id": "ab00859c-5824-4fcb-b198-5ee3ff9bd2a7",
+        "nonce": 0,
+        "status": "FAILED",
+        "hash": "0xec0878d903d2b15d53e05bb5f171fc807649e101bb95e2dbfeae19983f51e4b3",
+        "value": 181001,
+        "failed_reason": null
+      },
+      "5416140c-9a08-4e10-871b-6a2b273e8b24": {
+        "id": "5416140c-9a08-4e10-871b-6a2b273e8b24",
+        "nonce": 1,
+        "status": "MINED",
+        "hash": "0xa59348a8df586b4dea12a6d7e717a9f90741f425de72c2bbdf50dce60e8e8fdf",
+        "value": 181002,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 5,
+        "hash": "0xec0878d903d2b15d53e05bb5f171fc807649e101bb95e2dbfeae19983f51e4b3",
+        "nonce": 0,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 181001,
+        "status": 0
+      },
+      {
+        "block": 6,
+        "hash": "0xa59348a8df586b4dea12a6d7e717a9f90741f425de72c2bbdf50dce60e8e8fdf",
+        "nonce": 1,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 181002,
+        "status": 1
+      }
+    ],
+    "recipientBalanceWei": 181002
+  },
+  {
+    "scenario": "accepted_nonce_error",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "recipientBalanceWei": 282003,
+    "rows": {
+      "db0ba584-e8e0-486b-8378-018d90b64a41": {
+        "id": "db0ba584-e8e0-486b-8378-018d90b64a41",
+        "nonce": 0,
+        "status": "CONFIRMED",
+        "hash": "0x09401e927f77c6028d96819ac96e6a020c9ed2bef6ded44e2c9cd383bda202a5",
+        "value": 141001,
+        "failed_reason": null
+      },
+      "eab60ba2-8fae-4cba-ab53-aaa015f00a5c": {
+        "id": "eab60ba2-8fae-4cba-ab53-aaa015f00a5c",
+        "nonce": 1,
+        "status": "MINED",
+        "hash": "0xa1cfce3b52dc6362c8a7cf452daf4ac9c339692f76415c16f771b0ddeac1ac80",
+        "value": 141002,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 5,
+        "hash": "0x09401e927f77c6028d96819ac96e6a020c9ed2bef6ded44e2c9cd383bda202a5",
+        "nonce": 0,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 141001,
+        "status": 1
+      },
+      {
+        "block": 13,
+        "hash": "0xa1cfce3b52dc6362c8a7cf452daf4ac9c339692f76415c16f771b0ddeac1ac80",
+        "nonce": 1,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 141002,
+        "status": 1
+      }
+    ]
+  },
+  {
+    "scenario": "pending_edit_and_expiry",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "recipientBalanceWei": 302006,
+    "rows": {
+      "dd8ccdbb-2f14-4795-92fc-54c71f84732a": {
+        "id": "dd8ccdbb-2f14-4795-92fc-54c71f84732a",
+        "nonce": 0,
+        "status": "CONFIRMED",
+        "hash": "0xfbe31132a89d8d02782dc8fa4edaa9cff3684e47779a947b4177fafcba6d8c3c",
+        "value": 151002,
+        "failed_reason": null
+      },
+      "441a2f63-fef7-45ef-80a9-829f1f5e9af0": {
+        "id": "441a2f63-fef7-45ef-80a9-829f1f5e9af0",
+        "nonce": 1,
+        "status": "EXPIRED",
+        "hash": "0xaf484db3a9ef9e1e89c9d5d875700fb9799efdb8edb5e29244ba0100271ba496",
+        "value": 151003,
+        "failed_reason": null
+      },
+      "286e1c90-88e0-4166-b19f-44d422dba79f": {
+        "id": "286e1c90-88e0-4166-b19f-44d422dba79f",
+        "nonce": 1,
+        "status": "CONFIRMED",
+        "hash": "0x9fae17de2692eedffebd24a12952d2d771914b5a19e065cc99cb25f35a740ceb",
+        "value": 0,
+        "failed_reason": null
+      },
+      "edc1d8d8-a8db-4258-9cd2-8f61d1dfe732": {
+        "id": "edc1d8d8-a8db-4258-9cd2-8f61d1dfe732",
+        "nonce": 2,
+        "status": "MINED",
+        "hash": "0xdca40d94f43b2616309a6c717daffe3a121d5840d794b7fa32a13da2b136db2e",
+        "value": 151004,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 5,
+        "hash": "0xfbe31132a89d8d02782dc8fa4edaa9cff3684e47779a947b4177fafcba6d8c3c",
+        "nonce": 0,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 151002,
+        "status": 1
+      },
+      {
+        "block": 5,
+        "hash": "0x9fae17de2692eedffebd24a12952d2d771914b5a19e065cc99cb25f35a740ceb",
+        "nonce": 1,
+        "to": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+        "value": 0,
+        "status": 1
+      },
+      {
+        "block": 6,
+        "hash": "0xdca40d94f43b2616309a6c717daffe3a121d5840d794b7fa32a13da2b136db2e",
+        "nonce": 2,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 151004,
+        "status": 1
+      }
+    ]
+  },
+  {
+    "scenario": "original_wins_cancel",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "recipientBalanceWei": 161001,
+    "rows": {
+      "db74bc1b-1f21-45b2-8865-f759f0ba9cfe": {
+        "id": "db74bc1b-1f21-45b2-8865-f759f0ba9cfe",
+        "nonce": 0,
+        "status": "CONFIRMED",
+        "hash": "0x3f814ff32a55f24547011ef9e4e4593592aaadb1d3772d0b58eb78c4cbabd5d6",
+        "value": 161001,
+        "failed_reason": null
+      },
+      "9d62bcef-d67a-4a66-9fcc-cfa65961645f": {
+        "id": "9d62bcef-d67a-4a66-9fcc-cfa65961645f",
+        "nonce": 0,
+        "status": "DROPPED",
+        "hash": "0x16700c2deac901faa2e610555fba4d32ecd1c23f0543bd2199993fb548db560f",
+        "value": 0,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 5,
+        "hash": "0x3f814ff32a55f24547011ef9e4e4593592aaadb1d3772d0b58eb78c4cbabd5d6",
+        "nonce": 0,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 161001,
+        "status": 1
+      }
+    ]
+  },
+  {
+    "scenario": "database_reconnect",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "recipientBalanceWei": 176003,
+    "rows": {
+      "fc4cf75c-f75b-4349-b932-aee0988a10d2": {
+        "id": "fc4cf75c-f75b-4349-b932-aee0988a10d2",
+        "nonce": 0,
+        "status": "CONFIRMED",
+        "hash": "0x7bfcf47cafb5606d8bfb258bd9ce9298aee5ea72c2ccea7d93c40b40547af708",
+        "value": 88001,
+        "failed_reason": null
+      },
+      "d7de0c76-f5c9-4c35-ae41-03612df25a91": {
+        "id": "d7de0c76-f5c9-4c35-ae41-03612df25a91",
+        "nonce": 1,
+        "status": "CONFIRMED",
+        "hash": "0xdab5920e71563990724157489c284bbb17b549c8728b45c2b551c99a5e7c154e",
+        "value": 88002,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 5,
+        "hash": "0x7bfcf47cafb5606d8bfb258bd9ce9298aee5ea72c2ccea7d93c40b40547af708",
+        "nonce": 0,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 88001,
+        "status": 1
+      },
+      {
+        "block": 13,
+        "hash": "0xdab5920e71563990724157489c284bbb17b549c8728b45c2b551c99a5e7c154e",
+        "nonce": 1,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 88002,
+        "status": 1
+      }
+    ]
+  },
+  {
+    "scenario": "abandoned_session",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "recipientBalanceWei": 99001,
+    "rows": {
+      "bd5b984c-1870-4e9c-8e1f-83a9cd66339c": {
+        "id": "bd5b984c-1870-4e9c-8e1f-83a9cd66339c",
+        "nonce": 0,
+        "status": "CONFIRMED",
+        "hash": "0x343b31f2503bfc12e3d1c4b9e7a4518d733699a7db1dc21084840edd96ea31db",
+        "value": 99001,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 5,
+        "hash": "0x343b31f2503bfc12e3d1c4b9e7a4518d733699a7db1dc21084840edd96ea31db",
+        "nonce": 0,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 99001,
+        "status": 1
+      }
+    ],
+    "recoverySeconds": 23.891
+  },
+  {
+    "scenario": "warm_handoff",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "recipientBalanceWei": 166272,
+    "rows": {
+      "6daec66b-c976-460c-bb63-3683c85ba2aa": {
+        "id": "6daec66b-c976-460c-bb63-3683c85ba2aa",
+        "nonce": 0,
+        "status": "CONFIRMED",
+        "hash": "0x55d9626d142e13e4339e5c2c1e04653682d8f307ed97121a756785a1715c1671",
+        "value": 11001,
+        "failed_reason": null
+      },
+      "178eaaf8-b244-44f2-8e35-ecfb662241d8": {
+        "id": "178eaaf8-b244-44f2-8e35-ecfb662241d8",
+        "nonce": 1,
+        "status": "CONFIRMED",
+        "hash": "0xdacb5e22b0bd5a4416917f2fb8590f82e77719df947ffc44dfb64dc654007ec7",
+        "value": 11002,
+        "failed_reason": null
+      },
+      "7d77a908-80cc-4c2e-b832-095015f5e7a0": {
+        "id": "7d77a908-80cc-4c2e-b832-095015f5e7a0",
+        "nonce": 2,
+        "status": "CONFIRMED",
+        "hash": "0x60ebd44c972fc30c584cd06ac260cbcaf1e24a189b4e01748a43f2c6ae02f247",
+        "value": 11003,
+        "failed_reason": null
+      },
+      "3e939d0b-d283-46eb-b3e2-f39ea337485d": {
+        "id": "3e939d0b-d283-46eb-b3e2-f39ea337485d",
+        "nonce": 3,
+        "status": "CONFIRMED",
+        "hash": "0xa92bf94a98a4fb7b6aaaf7d6ac31bbae8475fc54a1dda808d03be4c38184708d",
+        "value": 11103,
+        "failed_reason": null
+      },
+      "26b51997-88d1-4e2d-91f2-0e38b4f7d619": {
+        "id": "26b51997-88d1-4e2d-91f2-0e38b4f7d619",
+        "nonce": 4,
+        "status": "CONFIRMED",
+        "hash": "0x99fc96101abec87dffa4fbdb242914b70722b90b8f62e0ecc81bfe18246535f5",
+        "value": 11101,
+        "failed_reason": null
+      },
+      "33755afc-8fc7-421f-8b7f-5d5c9f688342": {
+        "id": "33755afc-8fc7-421f-8b7f-5d5c9f688342",
+        "nonce": 5,
+        "status": "CONFIRMED",
+        "hash": "0x27c975d34c667edc18b35628e59e9fa685df3f4f48bd12f4e3047b2b8bfcb897",
+        "value": 11105,
+        "failed_reason": null
+      },
+      "c5742053-8ba0-4e19-8d17-25fb9d90ce99": {
+        "id": "c5742053-8ba0-4e19-8d17-25fb9d90ce99",
+        "nonce": 6,
+        "status": "CONFIRMED",
+        "hash": "0xb5dddb0e476dd7eb4d79f117c16ff7850f9218844f03a57170953b56f9715341",
+        "value": 11100,
+        "failed_reason": null
+      },
+      "e9df3f56-f16a-440d-9d94-323286794eaa": {
+        "id": "e9df3f56-f16a-440d-9d94-323286794eaa",
+        "nonce": 7,
+        "status": "CONFIRMED",
+        "hash": "0x98c57bd787c57f12c932b80f64947053b7d0dd8c9fb9928cbf5f358b55efe7b4",
+        "value": 11102,
+        "failed_reason": null
+      },
+      "e5284ba1-7f1e-4c54-a1f1-9b2ec94d6d8b": {
+        "id": "e5284ba1-7f1e-4c54-a1f1-9b2ec94d6d8b",
+        "nonce": 8,
+        "status": "CONFIRMED",
+        "hash": "0x3c2c4bea1564efeaa093ce636984870c402de2898b3ca9b5b4f1d077c0bbe136",
+        "value": 11104,
+        "failed_reason": null
+      },
+      "4ebd6e6b-b096-4281-975c-e5543c2eb7f4": {
+        "id": "4ebd6e6b-b096-4281-975c-e5543c2eb7f4",
+        "nonce": 9,
+        "status": "CONFIRMED",
+        "hash": "0x3ced35c9ad20ffe3c1cb22252196baa716c9b1aa29aabb68e0ffdfd3d84f2c53",
+        "value": 11106,
+        "failed_reason": null
+      },
+      "b89d0b43-a5fe-4b00-899e-adcf027f2a09": {
+        "id": "b89d0b43-a5fe-4b00-899e-adcf027f2a09",
+        "nonce": 10,
+        "status": "CONFIRMED",
+        "hash": "0x469ae4ae8a67355816609f974f7c06019bbafb578d6f34b0f5a6ecb5420733e8",
+        "value": 11108,
+        "failed_reason": null
+      },
+      "4e6df98f-e4d4-4059-9577-ec0740f23d17": {
+        "id": "4e6df98f-e4d4-4059-9577-ec0740f23d17",
+        "nonce": 11,
+        "status": "CONFIRMED",
+        "hash": "0x8f68c823c20245e20f19e8005beff603d2bf95b80bd70d4e95b9c3fc5f6d98b9",
+        "value": 11110,
+        "failed_reason": null
+      },
+      "542ee132-ce0a-430f-8dfc-7382c24eb650": {
+        "id": "542ee132-ce0a-430f-8dfc-7382c24eb650",
+        "nonce": 12,
+        "status": "CONFIRMED",
+        "hash": "0x36abe3eddac4df14d3f08d1b77bdee98d7da658421e78ed5d04295bc40dbf857",
+        "value": 11107,
+        "failed_reason": null
+      },
+      "fb93d8a8-9173-44c5-83b4-08cce4b169d9": {
+        "id": "fb93d8a8-9173-44c5-83b4-08cce4b169d9",
+        "nonce": 13,
+        "status": "CONFIRMED",
+        "hash": "0xd12a753129ae7da6806fec48393c9283eaee6b50f8ecce7b42f3e1f38df0fea9",
+        "value": 11109,
+        "failed_reason": null
+      },
+      "a03742e1-7616-4e5d-b2a3-56b6804fb923": {
+        "id": "a03742e1-7616-4e5d-b2a3-56b6804fb923",
+        "nonce": 14,
+        "status": "CONFIRMED",
+        "hash": "0x5008f77950085d2a0f8213815b79ca50d1cc2b8d26ea62fe3eaf71f968c7b7e2",
+        "value": 11111,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 5,
+        "hash": "0x55d9626d142e13e4339e5c2c1e04653682d8f307ed97121a756785a1715c1671",
+        "nonce": 0,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 11001,
+        "status": 1
+      },
+      {
+        "block": 5,
+        "hash": "0xdacb5e22b0bd5a4416917f2fb8590f82e77719df947ffc44dfb64dc654007ec7",
+        "nonce": 1,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 11002,
+        "status": 1
+      },
+      {
+        "block": 5,
+        "hash": "0x60ebd44c972fc30c584cd06ac260cbcaf1e24a189b4e01748a43f2c6ae02f247",
+        "nonce": 2,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 11003,
+        "status": 1
+      },
+      {
+        "block": 5,
+        "hash": "0xa92bf94a98a4fb7b6aaaf7d6ac31bbae8475fc54a1dda808d03be4c38184708d",
+        "nonce": 3,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 11103,
+        "status": 1
+      },
+      {
+        "block": 5,
+        "hash": "0x99fc96101abec87dffa4fbdb242914b70722b90b8f62e0ecc81bfe18246535f5",
+        "nonce": 4,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 11101,
+        "status": 1
+      },
+      {
+        "block": 5,
+        "hash": "0x27c975d34c667edc18b35628e59e9fa685df3f4f48bd12f4e3047b2b8bfcb897",
+        "nonce": 5,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 11105,
+        "status": 1
+      },
+      {
+        "block": 5,
+        "hash": "0xb5dddb0e476dd7eb4d79f117c16ff7850f9218844f03a57170953b56f9715341",
+        "nonce": 6,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 11100,
+        "status": 1
+      },
+      {
+        "block": 5,
+        "hash": "0x98c57bd787c57f12c932b80f64947053b7d0dd8c9fb9928cbf5f358b55efe7b4",
+        "nonce": 7,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 11102,
+        "status": 1
+      },
+      {
+        "block": 5,
+        "hash": "0x3c2c4bea1564efeaa093ce636984870c402de2898b3ca9b5b4f1d077c0bbe136",
+        "nonce": 8,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 11104,
+        "status": 1
+      },
+      {
+        "block": 5,
+        "hash": "0x3ced35c9ad20ffe3c1cb22252196baa716c9b1aa29aabb68e0ffdfd3d84f2c53",
+        "nonce": 9,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 11106,
+        "status": 1
+      },
+      {
+        "block": 5,
+        "hash": "0x469ae4ae8a67355816609f974f7c06019bbafb578d6f34b0f5a6ecb5420733e8",
+        "nonce": 10,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 11108,
+        "status": 1
+      },
+      {
+        "block": 5,
+        "hash": "0x8f68c823c20245e20f19e8005beff603d2bf95b80bd70d4e95b9c3fc5f6d98b9",
+        "nonce": 11,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 11110,
+        "status": 1
+      },
+      {
+        "block": 5,
+        "hash": "0x36abe3eddac4df14d3f08d1b77bdee98d7da658421e78ed5d04295bc40dbf857",
+        "nonce": 12,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 11107,
+        "status": 1
+      },
+      {
+        "block": 5,
+        "hash": "0xd12a753129ae7da6806fec48393c9283eaee6b50f8ecce7b42f3e1f38df0fea9",
+        "nonce": 13,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 11109,
+        "status": 1
+      },
+      {
+        "block": 6,
+        "hash": "0x5008f77950085d2a0f8213815b79ca50d1cc2b8d26ea62fe3eaf71f968c7b7e2",
+        "nonce": 14,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 11111,
+        "status": 1
+      }
+    ],
+    "handoffThroughDrainSeconds": 3.457,
+    "maxAdmissionMs": 320.76,
+    "requests": 15,
+    "httpStatuses": [
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200
+    ],
+    "maxAcceptedToFirstRpcAttemptMs": 1141.34
+  },
+  {
+    "scenario": "lost_response",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "recipientBalanceWei": 44003,
+    "rows": {
+      "02f1b2b1-a77c-4e06-877a-05dd0a8e237f": {
+        "id": "02f1b2b1-a77c-4e06-877a-05dd0a8e237f",
+        "nonce": 0,
+        "status": "CONFIRMED",
+        "hash": "0x9e3a94b19faf2be0e10119c13ccc4462a0625af7893a55b20d0c82e86581d96c",
+        "value": 22001,
+        "failed_reason": null
+      },
+      "d7225c94-695d-4042-a3ff-10602620fca6": {
+        "id": "d7225c94-695d-4042-a3ff-10602620fca6",
+        "nonce": 1,
+        "status": "MINED",
+        "hash": "0x8e65d701b4ef84b929c7c0af6c4117b16ee1ff4003090575842e87319d34a24d",
+        "value": 22002,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 5,
+        "hash": "0x9e3a94b19faf2be0e10119c13ccc4462a0625af7893a55b20d0c82e86581d96c",
+        "nonce": 0,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 22001,
+        "status": 1
+      },
+      {
+        "block": 13,
+        "hash": "0x8e65d701b4ef84b929c7c0af6c4117b16ee1ff4003090575842e87319d34a24d",
+        "nonce": 1,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 22002,
+        "status": 1
+      }
+    ]
+  },
+  {
+    "scenario": "stale_revival",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "recipientBalanceWei": 66003,
+    "rows": {
+      "666967a8-d741-4a3d-b829-f3a6961d94f6": {
+        "id": "666967a8-d741-4a3d-b829-f3a6961d94f6",
+        "nonce": 0,
+        "status": "CONFIRMED",
+        "hash": "0x9fe38947db5cb540e041cff76a110e368027618534d7219ecbb4e24bf9aff7c4",
+        "value": 33001,
+        "failed_reason": null
+      },
+      "01cdc18c-1713-46cd-9665-8fb98df055ea": {
+        "id": "01cdc18c-1713-46cd-9665-8fb98df055ea",
+        "nonce": 1,
+        "status": "CONFIRMED",
+        "hash": "0x96ee4cb25ada5266fe9d7084b4151c667771bd9cae9c98e148f52e3607e5712a",
+        "value": 33002,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 5,
+        "hash": "0x9fe38947db5cb540e041cff76a110e368027618534d7219ecbb4e24bf9aff7c4",
+        "nonce": 0,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 33001,
+        "status": 1
+      },
+      {
+        "block": 13,
+        "hash": "0x96ee4cb25ada5266fe9d7084b4151c667771bd9cae9c98e148f52e3607e5712a",
+        "nonce": 1,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 33002,
+        "status": 1
+      }
+    ]
+  },
+  {
+    "scenario": "failed_startup",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "recipientBalanceWei": 44001,
+    "rows": {
+      "d862a802-ffaf-4ca5-9cca-4c9992578dda": {
+        "id": "d862a802-ffaf-4ca5-9cca-4c9992578dda",
+        "nonce": 0,
+        "status": "MINED",
+        "hash": "0x5545d21cdaa5b5fa159278a44c14e1dab68f32cca35423844050c0314f00d08e",
+        "value": 44001,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 5,
+        "hash": "0x5545d21cdaa5b5fa159278a44c14e1dab68f32cca35423844050c0314f00d08e",
+        "nonce": 0,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 44001,
+        "status": 1
+      }
+    ]
+  },
+  {
+    "scenario": "replacement_cancel",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "recipientBalanceWei": 66003,
+    "rows": {
+      "067e3249-da1b-483c-84bf-45e06c692b82": {
+        "id": "067e3249-da1b-483c-84bf-45e06c692b82",
+        "nonce": 0,
+        "status": "CANCELLED",
+        "hash": "0xc01ec51bcede71869ad4f02149d9f3cfc60eddc840f63abc0057c647da4860e5",
+        "value": 66001,
+        "failed_reason": null
+      },
+      "2e8a12b5-6e44-4f18-b97c-bac6affec950": {
+        "id": "2e8a12b5-6e44-4f18-b97c-bac6affec950",
+        "nonce": 0,
+        "status": "CONFIRMED",
+        "hash": "0x16700c2deac901faa2e610555fba4d32ecd1c23f0543bd2199993fb548db560f",
+        "value": 0,
+        "failed_reason": null
+      },
+      "246d78c4-f0b4-4e29-8e04-4ac18bd83ab7": {
+        "id": "246d78c4-f0b4-4e29-8e04-4ac18bd83ab7",
+        "nonce": 1,
+        "status": "CONFIRMED",
+        "hash": "0x1ba8c51b7bbe00f6ede414fe9da9d886ac5c6e3b51a944c6617f9beed06e9e33",
+        "value": 66003,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 5,
+        "hash": "0x16700c2deac901faa2e610555fba4d32ecd1c23f0543bd2199993fb548db560f",
+        "nonce": 0,
+        "to": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+        "value": 0,
+        "status": 1
+      },
+      {
+        "block": 6,
+        "hash": "0x1ba8c51b7bbe00f6ede414fe9da9d886ac5c6e3b51a944c6617f9beed06e9e33",
+        "nonce": 1,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 66003,
+        "status": 1
+      }
+    ],
+    "cancelled": {
+      "067e3249-da1b-483c-84bf-45e06c692b82": {
+        "id": "067e3249-da1b-483c-84bf-45e06c692b82",
+        "nonce": 0,
+        "status": "CANCELLED",
+        "hash": "0xc01ec51bcede71869ad4f02149d9f3cfc60eddc840f63abc0057c647da4860e5",
+        "value": 66001,
+        "failed_reason": null
+      },
+      "2e8a12b5-6e44-4f18-b97c-bac6affec950": {
+        "id": "2e8a12b5-6e44-4f18-b97c-bac6affec950",
+        "nonce": 0,
+        "status": "CONFIRMED",
+        "hash": "0x16700c2deac901faa2e610555fba4d32ecd1c23f0543bd2199993fb548db560f",
+        "value": 0,
+        "failed_reason": null
+      }
+    }
+  },
+  {
+    "scenario": "bootstrap_refuses_pending",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "bootstrapRefused": true,
+    "rows": {
+      "e5b7d952-43d0-463c-93d4-79781d6c5d61": {
+        "id": "e5b7d952-43d0-463c-93d4-79781d6c5d61",
+        "nonce": 0,
+        "status": "PENDING",
+        "hash": "0x63dc4a11e5e3d9d1858b545af5b9e1eaf6ca74b8acac075ceee725f00a49ed84",
+        "value": 77001,
+        "failed_reason": null
+      }
+    }
+  },
+  {
+    "scenario": "before_attempt_commit",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "recipientBalanceWei": 55001,
+    "rows": {
+      "4edd17c2-6830-4184-b4d0-58adf0e7d004": {
+        "id": "4edd17c2-6830-4184-b4d0-58adf0e7d004",
+        "nonce": 0,
+        "status": "MINED",
+        "hash": "0x88290edf41a71bc839f5b6d01b483644797313607f9375ed82e77063a0d62b11",
+        "value": 55001,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 5,
+        "hash": "0x88290edf41a71bc839f5b6d01b483644797313607f9375ed82e77063a0d62b11",
+        "nonce": 0,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 55001,
+        "status": 1
+      }
+    ]
+  },
+  {
+    "scenario": "after_attempt_commit",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "recipientBalanceWei": 55001,
+    "rows": {
+      "e72fb768-052b-48e7-ba43-46e03c4d6735": {
+        "id": "e72fb768-052b-48e7-ba43-46e03c4d6735",
+        "nonce": 0,
+        "status": "MINED",
+        "hash": "0x9a7191c769fa4b89527a252097175f542873a48654ad21d823601ac0697c09f9",
+        "value": 55001,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 5,
+        "hash": "0x9a7191c769fa4b89527a252097175f542873a48654ad21d823601ac0697c09f9",
+        "nonce": 0,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 55001,
+        "status": 1
+      }
+    ]
+  },
+  {
+    "scenario": "before_broadcast",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "recipientBalanceWei": 55001,
+    "rows": {
+      "a344b9a9-13a2-4e5d-8484-aa00e5886987": {
+        "id": "a344b9a9-13a2-4e5d-8484-aa00e5886987",
+        "nonce": 0,
+        "status": "MINED",
+        "hash": "0x9a7191c769fa4b89527a252097175f542873a48654ad21d823601ac0697c09f9",
+        "value": 55001,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 5,
+        "hash": "0x9a7191c769fa4b89527a252097175f542873a48654ad21d823601ac0697c09f9",
+        "nonce": 0,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 55001,
+        "status": 1
+      }
+    ]
+  },
+  {
+    "scenario": "after_broadcast",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "recipientBalanceWei": 55001,
+    "rows": {
+      "a30c0cfc-4614-424b-a119-41ded0ab3230": {
+        "id": "a30c0cfc-4614-424b-a119-41ded0ab3230",
+        "nonce": 0,
+        "status": "MINED",
+        "hash": "0x9a7191c769fa4b89527a252097175f542873a48654ad21d823601ac0697c09f9",
+        "value": 55001,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 5,
+        "hash": "0x9a7191c769fa4b89527a252097175f542873a48654ad21d823601ac0697c09f9",
+        "nonce": 0,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 55001,
+        "status": 1
+      }
+    ]
+  },
+  {
+    "scenario": "authorization_handoff",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "recipientBalanceWei": 191001,
+    "rows": {
+      "baf767b1-45bd-464b-ae6d-e39b3f998df9": {
+        "id": "baf767b1-45bd-464b-ae6d-e39b3f998df9",
+        "nonce": 0,
+        "status": "CONFIRMED",
+        "hash": "0x3c451f2a78ed350def4109f71631bab8f270feaa281aa2d04576c30cf65db820",
+        "value": 191001,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 5,
+        "hash": "0x3c451f2a78ed350def4109f71631bab8f270feaa281aa2d04576c30cf65db820",
+        "nonce": 0,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 191001,
+        "status": 1
+      }
+    ]
+  },
+  {
+    "scenario": "legacy_control",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "expectedUnsafeControl": true,
+    "rows": {
+      "493e6290-ff04-4205-b6d3-f676c4a82331": {
+        "id": "493e6290-ff04-4205-b6d3-f676c4a82331",
+        "nonce": 1,
+        "status": "CONFIRMED",
+        "hash": "0x9c7af083dcca3121c25621b08c69dd7046d5e04da44fc14ecbeb73f9c4ce2f27",
+        "value": 1001,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 4,
+        "hash": "0xfae7ba52e825782d7e269908fb691d4cba2365067eeb97bf882adbe6c243132a",
+        "nonce": 0,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 1001,
+        "status": 1
+      },
+      {
+        "block": 4,
+        "hash": "0x9c7af083dcca3121c25621b08c69dd7046d5e04da44fc14ecbeb73f9c4ce2f27",
+        "nonce": 1,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 1001,
+        "status": 1
+      }
+    ],
+    "logs": {
+      "nonce_too_high": 0,
+      "nonce_too_low": 1,
+      "baseline_renonce": 1,
+      "candidate_tracking_as_sent": 0,
+      "candidate_waiting_tracked_hash": 0,
+      "candidate_failed_not_resent": 0,
+      "candidate_resynced": 0,
+      "candidate_bounded_wait_failed": 0,
+      "already_known_lookup_hit": 0,
+      "insufficient_funds_failed": 0,
+      "intrinsic_gas_failed": 0,
+      "panic": 0
+    }
+  },
+  {
+    "scenario": "legacy_bootstrap",
+    "pass": true,
+    "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da",
+    "recipientBalanceWei": 124002,
+    "rows": {
+      "28b343e5-c794-478b-ae1a-d98cf4b98d29": {
+        "id": "28b343e5-c794-478b-ae1a-d98cf4b98d29",
+        "nonce": 0,
+        "status": "CONFIRMED",
+        "hash": "0xfae7ba52e825782d7e269908fb691d4cba2365067eeb97bf882adbe6c243132a",
+        "value": 1001,
+        "failed_reason": null
+      },
+      "8c85146e-f3ef-4617-b3d0-f53a7a151741": {
+        "id": "8c85146e-f3ef-4617-b3d0-f53a7a151741",
+        "nonce": 1,
+        "status": "CONFIRMED",
+        "hash": "0x9b8ccb019fe1a6adbd0a538169b41c344519f33790d9c9fe26597601edc81efc",
+        "value": 123001,
+        "failed_reason": null
+      }
+    },
+    "chain": [
+      {
+        "block": 5,
+        "hash": "0xfae7ba52e825782d7e269908fb691d4cba2365067eeb97bf882adbe6c243132a",
+        "nonce": 0,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 1001,
+        "status": 1
+      },
+      {
+        "block": 6,
+        "hash": "0x9b8ccb019fe1a6adbd0a538169b41c344519f33790d9c9fe26597601edc81efc",
+        "nonce": 1,
+        "to": "0x000000000000000000000000000000000000dead",
+        "value": 123001,
+        "status": 1
+      }
+    ]
+  }
+]

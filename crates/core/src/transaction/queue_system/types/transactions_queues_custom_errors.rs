@@ -18,6 +18,11 @@ use crate::{
 
 #[derive(Error, Debug)]
 pub enum ReplaceTransactionError {
+    #[error("{0}")]
+    Handoff(PostgresError),
+    #[error("Transaction {0} has already attempted broadcast; wait for its state to resolve before replacing")]
+    BroadcastAlreadyAttempted(TransactionId),
+
     #[error("Send transaction error: {0}")]
     SendTransactionError(#[from] TransactionQueueSendTransactionError),
 
@@ -39,7 +44,14 @@ pub enum ReplaceTransactionError {
 
 impl From<ReplaceTransactionError> for HttpError {
     fn from(value: ReplaceTransactionError) -> Self {
-        if matches!(value, ReplaceTransactionError::TransactionNotFound(_)) {
+        if matches!(value, ReplaceTransactionError::Handoff(_)) {
+            return (reqwest::StatusCode::SERVICE_UNAVAILABLE, value.to_string());
+        }
+        if matches!(
+            value,
+            ReplaceTransactionError::TransactionNotFound(_)
+                | ReplaceTransactionError::BroadcastAlreadyAttempted(_)
+        ) {
             return bad_request(value.to_string());
         }
 
@@ -89,6 +101,12 @@ pub enum AddTransactionError {
 
 impl From<AddTransactionError> for HttpError {
     fn from(value: AddTransactionError) -> Self {
+        if matches!(
+            value,
+            AddTransactionError::CouldNotSaveTransactionDb(PostgresError::Handoff(_))
+        ) {
+            return (reqwest::StatusCode::SERVICE_UNAVAILABLE, value.to_string());
+        }
         if matches!(value, AddTransactionError::RelayerIsPaused(_)) {
             return forbidden(value.to_string());
         }
@@ -111,6 +129,8 @@ impl From<AddTransactionError> for HttpError {
 
 #[derive(Error, Debug)]
 pub enum CancelTransactionError {
+    #[error("{0}")]
+    Handoff(PostgresError),
     #[error("Send transaction error: {0}")]
     SendTransactionError(#[from] TransactionQueueSendTransactionError),
 
@@ -129,6 +149,9 @@ pub enum CancelTransactionError {
 
 impl From<CancelTransactionError> for HttpError {
     fn from(value: CancelTransactionError) -> Self {
+        if matches!(value, CancelTransactionError::Handoff(_)) {
+            return (reqwest::StatusCode::SERVICE_UNAVAILABLE, value.to_string());
+        }
         if matches!(value, CancelTransactionError::RelayerIsPaused(_)) {
             return forbidden(value.to_string());
         }
@@ -144,6 +167,8 @@ impl From<CancelTransactionError> for HttpError {
 #[derive(Error, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum ProcessPendingTransactionError {
+    #[error("{0}")]
+    Handoff(PostgresError),
     #[error("Relayer transactions queue not found for relayer id {0}")]
     RelayerTransactionsQueueNotFound(RelayerId),
 
@@ -169,6 +194,8 @@ pub enum ProcessPendingTransactionError {
 
 #[derive(Error, Debug)]
 pub enum ProcessInmempoolTransactionError {
+    #[error("{0}")]
+    Handoff(PostgresError),
     #[error("Relayer transactions queue not found for relayer {0}")]
     RelayerTransactionsQueueNotFound(RelayerId),
 
@@ -207,6 +234,8 @@ pub enum ProcessInmempoolTransactionError {
 
 #[derive(Error, Debug)]
 pub enum ProcessMinedTransactionError {
+    #[error("{0}")]
+    Handoff(PostgresError),
     #[error("Relayer transactions queue not found for relayer {0}")]
     RelayerTransactionsQueueNotFound(RelayerId),
 

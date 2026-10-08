@@ -22,7 +22,7 @@ impl FallbackGasFeeEstimator {
     async fn estimate_with_fee_history(
         &self,
         chain_id: &ChainId,
-    ) -> Result<(u128, u128), GasEstimatorError> {
+    ) -> Result<(u128, u128, u128), GasEstimatorError> {
         let ethereum_or_ethereum_testnet = chain_id.u64() == 1 || chain_id.u64() == 11155111;
         let past_blocks = if ethereum_or_ethereum_testnet { 20 } else { 60 };
         let reward_percentile = if ethereum_or_ethereum_testnet { 60.0 } else { 25.0 };
@@ -84,7 +84,7 @@ impl FallbackGasFeeEstimator {
             base_fee_per_gas + (priority_fee * 2)
         };
 
-        Ok((priority_fee, max_fee))
+        Ok((priority_fee, max_fee, base_fee_per_gas))
     }
 }
 
@@ -94,7 +94,7 @@ impl BaseGasFeeEstimator for FallbackGasFeeEstimator {
         &self,
         _chain_id: &ChainId,
     ) -> Result<GasEstimatorResult, GasEstimatorError> {
-        let (base_priority_fee, base_max_fee) =
+        let (base_priority_fee, base_max_fee, current_base_fee) =
             match self.estimate_with_fee_history(_chain_id).await {
                 Ok(fees) => fees,
                 Err(_) => {
@@ -110,20 +110,19 @@ impl BaseGasFeeEstimator for FallbackGasFeeEstimator {
                     } else {
                         suggested.max_fee_per_gas // Simplified for other chains
                     };
-                    (priority_fee, max_fee)
+                    let current_base_fee = self
+                        .provider
+                        .get_block_by_number(BlockNumberOrTag::Latest)
+                        .await
+                        .map_err(|e| GasEstimatorError::CustomError(e.to_string()))?
+                        .and_then(|block| block.header.base_fee_per_gas)
+                        .map(|fee| fee as u128)
+                        .unwrap_or(0);
+                    (priority_fee, max_fee, current_base_fee)
                 }
             };
 
-        // Get current base fee to ensure max_fee is never below it
-        let current_base_fee = self
-            .provider
-            .get_block_by_number(BlockNumberOrTag::Latest)
-            .await
-            .map_err(|e| GasEstimatorError::CustomError(e.to_string()))?
-            .and_then(|block| block.header.base_fee_per_gas)
-            .map(|fee| fee as u128)
-            .unwrap_or(0);
-
+        // Reuse the base fee from the same snapshot used to price the tiers.
         Ok(GasEstimatorResult {
             slow: GasPriceResult {
                 max_priority_fee: MaxPriorityFee::new((base_priority_fee * 80) / 100), // -20%
@@ -160,5 +159,126 @@ impl BaseGasFeeEstimator for FallbackGasFeeEstimator {
 
     fn is_chain_supported(&self, _: &ChainId) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::{network::AnyNetwork, providers::ProviderBuilder};
+    use axum::{extract::State, routing::post, Json, Router};
+    use serde_json::{json, Value};
+    use std::sync::Mutex;
+
+    struct RpcState {
+        calls: Mutex<Vec<String>>,
+        base_fees: Vec<&'static str>,
+        fail_history: usize,
+        fail_block: bool,
+    }
+
+    async fn rpc(State(state): State<Arc<RpcState>>, Json(request): Json<Value>) -> Json<Value> {
+        let method = request["method"].as_str().unwrap();
+        let history_calls = {
+            let mut calls = state.calls.lock().unwrap();
+            calls.push(method.to_string());
+            calls.iter().filter(|method| *method == "eth_feeHistory").count()
+        };
+        let result = match method {
+            "eth_feeHistory" if history_calls > state.fail_history => json!({
+                "oldestBlock":"0x1", "baseFeePerGas":state.base_fees,
+                "gasUsedRatio":[0.5], "reward":[["0xa"],["0x14"],["0x1e"]]
+            }),
+            "eth_getBlockByNumber" if !state.fail_block => {
+                let block = alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+                let mut value = serde_json::to_value(block).unwrap();
+                value["baseFeePerGas"] = json!("0x64");
+                value
+            }
+            _ => {
+                return Json(json!({"jsonrpc":"2.0","id":request["id"],
+                "error":{"code":-32603,"message":"fixture RPC failure"}}))
+            }
+        };
+        Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
+    }
+
+    async fn run_estimate(
+        chain_id: u64,
+        base_fees: Vec<&'static str>,
+        fail_history: usize,
+        fail_block: bool,
+    ) -> (Result<GasEstimatorResult, GasEstimatorError>, Vec<String>) {
+        let state = Arc::new(RpcState {
+            calls: Mutex::new(Vec::new()),
+            base_fees,
+            fail_history,
+            fail_block,
+        });
+        let app = Router::new().route("/", post(rpc)).with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = ProviderBuilder::new().network::<AnyNetwork>().connect_http(url);
+        let estimator = FallbackGasFeeEstimator::new(Arc::new(Box::new(provider)));
+        let result = estimator.get_gas_prices(&ChainId::new(chain_id)).await;
+        server.abort();
+        let calls = state.calls.lock().unwrap().clone();
+        (result, calls)
+    }
+
+    #[tokio::test]
+    async fn valid_history_reuses_base_fee_and_preserves_tiers() {
+        for chain in [1, 8453] {
+            let (result, calls) = run_estimate(chain, vec!["0x64", "0x70"], 0, false).await;
+            let prices = result.unwrap();
+            assert_eq!(calls, ["eth_feeHistory"]);
+            let expected = if chain == 1 { [120, 120, 144, 180] } else { [126, 140, 168, 210] };
+            for ((tier, max), priority) in
+                [prices.slow, prices.medium, prices.fast, prices.super_fast]
+                    .iter()
+                    .zip(expected)
+                    .zip([16, 20, 26, 36])
+            {
+                assert_eq!(tier.max_fee.into_u128(), max);
+                assert_eq!(tier.max_priority_fee.into_u128(), priority);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_or_zero_history_base_fee_reads_block_once() {
+        for fees in [vec![], vec!["0x0", "0x70"]] {
+            let (result, calls) = run_estimate(8453, fees, 0, false).await;
+            assert_eq!(result.unwrap().medium.max_fee.into_u128(), 140);
+            assert_eq!(calls, ["eth_feeHistory", "eth_getBlockByNumber"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn history_failure_retains_provider_fallback() {
+        let (result, calls) = run_estimate(8453, vec![], usize::MAX, false).await;
+        // Alloy's fallback also needs fee history, so its RPC error must propagate.
+        assert!(result.is_err());
+        assert!(calls.iter().filter(|method| *method == "eth_feeHistory").count() >= 2);
+    }
+
+    #[tokio::test]
+    async fn transient_history_failure_uses_provider_estimate_and_block_floor() {
+        let (result, calls) = run_estimate(8453, vec!["0x64", "0x70"], 1, false).await;
+        let prices = result.unwrap();
+        assert_eq!(calls.iter().filter(|method| *method == "eth_feeHistory").count(), 2);
+        assert!(calls.contains(&"eth_getBlockByNumber".to_string()));
+        let floor = 100 + prices.medium.max_priority_fee.into_u128();
+        for tier in [prices.slow, prices.medium, prices.fast, prices.super_fast] {
+            assert!(tier.max_fee.into_u128() >= floor);
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_base_fee_remains_an_error() {
+        let (result, calls) = run_estimate(8453, vec![], 0, true).await;
+        assert!(result.is_err());
+        assert!(calls.contains(&"eth_getBlockByNumber".to_string()));
     }
 }
