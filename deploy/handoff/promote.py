@@ -10,11 +10,12 @@ import argparse
 import base64
 import json
 import os
+import pty
 from pathlib import Path
 import re
+import select
 import subprocess
 import time
-import threading
 import uuid
 
 REQUIRED = {'two_process_handoff','crash_boundaries','lost_rpc_response','stale_owner',
@@ -90,24 +91,39 @@ class Controller:
         script+='http://127.0.0.1:3000'+path
         encoded=base64.b64encode(script.encode()).decode()
         command="sh -c 'echo HANDOFF_BEGIN; echo "+encoded+" | base64 -d | sh; echo; echo HANDOFF_END'"
-        proc=subprocess.Popen(['aws','--region',self.a.region,'ecs','execute-command','--cluster',self.a.cluster,'--task',task,'--container',self.a.container,'--interactive','--command',command],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        master,slave=pty.openpty()
         try:
-            timer=threading.Timer(30,proc.kill);timer.start()
-            lines=[];capturing=False;complete=False
-            try:
-                for line in proc.stdout:
-                    if line.strip()=='HANDOFF_BEGIN':capturing=True;continue
-                    if line.strip()=='HANDOFF_END':complete=True;break
-                    if capturing:lines.append(line)
-            finally:timer.cancel()
-            proc.stdin.close()
-            try:proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:proc.kill();proc.wait()
-            if not complete:raise RuntimeError('Incomplete ECS Exec response')
-            return json.loads(''.join(lines))
+            proc=subprocess.Popen(['aws','--region',self.a.region,'ecs','execute-command','--cluster',self.a.cluster,'--task',task,'--container',self.a.container,'--interactive','--command',command],stdin=slave,stdout=slave,stderr=slave,start_new_session=True)
         except Exception:
-            proc.kill();proc.wait()
+            os.close(master)
+            raise
+        finally:
+            os.close(slave)
+        try:
+            data=b''
+            deadline=time.monotonic()+35
+            while b'HANDOFF_END' not in data and time.monotonic()<deadline:
+                ready,_,_=select.select([master],[],[],min(1,max(0,deadline-time.monotonic())))
+                if ready:
+                    try:chunk=os.read(master,65536)
+                    except OSError:break
+                    if not chunk:break
+                    data+=chunk
+            if b'HANDOFF_BEGIN' not in data or b'HANDOFF_END' not in data:
+                raise RuntimeError('Incomplete ECS Exec response')
+            body=data.split(b'HANDOFF_BEGIN',1)[1].split(b'HANDOFF_END',1)[0].replace(b'\r',b'').strip()
+            return json.loads(body)
+        except Exception:
             raise RuntimeError('Task API unavailable: '+path) from None
+        finally:
+            os.close(master)
+            try:proc.terminate()
+            except ProcessLookupError:pass
+            try:proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:proc.kill()
+                except ProcessLookupError:pass
+                proc.wait()
     def wait(self,predicate,label,seconds=600):
         until=time.monotonic()+seconds
         while time.monotonic()<until:

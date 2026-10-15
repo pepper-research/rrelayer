@@ -1,6 +1,7 @@
-import copy,json,tempfile,unittest
+import copy,json,os,tempfile,unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 from promote import Controller,REQUIRED,validate_acceptance,compatible_definition
 SHA='a'*40;DIGEST='sha256:'+'b'*64
 
@@ -49,6 +50,13 @@ class PromotionTests(unittest.TestCase):
   r=receipt();del r['checks']['stale_owner'];(self.path/'acceptance.json').write_text(json.dumps(r));c=Fake(self.args)
   with self.assertRaises(ValueError):c.run()
   self.assertEqual(c.calls,[])
+ def test_ecs_exec_uses_tty_and_reads_json(self):
+  fake=self.path/'aws'
+  fake.write_text('#!/usr/bin/env python3\nimport json,sys\nassert sys.stdin.isatty() and sys.stdout.isatty()\nprint("HANDOFF_BEGIN")\nprint(json.dumps({"protocol":1,"processing":True}))\nprint("HANDOFF_END")\n')
+  fake.chmod(0o755)
+  with patch.dict(os.environ,PATH=str(self.path)+os.pathsep+os.environ['PATH']):
+   result=Controller(self.args).api('task','/ready')
+  self.assertEqual(result,{'protocol':1,'processing':True})
  def test_normal_order_and_rollback_disabled(self):
   c=Fake(self.args);self.assertEqual(c.run()['stage'],'complete');self.assertTrue(c.warmStopped)
   pre=c.calls.index(('wait','prewarmed target health'));activate=c.calls.index(('api','warm-task','/handoff/activate'));self.assertLess(pre,activate)
