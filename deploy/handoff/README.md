@@ -48,6 +48,20 @@ API's durable send journal performs lookup before recovery instead of repeating
 an ambiguous POST. Deploying this relayer alone does not fix older API timeout
 or refund behavior.
 
+`GET /transactions/:id/prebroadcast-failure` returns either `null` or
+`{ "kind": "terminal_prebroadcast_v1", "transaction": <original transaction> }`.
+It requires enabled sender fencing, a UUID-keyed request originally persisted
+as FAILED before signing/queueing, no signed attempt or attempted audit history,
+no competing external-ID row, and unchanged payload. It bypasses the status
+cache. The existing keyed endpoint cannot restart such a rejection, including
+after refill/restart. FAILED or an absent hash alone does not establish this
+proof. Deploy this endpoint before the API's accelerated reservation recovery;
+the API still owns exact request binding, stopped execution, payout checks and
+the native signed cancellation window. No rollup/contract policy changes.
+
+`scripts/test-idempotent-submission.mjs` covers the proof using real local
+PostgreSQL/Anvil, including auth, refill/restart and attempted-history refusal.
+
 Automatic top-up configurations are rejected at startup before database or
 background work. Their current periodic producers create independent requests
 per process and are not safe under overlap. The checked production/dev YAML
