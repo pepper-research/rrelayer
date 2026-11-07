@@ -494,7 +494,29 @@ impl TransactionsQueues {
         let assigned_nonce = if fixed_lane {
             transactions_queue.nonce_manager.get_current_nonce().await
         } else {
-            transactions_queue.nonce_manager.get_and_increment().await
+            // The sender lock covers this read through admission. Fill unused gaps,
+            // but keep every durable admission/attempt at its original nonce,
+            // including rows belonging to another relayer with the same signer.
+            let reserved = self
+                .db
+                .query(
+                    "SELECT DISTINCT nonce FROM relayer.transaction
+                 WHERE chain_id=$1 AND \"from\"=$2 AND nonce >= $3
+                   AND (status <> 'FAILED' OR broadcast_attempted)
+                 ORDER BY nonce",
+                    &[&transaction.chain_id, &transaction.from, &current_onchain_nonce],
+                )
+                .await
+                .map_err(AddTransactionError::CouldNotSaveTransactionDb)?;
+            let mut next = current_onchain_nonce;
+            for row in reserved {
+                let occupied: TransactionNonce = row.get("nonce");
+                if occupied != next {
+                    break;
+                }
+                next = next + 1;
+            }
+            next
         };
         transaction.nonce = assigned_nonce;
         transaction.gas_limit = Some(estimated_gas_limit);
