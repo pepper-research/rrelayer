@@ -6,6 +6,7 @@ use crate::{gas::get_gas_estimator, network::ChainId, SetupConfig, SigningProvid
 
 mod evm_provider;
 mod layer_extensions;
+mod limit_base;
 
 use self::evm_provider::EvmProviderNewError;
 use crate::gas::GasEstimatorError;
@@ -17,6 +18,9 @@ pub use evm_provider::{
 
 #[derive(Error, Debug)]
 pub enum LoadProvidersError {
+    #[error(transparent)]
+    LimitBaseConfiguration(#[from] limit_base::LimitBaseConfigError),
+
     #[error("No signing_key in the yaml")]
     NoSigningKey,
 
@@ -38,6 +42,7 @@ pub async fn load_providers(
     project_path: &Path,
     setup_config: &SetupConfig,
 ) -> Result<Vec<EvmProvider>, LoadProvidersError> {
+    limit_base::limit_base_config()?;
     let mut providers = Vec::new();
 
     for config in &setup_config.networks {
