@@ -19,7 +19,7 @@ jobs:
           sudo apt-get install -y postgresql-16
       - run: cargo build --locked -p rrelayer_cli
       - name: Restricted Base configuration and lane selection
-        run: cargo test --locked -p rrelayer_core provider:: --lib
+        run: "cargo test --locked -p rrelayer_core provider:: --lib"
       - run: python3 -m unittest discover -s deploy/handoff -p 'test_*.py'
       - name: Real processes, database and chain
         env:
