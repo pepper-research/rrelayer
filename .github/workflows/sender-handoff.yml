@@ -6,13 +6,17 @@ permissions:
   contents: read
 jobs:
   recovery:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: foundry-rs/foundry-toolchain@v1
+      - name: Install PostgreSQL 16 for the local recovery fixture
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-16
       - run: cargo build --locked -p rrelayer_cli
       - run: python3 -m unittest discover -s deploy/handoff -p 'test_*.py'
       - name: Real processes, database and chain
