@@ -1873,3 +1873,7 @@ mod pending_order_tests {
         assert!(empty.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "elysium_tests.rs"]
+mod elysium_tests;
