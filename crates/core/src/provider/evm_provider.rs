@@ -645,7 +645,7 @@ impl EvmProvider {
             let prices: String = client
                 .client()
                 .request(
-                    "eth_call".into(),
+                    "eth_call",
                     (
                         serde_json::json!({
                             "to": "0x000000000000000000000000000000000000006c",
@@ -670,7 +670,7 @@ impl EvmProvider {
             let result: serde_json::Value = client
                 .client()
                 .request(
-                    "eth_simulateV1".into(),
+                    "eth_simulateV1",
                     (
                         serde_json::json!({
                             "blockStateCalls": [{ "calls": [request] }],

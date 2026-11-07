@@ -198,7 +198,7 @@ async fn elysium_queue_signs_authorization_aware_gas_without_rejecting_a_future_
         .rpc_client()
         .client()
         .request(
-            "eth_simulateV1".into(),
+            "eth_simulateV1",
             (json!({ "blockStateCalls": [{ "calls": [request] }], "validation": true }), "0x1"),
         )
         .await;
