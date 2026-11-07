@@ -1,7 +1,7 @@
 use super::*;
 use crate::gas::CustomGasFeeEstimator;
 use crate::NetworkSetupConfig;
-use alloy::consensus::{Transaction as _, TxEip7702, TxEnvelope};
+use alloy::consensus::{Transaction as _, TxEip7702, TxEnvelope, TxLegacy};
 use alloy::primitives::{address, Bytes, U256};
 use alloy::rpc::types::{serde_helpers::WithOtherFields, TransactionRequest};
 use alloy::signers::{local::PrivateKeySigner, Signer};
@@ -9,10 +9,18 @@ use alloy_eips::{eip2718::Decodable2718, eip7702::Authorization};
 use axum::{extract::State, routing::post, Json, Router};
 use serde_json::{json, Value};
 
+struct SimulationBudget {
+    balance: U256,
+    inner_native_value: U256,
+    fee_sensitive: bool,
+    final_reply: Option<Value>,
+}
+
 struct Fixture {
     queue: TransactionsQueue,
     transaction: TypedTransaction,
     requests: Arc<Mutex<Vec<Value>>>,
+    budget: Arc<Mutex<SimulationBudget>>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -25,7 +33,13 @@ impl Drop for Fixture {
 impl Fixture {
     async fn new(chain_id: u64, simulation_reply: Value, parent_fee: u64) -> Self {
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let state = (chain_id, simulation_reply, parent_fee, requests.clone());
+        let budget = Arc::new(Mutex::new(SimulationBudget {
+            balance: U256::from(100_000_000),
+            inner_native_value: U256::ZERO,
+            fee_sensitive: false,
+            final_reply: None,
+        }));
+        let state = (chain_id, simulation_reply, parent_fee, requests.clone(), budget.clone());
         let app = Router::new().route("/", post(rpc)).with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -127,16 +141,17 @@ impl Fixture {
             Arc::new(Mutex::new(BlobGasOracleCache::new())),
         );
         requests.lock().await.clear();
-        Self { queue, transaction, requests, server }
+        Self { queue, transaction, requests, budget, server }
     }
 }
 
 async fn rpc(
-    State((chain_id, reply, parent_fee, requests)): State<(
+    State((chain_id, reply, parent_fee, requests, budget)): State<(
         u64,
         Value,
         u64,
         Arc<Mutex<Vec<Value>>>,
+        Arc<Mutex<SimulationBudget>>,
     )>,
     Json(request): Json<Value>,
 ) -> Json<Value> {
@@ -166,13 +181,45 @@ async fn rpc(
         "eth_simulateV1" if request["params"][0]["validation"] == true => {
             json!({ "error": { "code": -32000, "message": "nonce too high: latest sender nonce is zero" } })
         }
-        "eth_simulateV1" => reply,
+        "eth_simulateV1" => {
+            let block = &request["params"][0]["blockStateCalls"][0];
+            assert!(block.get("stateOverrides").is_none());
+            let call = &block["calls"][0];
+            let gas = quantity(&call["gas"]);
+            let value = quantity(&call["value"]);
+            let legacy = call.get("gasPrice").is_some();
+            let fee = quantity(&call[if legacy { "gasPrice" } else { "maxFeePerGas" }]);
+            let tip = call.get("maxPriorityFeePerGas").map(quantity).unwrap_or_default();
+            let base =
+                block["blockOverrides"].get("baseFeePerGas").map(quantity).unwrap_or_default();
+            let effective = if legacy { fee } else { fee.min(base + tip) };
+            let budget = budget.lock().await;
+            if budget.balance < gas * fee + value {
+                json!({ "error": { "code": -38014, "message": "insufficient funds for gas * price + value" } })
+            } else if budget.balance - gas * effective - value < budget.inner_native_value {
+                json!({ "result": [{ "calls": [{ "status": "0x0", "error": {
+                    "code": 3, "message": "CallReverted(nativecall)", "data": "0xdeadbeef"
+                } }] }] })
+            } else if budget.fee_sensitive && effective > U256::ZERO {
+                json!({ "result": [{ "calls": [{ "status": "0x0", "error": {
+                    "code": -32000, "message": "out of gas on GASPRICE-sensitive path", "data": "0x1234"
+                } }] }] })
+            } else if fee > U256::ZERO {
+                budget.final_reply.clone().unwrap_or(reply)
+            } else {
+                reply
+            }
+        }
         _ => json!({ "error": { "code": -32601, "message": "Unexpected fixture RPC method" } }),
     };
     let mut response = response.as_object().unwrap().clone();
     response.insert("jsonrpc".to_string(), json!("2.0"));
     response.insert("id".to_string(), request["id"].clone());
     Json(Value::Object(response))
+}
+
+fn quantity(value: &Value) -> U256 {
+    U256::from_str_radix(value.as_str().unwrap().strip_prefix("0x").unwrap(), 16).unwrap()
 }
 
 fn success() -> Value {
@@ -239,7 +286,7 @@ async fn elysium_queue_signs_authorization_aware_gas_without_rejecting_a_future_
     assert_eq!(requests.iter().filter(|request| request["method"] == "eth_estimateGas").count(), 1);
     let simulations: Vec<_> =
         requests.iter().filter(|request| request["method"] == "eth_simulateV1").collect();
-    assert_eq!(simulations.len(), 2);
+    assert_eq!(simulations.len(), 3);
     assert_eq!(simulations[1]["params"][1], "0x1");
     let block = &simulations[1]["params"][0]["blockStateCalls"][0];
     assert_eq!(simulations[1]["params"][0]["validation"], false);
@@ -252,9 +299,20 @@ async fn elysium_queue_signs_authorization_aware_gas_without_rejecting_a_future_
     assert_eq!(call["nonce"], "0x1");
     assert_eq!(call["chainId"], "0x1863d");
     assert_eq!(call["authorizationList"], json!(transaction.authorization_list));
-    assert_eq!(call["maxFeePerGas"], "0xc8");
-    assert_eq!(call["maxPriorityFeePerGas"], "0x1");
+    assert_eq!(call["maxFeePerGas"], "0x0");
+    assert_eq!(call["maxPriorityFeePerGas"], "0x0");
     assert_eq!(call["gas"], "0x989680");
+    let final_block = &simulations[2]["params"][0]["blockStateCalls"][0];
+    assert_eq!(simulations[2]["params"][0]["validation"], false);
+    assert_eq!(final_block["blockOverrides"]["baseFeePerGas"], "0x64");
+    assert!(final_block.get("stateOverrides").is_none());
+    let final_call = &final_block["calls"][0];
+    assert_eq!(final_call["maxFeePerGas"], "0xc8");
+    assert_eq!(final_call["maxPriorityFeePerGas"], "0x1");
+    assert_eq!(final_call["gas"], "0x1d4c0");
+    for field in ["from", "to", "input", "value", "nonce", "chainId", "authorizationList"] {
+        assert_eq!(final_call[field], call[field]);
+    }
     assert!(!requests.iter().any(|request| request["method"] == "eth_sendRawTransaction"));
 }
 
@@ -304,4 +362,143 @@ async fn elysium_change_preserves_ordinary_network_estimation() {
     assert!(!requests
         .iter()
         .any(|request| request["method"] == "eth_simulateV1" || request["method"] == "eth_call"));
+}
+
+#[tokio::test]
+async fn elysium_measurement_does_not_require_full_cap_funding() {
+    let fixture = Fixture::new(99901, success(), 0).await;
+    fixture.budget.lock().await.balance = U256::from(120_000 * 200 + 8);
+    assert_eq!(
+        fixture.queue.estimate_gas(&fixture.transaction, false, None).await.unwrap(),
+        GasLimit::new(120_000)
+    );
+    let requests = fixture.requests.lock().await;
+    let simulations: Vec<_> = requests.iter().filter(|r| r["method"] == "eth_simulateV1").collect();
+    assert_eq!(simulations.len(), 2);
+    assert_eq!(
+        simulations[0]["params"][0]["blockStateCalls"][0]["calls"][0]["maxFeePerGas"],
+        "0x0"
+    );
+    assert_eq!(simulations[1]["params"][0]["blockStateCalls"][0]["calls"][0]["gas"], "0x1d4c0");
+    assert_eq!(fixture.queue.nonce_manager.get_current_nonce().await.into_inner(), 1);
+}
+
+#[tokio::test]
+async fn elysium_inner_native_principal_survives_measurement_and_exact_budget_validation() {
+    let mut fixture = Fixture::new(99901, success(), 0).await;
+    let TypedTransaction::Eip7702(transaction) = &mut fixture.transaction else {
+        panic!("type 4");
+    };
+    transaction.value = U256::ZERO;
+    let principal = U256::from(1_000_000_000_000_000_000u128);
+    {
+        let mut budget = fixture.budget.lock().await;
+        budget.balance = principal + U256::from(120_000 * 200 + 1);
+        budget.inner_native_value = principal;
+    }
+    let mut call: TransactionRequest = fixture.transaction.clone().into();
+    call.from = Some(fixture.queue.relayer.address.into_address());
+    let cap_control: Value = fixture.queue.evm_provider.rpc_client().client().request(
+        "eth_simulateV1", (json!({ "blockStateCalls": [{ "blockOverrides": { "baseFeePerGas": "0x64" }, "calls": [call] }], "validation": false }), "0x1")
+    ).await.unwrap();
+    assert_eq!(cap_control[0]["calls"][0]["status"], "0x0");
+    assert_eq!(cap_control[0]["calls"][0]["error"]["data"], "0xdeadbeef");
+    assert_eq!(
+        fixture.queue.estimate_gas(&fixture.transaction, false, None).await.unwrap(),
+        GasLimit::new(120_000)
+    );
+    assert_eq!(fixture.budget.lock().await.balance, principal + U256::from(120_000 * 200 + 1));
+}
+
+#[tokio::test]
+async fn elysium_final_fee_sensitive_failure_cannot_be_accepted_as_zero_fee_success() {
+    let fixture = Fixture::new(99901, success(), 0).await;
+    fixture.budget.lock().await.fee_sensitive = true;
+    let error = fixture.queue.estimate_gas(&fixture.transaction, false, None).await.unwrap_err();
+    assert!(error.to_string().contains("GASPRICE-sensitive"));
+    assert!(error.to_string().contains("0x1234"));
+    assert_eq!(fixture.queue.nonce_manager.get_current_nonce().await.into_inner(), 1);
+    let requests = fixture.requests.lock().await;
+    let simulations: Vec<_> = requests.iter().filter(|r| r["method"] == "eth_simulateV1").collect();
+    assert_eq!(simulations.len(), 2);
+    assert_eq!(
+        simulations[1]["params"][0]["blockStateCalls"][0]["blockOverrides"]["baseFeePerGas"],
+        "0x64"
+    );
+}
+
+#[tokio::test]
+async fn elysium_final_response_must_fit_the_exact_final_budget() {
+    let invalid = [
+        json!({ "error": { "code": -32601, "message": "validation unavailable" } }),
+        json!({ "result": [{ "calls": [{ "status": "0x1", "gasUsed": "0x1", "maxUsedGas": "0x1d4c1" }] }] }),
+        json!({ "result": [{ "calls": [{ "status": "0x1", "gasUsed": "0x1" }] }] }),
+    ];
+    for reply in invalid {
+        let fixture = Fixture::new(99901, success(), 0).await;
+        fixture.budget.lock().await.final_reply = Some(reply);
+        assert!(fixture.queue.estimate_gas(&fixture.transaction, false, None).await.is_err());
+        assert_eq!(fixture.queue.nonce_manager.get_current_nonce().await.into_inner(), 1);
+    }
+}
+
+#[tokio::test]
+async fn elysium_cached_gas_is_checked_against_changed_signing_fees() {
+    let fixture = Fixture::new(99901, success(), 0).await;
+    let gas = fixture.queue.estimate_gas(&fixture.transaction, false, None).await.unwrap();
+    let TypedTransaction::Eip7702(mut transaction) = fixture.transaction.clone() else {
+        panic!("type 4");
+    };
+    transaction.gas_limit = gas.into();
+    transaction.max_fee_per_gas = 1000;
+    let error = fixture
+        .queue
+        .evm_provider
+        .validate_estimated_gas(
+            &TypedTransaction::Eip7702(transaction),
+            &fixture.queue.relayer.address,
+            gas,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("insufficient funds"));
+    assert_eq!(fixture.queue.nonce_manager.get_current_nonce().await.into_inner(), 1);
+}
+
+#[tokio::test]
+async fn elysium_legacy_fees_are_zero_only_during_measurement() {
+    let fixture = Fixture::new(99901, success(), 0).await;
+    let transaction = TypedTransaction::Legacy(TxLegacy {
+        chain_id: Some(99901),
+        nonce: 1,
+        gas_price: 200,
+        gas_limit: 10_000_000,
+        to: fixture.queue.relayer.address.into_address().into(),
+        value: U256::from(7),
+        input: Bytes::from_static(&[0x12, 0x34]),
+    });
+    assert_eq!(
+        fixture.queue.estimate_gas(&transaction, false, None).await.unwrap(),
+        GasLimit::new(120_000)
+    );
+    let requests = fixture.requests.lock().await;
+    let simulations: Vec<_> = requests.iter().filter(|r| r["method"] == "eth_simulateV1").collect();
+    assert_eq!(simulations.len(), 2);
+    let first = &simulations[0]["params"][0]["blockStateCalls"][0]["calls"][0];
+    let final_call = &simulations[1]["params"][0]["blockStateCalls"][0]["calls"][0];
+    assert_eq!(first["gasPrice"], "0x0");
+    assert_eq!(final_call["gasPrice"], "0xc8");
+    assert!(first.get("maxFeePerGas").is_none());
+}
+
+#[tokio::test]
+async fn elysium_noop_keeps_the_unbuffered_budget() {
+    let fixture = Fixture::new(99901, success(), 0).await;
+    assert_eq!(
+        fixture.queue.estimate_gas(&fixture.transaction, true, None).await.unwrap(),
+        GasLimit::new(100_000)
+    );
+    let requests = fixture.requests.lock().await;
+    let last = requests.iter().filter(|r| r["method"] == "eth_simulateV1").last().unwrap();
+    assert_eq!(last["params"][0]["blockStateCalls"][0]["calls"][0]["gas"], "0x186a0");
 }
