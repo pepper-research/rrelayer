@@ -16,6 +16,7 @@ impl TestRunner {
 
         let relayer = self.create_and_fund_relayer("allowlist-restriction-relayer").await?;
         info!("Created relayer: {:?}", relayer);
+        self.replacement_permissions(&relayer, false).await?;
 
         let allowed_tx_result = self
             .relayer_client
@@ -52,6 +53,7 @@ impl TestRunner {
 
         let relayer = self.create_and_fund_relayer("allowlist-restriction-relayer").await?;
         info!("Created relayer: {:?}", relayer);
+        self.replacement_permissions(&relayer, true).await?;
 
         let forbidden_native_tx_result = self
             .relayer_client

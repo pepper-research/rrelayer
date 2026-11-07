@@ -34,7 +34,7 @@ pub async fn send_transaction_random(
 /// Filters out paused, internal-only, and relayers only allowed for random selection.
 /// Note: The random relayer feature must be explicitly enabled via `allowed_random_relayers`
 /// config for the network, otherwise all relayers will be filtered out.
-async fn select_random_relayer(
+pub(super) async fn select_random_relayer(
     state: &Arc<AppState>,
     chain_id: &ChainId,
 ) -> Result<Relayer, HttpError> {
@@ -50,6 +50,7 @@ async fn select_random_relayer(
         .into_iter()
         .filter(|r| {
             !r.paused
+                && !crate::provider::is_limit_base_address(&r.chain_id, &r.address)
                 && !state.relayer_internal_only.restricted(&r.address, &r.chain_id)
                 && state.relayers_allowed_for_random.is_allowed(&r.address, &r.chain_id)
         })

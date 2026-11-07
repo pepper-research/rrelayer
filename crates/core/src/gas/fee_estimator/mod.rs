@@ -13,6 +13,7 @@ mod etherscan;
 pub use etherscan::EtherscanGasProviderSetupConfig;
 
 mod fallback;
+pub use fallback::FallbackGasFeeEstimator;
 
 mod infura;
 pub use infura::InfuraGasProviderSetupConfig;

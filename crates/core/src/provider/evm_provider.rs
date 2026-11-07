@@ -1,4 +1,4 @@
-use crate::gas::BLOB_GAS_PER_BLOB;
+use crate::gas::{FallbackGasFeeEstimator, BLOB_GAS_PER_BLOB};
 use crate::provider::layer_extensions::RpcLoggingLayer;
 use crate::relayer::Relayer;
 use crate::wallet::{
@@ -41,7 +41,9 @@ use alloy::{
     },
 };
 use alloy_eips::eip2718::Encodable2718;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rand::{thread_rng, Rng};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::Url;
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,6 +51,58 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 pub type RelayerProvider = Box<dyn Provider<AnyNetwork> + Send + Sync>;
+const LIMIT_BASE_RPC_GATEWAY: &str =
+    "https://tx-submission-api.spicenet.io/internal/orders/base-rpc";
+const LIMIT_BASE_WALLET: &str = "0x43558ebdCfEb6EeD08f636fa515e221a4755e0d4";
+
+pub fn is_limit_base_relayer(relayer: &Relayer) -> bool {
+    relayer.chain_id.u64() == 8453 && relayer.wallet_index == 0 && !relayer.is_private_key
+}
+
+pub fn is_limit_base_address(chain_id: &ChainId, address: &EvmAddress) -> bool {
+    chain_id.u64() == 8453 && address.to_string().eq_ignore_ascii_case(LIMIT_BASE_WALLET)
+}
+
+#[cfg(test)]
+mod gateway_selection_tests {
+    use super::{is_limit_base_address, is_limit_base_relayer, LIMIT_BASE_WALLET};
+    use crate::{
+        network::ChainId,
+        relayer::{Relayer, RelayerId},
+        shared::common_types::EvmAddress,
+    };
+
+    #[test]
+    fn selects_only_fixed_base_normal_wallet_zero() {
+        let address: EvmAddress = LIMIT_BASE_WALLET.parse().unwrap();
+        let mut relayer = Relayer {
+            id: RelayerId::new(),
+            name: "fixed".to_string(),
+            chain_id: ChainId::new(8453),
+            cloned_from_chain_id: None,
+            address,
+            wallet_index: 0,
+            max_gas_price: None,
+            paused: false,
+            eip_1559_enabled: true,
+            created_at: chrono::Utc::now(),
+            is_private_key: false,
+        };
+        assert!(is_limit_base_relayer(&relayer));
+        assert!(is_limit_base_address(&relayer.chain_id, &relayer.address));
+        relayer.is_private_key = true;
+        assert!(!is_limit_base_relayer(&relayer));
+        relayer.wallet_index = -1;
+        assert!(!is_limit_base_relayer(&relayer));
+        relayer.is_private_key = false;
+        relayer.wallet_index = 1;
+        assert!(!is_limit_base_relayer(&relayer));
+        relayer.wallet_index = 0;
+        relayer.chain_id = ChainId::new(1);
+        assert!(!is_limit_base_relayer(&relayer));
+        assert!(!is_limit_base_address(&relayer.chain_id, &relayer.address));
+    }
+}
 
 #[derive(Clone)]
 pub struct EvmProvider {
@@ -63,6 +117,7 @@ pub struct EvmProvider {
     pub confirmations: u64,
     /// Whether this provider type supports cloning (for clone prevention logic)
     can_clone: bool,
+    isolated_limit_base: bool,
 }
 
 async fn calculate_block_time_difference(
@@ -110,6 +165,9 @@ pub enum RetryClientError {
 
     #[error("Could not build client: {0}")]
     CouldNotBuildClient(#[from] ReqwestError),
+
+    #[error("Fixed Base RPC gateway configuration is unavailable")]
+    GatewayConfiguration,
 }
 
 pub async fn create_retry_client(rpc_url: &str) -> Result<Arc<RelayerProvider>, RetryClientError> {
@@ -130,6 +188,32 @@ pub async fn create_retry_client(rpc_url: &str) -> Result<Arc<RelayerProvider>, 
     Ok(Arc::new(Box::new(provider)))
 }
 
+fn create_limit_base_gateway_client() -> Result<Arc<RelayerProvider>, RetryClientError> {
+    let username = std::env::var("RRELAYER_AUTH_USERNAME")
+        .map_err(|_| RetryClientError::GatewayConfiguration)?;
+    let password = std::env::var("RRELAYER_AUTH_PASSWORD")
+        .map_err(|_| RetryClientError::GatewayConfiguration)?;
+    if username.is_empty() || password.is_empty() {
+        return Err(RetryClientError::GatewayConfiguration);
+    }
+    let auth = format!("Basic {}", BASE64.encode(format!("{username}:{password}")));
+    let mut headers = HeaderMap::new();
+    let mut authorization =
+        HeaderValue::from_str(&auth).map_err(|_| RetryClientError::GatewayConfiguration)?;
+    authorization.set_sensitive(true);
+    headers.insert(AUTHORIZATION, authorization);
+    let client =
+        Client::builder().default_headers(headers).timeout(Duration::from_secs(15)).build()?;
+    let url =
+        Url::parse(LIMIT_BASE_RPC_GATEWAY).map_err(|_| RetryClientError::GatewayConfiguration)?;
+    let http = Http::with_client(client, url);
+    // This lane has one physical attempt per call. The gateway owns budget and
+    // the queue applies its own bounded cooldown without changing ordinary RPC.
+    let rpc_client = RpcClient::builder().transport(http, false);
+    let provider = ProviderBuilder::new().network::<AnyNetwork>().connect_client(rpc_client);
+    Ok(Arc::new(Box::new(provider)))
+}
+
 #[derive(Error, Debug)]
 #[allow(clippy::enum_variant_names)]
 pub enum SendTransactionError {
@@ -144,11 +228,6 @@ pub enum SendTransactionError {
 
     #[error("Internal error: {0}")]
     InternalError(String),
-
-    /// The node rejected this exact signed transaction because its nonce is used and could not
-    /// serve it by hash. `hash` is what was broadcast. The message matches `RpcError`'s.
-    #[error("Provider error: {error}")]
-    NonceUsed { hash: TransactionHash, error: RpcError<TransportErrorKind> },
 }
 
 #[derive(Error, Debug)]
@@ -283,7 +362,37 @@ impl EvmProvider {
             provider_urls: network_setup_config.provider_urls.to_owned(),
             confirmations: network_setup_config.confirmations.unwrap_or(12),
             can_clone,
+            isolated_limit_base: false,
         })
+    }
+
+    /// The fixed normal wallet-0 lane never falls back to ordinary Base RPC.
+    /// With the flag absent, callers omit its queue until the gateway is ready.
+    pub fn for_relayer(&self, relayer: &Relayer) -> Result<Option<Self>, RetryClientError> {
+        if self.chain_id != relayer.chain_id {
+            return Err(RetryClientError::GatewayConfiguration);
+        }
+        if !is_limit_base_relayer(relayer) {
+            return Ok(Some(self.clone()));
+        }
+        if !relayer.address.to_string().eq_ignore_ascii_case(LIMIT_BASE_WALLET) {
+            return Err(RetryClientError::GatewayConfiguration);
+        }
+        if std::env::var("RRELAYER_LIMIT_RPC_GATEWAY_ENABLED").as_deref() != Ok("true") {
+            return Ok(None);
+        }
+        let client = create_limit_base_gateway_client()?;
+        let mut isolated = self.clone();
+        isolated.rpc_clients = vec![client.clone()];
+        isolated.gas_estimator = Arc::new(FallbackGasFeeEstimator::new(client));
+        isolated.provider_urls = vec![LIMIT_BASE_RPC_GATEWAY.to_string()];
+        isolated.blocks_every = isolated.blocks_every.max(1_000);
+        isolated.isolated_limit_base = true;
+        Ok(Some(isolated))
+    }
+
+    pub fn is_isolated_limit_base(&self) -> bool {
+        self.isolated_limit_base
     }
 
     pub fn rpc_client(&self) -> Arc<RelayerProvider> {
@@ -374,9 +483,7 @@ impl EvmProvider {
         Ok(TransactionNonce::new(nonce))
     }
 
-    /// Nonces used by mined transactions only, unlike `get_nonce_from_address` which also counts
-    /// the mempool.
-    pub async fn get_mined_nonce_from_address(
+    pub async fn get_latest_nonce_from_address(
         &self,
         address: &EvmAddress,
     ) -> Result<TransactionNonce, RpcError<TransportErrorKind>> {
@@ -385,8 +492,14 @@ impl EvmProvider {
             .get_transaction_count(address.into_address())
             .block_id(BlockId::Number(BlockNumberOrTag::Latest))
             .await?;
-
         Ok(TransactionNonce::new(nonce))
+    }
+
+    pub async fn has_transaction_hash(
+        &self,
+        hash: &TransactionHash,
+    ) -> Result<bool, RpcError<TransportErrorKind>> {
+        Ok(self.rpc_client().get_transaction_by_hash(hash.into_alloy_hash()).await?.is_some())
     }
 
     pub async fn send_transaction(
@@ -394,6 +507,15 @@ impl EvmProvider {
         relayer: &Relayer,
         transaction: TypedTransaction,
     ) -> Result<TransactionHash, SendTransactionError> {
+        let (tx_bytes, tx_hash) = self.sign_raw_transaction(relayer, transaction).await?;
+        self.send_raw_signed(&tx_bytes, tx_hash).await
+    }
+
+    pub async fn sign_raw_transaction(
+        &self,
+        relayer: &Relayer,
+        transaction: TypedTransaction,
+    ) -> Result<(Vec<u8>, TransactionHash), SendTransactionError> {
         let signature = self
             .wallet_manager
             .sign_transaction(
@@ -403,7 +525,6 @@ impl EvmProvider {
             )
             .await
             .map_err(|e| SendTransactionError::InternalError(e.to_string()))?;
-
         let tx_envelope = match transaction {
             TypedTransaction::Legacy(tx) => TxEnvelope::Legacy(tx.into_signed(signature)),
             TypedTransaction::Eip2930(tx) => TxEnvelope::Eip2930(tx.into_signed(signature)),
@@ -412,38 +533,44 @@ impl EvmProvider {
             TypedTransaction::Eip7702(tx) => TxEnvelope::Eip7702(tx.into_signed(signature)),
         };
 
-        let provider = self.rpc_client();
-        let tx_bytes = tx_envelope.encoded_2718();
+        Ok((tx_envelope.encoded_2718(), TransactionHash::from_alloy_hash(tx_envelope.tx_hash())))
+    }
 
-        let error = match provider.send_raw_transaction(&tx_bytes).await {
+    pub async fn send_raw_signed(
+        &self,
+        tx_bytes: &[u8],
+        tx_hash: TransactionHash,
+    ) -> Result<TransactionHash, SendTransactionError> {
+        let provider = self.rpc_client();
+        let error = match provider.send_raw_transaction(tx_bytes).await {
             Ok(pending) => return Ok(TransactionHash::from_alloy_hash(pending.tx_hash())),
             Err(error) => error,
         };
+
+        if self.isolated_limit_base
+            && matches!(
+                &error,
+                RpcError::Transport(TransportErrorKind::HttpError(http))
+                    if matches!(http.status, 400 | 401 | 413 | 429)
+            )
+        {
+            return Err(error.into());
+        }
 
         // A node can reject this exact signed transaction ("nonce too low", "already known")
         // after it has already accepted it. If the node knows this hash, the send succeeded.
         // Returning the error makes the queue re-send the payload at a new nonce, putting it
         // on-chain twice.
-        let tx_hash = *tx_envelope.tx_hash();
-        if let Ok(Some(_)) = provider.get_transaction_by_hash(tx_hash).await {
+        if let Ok(Some(_)) = provider.get_transaction_by_hash(tx_hash.into_alloy_hash()).await {
             warn!("rrelayer_send_already_known hash={} provider_error=\"{}\"", tx_hash, error);
-            return Ok(TransactionHash::from_alloy_hash(&tx_hash));
+            return Ok(tx_hash);
         }
 
-        // Right after inclusion a node can report the nonce as used before it serves the
-        // transaction by hash (robinhood-pk-0, 2026-09-29), so hand the caller the hash to track.
-        // Nonce-specific wording only: "intrinsic gas too low" or "fee too low" leave the nonce
-        // unused, so a hash tracked for them could never land.
-        let error_msg = error.to_string().to_lowercase();
-        if error_msg.contains("nonce too low")
-            || error_msg.contains("nonce is too low")
-            || error_msg.contains("already known")
-            || error_msg.contains("nonce has already been used")
-        {
-            return Err(SendTransactionError::NonceUsed {
-                hash: TransactionHash::from_alloy_hash(&tx_hash),
-                error,
-            });
+        if self.isolated_limit_base {
+            // An HTTP error cannot prove whether the gateway forwarded the raw bytes.
+            // Keep the original pending; the next attempt reconciles its hash and
+            // nonce before rebroadcasting these identical durable bytes.
+            warn!("rrelayer_fixed_base_send_uncertain hash={}", tx_hash);
         }
 
         Err(error.into())
@@ -569,7 +696,7 @@ impl EvmProvider {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use crate::gas::CustomGasFeeEstimator;
     use crate::relayer::RelayerId;
@@ -577,7 +704,7 @@ pub(crate) mod tests {
     use alloy::primitives::{address, TxKind, U256};
     use std::process::{Child, Command};
 
-    pub(crate) struct Anvil(Child);
+    struct Anvil(Child);
 
     impl Drop for Anvil {
         fn drop(&mut self) {
@@ -585,10 +712,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// Starts anvil and returns a provider and relayer for its first dev account.
-    pub(crate) async fn anvil_relayer() -> (Anvil, EvmProvider, Relayer) {
+    // Run with: cargo test -p rrelayer_core -- --ignored
+    #[tokio::test]
+    #[ignore = "requires anvil on PATH"]
+    async fn resending_a_mined_transaction_returns_its_hash() {
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let anvil = Anvil(
+        let _anvil = Anvil(
             Command::new("anvil")
                 .args(["--port", &port.to_string(), "--silent"])
                 .spawn()
@@ -630,69 +759,21 @@ pub(crate) mod tests {
             created_at: chrono::Utc::now(),
             is_private_key: false,
         };
-        (anvil, provider, relayer)
-    }
-
-    fn transfer(nonce: u64, value: u64) -> TypedTransaction {
-        TypedTransaction::Eip1559(TxEip1559 {
+        let transaction = TypedTransaction::Eip1559(TxEip1559 {
             chain_id: 31337,
-            nonce,
+            nonce: 0,
             gas_limit: 21_000,
             max_fee_per_gas: 10_000_000_000,
             max_priority_fee_per_gas: 1_000_000_000,
             to: TxKind::Call(address!("000000000000000000000000000000000000dead")),
-            value: U256::from(value),
+            value: U256::from(1),
             ..Default::default()
-        })
-    }
-
-    // Run with: cargo test -p rrelayer_core -- --ignored
-    #[tokio::test]
-    #[ignore = "requires anvil on PATH"]
-    async fn resending_a_mined_transaction_returns_its_hash() {
-        let (_anvil, provider, relayer) = anvil_relayer().await;
-        let transaction = transfer(0, 1);
+        });
 
         let sent = provider.send_transaction(&relayer, transaction.clone()).await.unwrap();
         // anvil mines on receipt, so the node now answers this exact resend with "nonce too low"
         let resent = provider.send_transaction(&relayer, transaction).await.unwrap();
 
         assert_eq!(resent, sent);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires anvil on PATH"]
-    async fn a_used_nonce_that_is_not_found_returns_the_broadcast_hash() {
-        let (_anvil, provider, relayer) = anvil_relayer().await;
-        provider.send_transaction(&relayer, transfer(0, 1)).await.unwrap();
-        let other = transfer(0, 2);
-        let signature = provider.sign_transaction(&relayer, &other).await.unwrap();
-        let TypedTransaction::Eip1559(unsigned) = other.clone() else { unreachable!() };
-        let other_hash = TransactionHash::from_alloy_hash(unsigned.into_signed(signature).hash());
-
-        let error = provider.send_transaction(&relayer, other).await.unwrap_err();
-
-        let SendTransactionError::NonceUsed { hash, .. } = &error else {
-            panic!("expected NonceUsed, got {error}");
-        };
-        assert_eq!(*hash, other_hash);
-        // Callers that match on the message still see the node's rejection.
-        assert!(error.to_string().to_lowercase().contains("nonce too low"), "{error}");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires anvil on PATH"]
-    async fn a_too_low_rejection_that_is_not_about_the_nonce_is_not_a_used_nonce() {
-        let (_anvil, provider, relayer) = anvil_relayer().await;
-        let TypedTransaction::Eip1559(mut underfunded_gas) = transfer(0, 1) else { unreachable!() };
-        underfunded_gas.gas_limit = 20_000;
-
-        let error = provider
-            .send_transaction(&relayer, TypedTransaction::Eip1559(underfunded_gas))
-            .await
-            .unwrap_err();
-
-        assert!(error.to_string().to_lowercase().contains("too low"), "{error}");
-        assert!(!matches!(error, SendTransactionError::NonceUsed { .. }), "{error}");
     }
 }

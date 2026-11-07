@@ -18,6 +18,11 @@ use crate::{
 
 #[derive(Error, Debug)]
 pub enum ReplaceTransactionError {
+    #[error("{0}")]
+    Handoff(PostgresError),
+    #[error("Transaction {0} has already attempted broadcast; wait for its state to resolve before replacing")]
+    BroadcastAlreadyAttempted(TransactionId),
+
     #[error("Send transaction error: {0}")]
     SendTransactionError(#[from] TransactionQueueSendTransactionError),
 
@@ -39,7 +44,14 @@ pub enum ReplaceTransactionError {
 
 impl From<ReplaceTransactionError> for HttpError {
     fn from(value: ReplaceTransactionError) -> Self {
-        if matches!(value, ReplaceTransactionError::TransactionNotFound(_)) {
+        if matches!(value, ReplaceTransactionError::Handoff(_)) {
+            return (reqwest::StatusCode::SERVICE_UNAVAILABLE, value.to_string());
+        }
+        if matches!(
+            value,
+            ReplaceTransactionError::TransactionNotFound(_)
+                | ReplaceTransactionError::BroadcastAlreadyAttempted(_)
+        ) {
             return bad_request(value.to_string());
         }
 
@@ -65,6 +77,9 @@ pub enum AddTransactionError {
     #[error("Relayer {0} is paused")]
     RelayerIsPaused(RelayerId),
 
+    #[error("Fixed Base relayer has an unresolved original transaction")]
+    FixedBaseLaneBusy,
+
     #[error("{0}")]
     TransactionGasPriceError(#[from] SendTransactionGasPriceError),
 
@@ -86,6 +101,12 @@ pub enum AddTransactionError {
 
 impl From<AddTransactionError> for HttpError {
     fn from(value: AddTransactionError) -> Self {
+        if matches!(
+            value,
+            AddTransactionError::CouldNotSaveTransactionDb(PostgresError::Handoff(_))
+        ) {
+            return (reqwest::StatusCode::SERVICE_UNAVAILABLE, value.to_string());
+        }
         if matches!(value, AddTransactionError::RelayerIsPaused(_)) {
             return forbidden(value.to_string());
         }
@@ -98,12 +119,18 @@ impl From<AddTransactionError> for HttpError {
             return bad_request(value.to_string());
         }
 
+        if matches!(value, AddTransactionError::FixedBaseLaneBusy) {
+            return forbidden(value.to_string());
+        }
+
         internal_server_error(Some(value.to_string()))
     }
 }
 
 #[derive(Error, Debug)]
 pub enum CancelTransactionError {
+    #[error("{0}")]
+    Handoff(PostgresError),
     #[error("Send transaction error: {0}")]
     SendTransactionError(#[from] TransactionQueueSendTransactionError),
 
@@ -122,6 +149,9 @@ pub enum CancelTransactionError {
 
 impl From<CancelTransactionError> for HttpError {
     fn from(value: CancelTransactionError) -> Self {
+        if matches!(value, CancelTransactionError::Handoff(_)) {
+            return (reqwest::StatusCode::SERVICE_UNAVAILABLE, value.to_string());
+        }
         if matches!(value, CancelTransactionError::RelayerIsPaused(_)) {
             return forbidden(value.to_string());
         }
@@ -137,6 +167,8 @@ impl From<CancelTransactionError> for HttpError {
 #[derive(Error, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum ProcessPendingTransactionError {
+    #[error("{0}")]
+    Handoff(PostgresError),
     #[error("Relayer transactions queue not found for relayer id {0}")]
     RelayerTransactionsQueueNotFound(RelayerId),
 
@@ -144,13 +176,13 @@ pub enum ProcessPendingTransactionError {
     SendTransactionError(RelayerId, EvmAddress, TransactionQueueSendTransactionError),
 
     #[error("Transaction could not be sent due to gas calculation error for relayer id {0} / address {1}: tx {2}")]
-    GasCalculationError(RelayerId, EvmAddress, Transaction),
+    GasCalculationError(RelayerId, EvmAddress, Box<Transaction>),
 
     #[error("Relayer id {0} / address {1} - {2}")]
     MovePendingTransactionToInmempoolError(
         RelayerId,
         EvmAddress,
-        MovePendingTransactionToInmempoolError,
+        Box<MovePendingTransactionToInmempoolError>,
     ),
 
     #[error("Relayer id {0} / address {1} - Transaction estimate gas error: {2}")]
@@ -162,6 +194,8 @@ pub enum ProcessPendingTransactionError {
 
 #[derive(Error, Debug)]
 pub enum ProcessInmempoolTransactionError {
+    #[error("{0}")]
+    Handoff(PostgresError),
     #[error("Relayer transactions queue not found for relayer {0}")]
     RelayerTransactionsQueueNotFound(RelayerId),
 
@@ -174,7 +208,7 @@ pub enum ProcessInmempoolTransactionError {
     CouldNotUpdateTransactionStatusInTheDatabase(
         RelayerId,
         EvmAddress,
-        Transaction,
+        Box<Transaction>,
         TransactionStatus,
         PostgresError,
     ),
@@ -183,48 +217,65 @@ pub enum ProcessInmempoolTransactionError {
     MoveInmempoolTransactionToMinedError(
         RelayerId,
         EvmAddress,
-        MoveInmempoolTransactionToMinedError,
+        Box<MoveInmempoolTransactionToMinedError>,
     ),
 
     #[error("Could not read transaction receipt relayer {0} tx - {1} error - {2}")]
-    CouldNotGetTransactionReceipt(RelayerId, EvmAddress, Transaction, RpcError<TransportErrorKind>),
+    CouldNotGetTransactionReceipt(
+        RelayerId,
+        EvmAddress,
+        Box<Transaction>,
+        RpcError<TransportErrorKind>,
+    ),
 
     #[error("Transaction does not have an hash for relayer id {0} / address {1} tx - {2}")]
-    UnknownTransactionHash(RelayerId, EvmAddress, Transaction),
+    UnknownTransactionHash(RelayerId, EvmAddress, Box<Transaction>),
 }
 
 #[derive(Error, Debug)]
 pub enum ProcessMinedTransactionError {
+    #[error("{0}")]
+    Handoff(PostgresError),
     #[error("Relayer transactions queue not found for relayer {0}")]
     RelayerTransactionsQueueNotFound(RelayerId),
 
     #[error(
         "Transaction confirmed not be saved to the database for  relayer id {0} / address {1}: tx {2} - error {3}"
     )]
-    TransactionConfirmedNotSaveToDatabase(RelayerId, EvmAddress, Transaction, PostgresError),
+    TransactionConfirmedNotSaveToDatabase(RelayerId, EvmAddress, Box<Transaction>, PostgresError),
 
     #[error("Relayer transaction has no mined at for relayer id {0} / address {1} - tx {2}")]
-    NoMinedAt(RelayerId, EvmAddress, Transaction),
+    NoMinedAt(RelayerId, EvmAddress, Box<Transaction>),
 
     #[error(
         "Relayer transaction has no mined at for relayer id {0} / address {1} - tx {2} - error {3}"
     )]
-    MinedAtTimeError(RelayerId, EvmAddress, Transaction, SystemTimeError),
+    MinedAtTimeError(RelayerId, EvmAddress, Box<Transaction>, SystemTimeError),
 
     #[error(
         "Could not read transaction receipt relayer id {0} / address {1} - tx - {2} error - {3}"
     )]
-    CouldNotGetTransactionReceipt(RelayerId, EvmAddress, Transaction, RpcError<TransportErrorKind>),
+    CouldNotGetTransactionReceipt(
+        RelayerId,
+        EvmAddress,
+        Box<Transaction>,
+        RpcError<TransportErrorKind>,
+    ),
 }
 
 #[derive(Error, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum MovePendingTransactionToInmempoolError {
     #[error("Relayer transaction not found for relayer id {0} / address {1} and tx {2}")]
-    TransactionNotFound(RelayerId, EvmAddress, TransactionSentWithRelayer),
+    TransactionNotFound(RelayerId, EvmAddress, Box<TransactionSentWithRelayer>),
 
     #[error("Relayer transaction ID does not match for relayer id {0} / address {1} - tx sent {2} - tx at front of queue {3}")]
-    TransactionIdDoesNotMatch(RelayerId, EvmAddress, TransactionSentWithRelayer, Transaction),
+    TransactionIdDoesNotMatch(
+        RelayerId,
+        EvmAddress,
+        Box<TransactionSentWithRelayer>,
+        Box<Transaction>,
+    ),
 }
 
 #[derive(Error, Debug)]
@@ -234,7 +285,7 @@ pub enum MoveInmempoolTransactionToMinedError {
     TransactionNotFound(RelayerId, EvmAddress, TransactionId),
 
     #[error("Relayer transaction ID does not match for relayer id {0} / address {1} - tx sent {2} - tx at front of queue {3}")]
-    TransactionIdDoesNotMatch(RelayerId, EvmAddress, TransactionId, Transaction),
+    TransactionIdDoesNotMatch(RelayerId, EvmAddress, TransactionId, Box<Transaction>),
 }
 
 /// Result of moving a transaction from inmempool to mined with competition resolution details

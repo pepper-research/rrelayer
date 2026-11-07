@@ -4,7 +4,7 @@ pub use send_transaction_error::{
 };
 
 mod editable_transaction;
-pub use editable_transaction::{EditableTransaction, EditableTransactionType};
+pub use editable_transaction::EditableTransaction;
 
 mod transaction_relayer_setup;
 pub use transaction_relayer_setup::TransactionRelayerSetup;

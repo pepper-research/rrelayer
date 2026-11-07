@@ -10,3 +10,4 @@ export * from './replace-transaction';
 export * from './send-transaction';
 export * from './send-transaction-random';
 export * from './types';
+export * from './send-transaction-idempotent';

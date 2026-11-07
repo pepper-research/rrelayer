@@ -69,6 +69,10 @@ pub async fn handle_send_transaction(
         .await?
         .ok_or(not_found("Relayer does not exist".to_string()))?;
 
+    if crate::provider::is_limit_base_relayer(&relayer) {
+        state.validate_basic_auth_valid(&headers)?;
+    }
+
     let result = send_transaction(relayer, transaction, &state, &headers).await?;
 
     Ok(Json(result))
@@ -79,6 +83,16 @@ pub async fn send_transaction(
     transaction: RelayTransactionRequest,
     state: &Arc<AppState>,
     headers: &HeaderMap,
+) -> Result<SendTransactionResult, HttpError> {
+    send_transaction_with_id(relayer, transaction, state, headers, None).await
+}
+
+pub(super) async fn send_transaction_with_id(
+    relayer: Relayer,
+    transaction: RelayTransactionRequest,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    id: Option<TransactionId>,
 ) -> Result<SendTransactionResult, HttpError> {
     state.validate_auth_basic_or_api_key(headers, &relayer.address, &relayer.chain_id)?;
 
@@ -116,7 +130,7 @@ pub async fn send_transaction(
     )
     .await?;
 
-    let transaction_to_send = TransactionToSend::new(
+    let mut transaction_to_send = TransactionToSend::new(
         transaction.authorization_list,
         transaction.to,
         transaction.value,
@@ -125,6 +139,10 @@ pub async fn send_transaction(
         convert_blob_strings_to_blobs(transaction.blobs)?,
         transaction.external_id,
     );
+
+    if let Some(id) = id {
+        transaction_to_send.id = id;
+    }
 
     let transaction = state
         .transactions_queues

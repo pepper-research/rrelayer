@@ -24,14 +24,13 @@ pub enum TransactionsQueuesError {
 use super::{
     log_summary::summarize_rpc_error,
     start::spawn_processing_tasks_for_relayer,
-    transactions_queue::{first_free_nonce, TransactionsQueue},
+    transactions_queue::TransactionsQueue,
     types::{
-        AddTransactionError, CancelTransactionError, CancelTransactionResult, CompetitionType,
-        EditableTransactionType, ProcessInmempoolStatus, ProcessInmempoolTransactionError,
-        ProcessMinedStatus, ProcessMinedTransactionError, ProcessPendingStatus,
-        ProcessPendingTransactionError, ProcessResult, ReplaceTransactionError,
-        ReplaceTransactionResult, TransactionRelayerSetup, TransactionToSend,
-        TransactionsQueueSetup,
+        AddTransactionError, CancelTransactionError, CancelTransactionResult,
+        ProcessInmempoolStatus, ProcessInmempoolTransactionError, ProcessMinedStatus,
+        ProcessMinedTransactionError, ProcessPendingStatus, ProcessPendingTransactionError,
+        ProcessResult, ReplaceTransactionError, ReplaceTransactionResult, TransactionRelayerSetup,
+        TransactionToSend, TransactionsQueueSetup,
     },
 };
 use crate::transaction::api::RelayTransactionRequest;
@@ -47,8 +46,10 @@ use crate::{
     transaction::{
         cache::invalidate_transaction_no_state_cache,
         nonce_manager::NonceManager,
-        queue_system::types::TransactionQueueSendTransactionError,
-        types::{Transaction, TransactionData, TransactionId, TransactionStatus, TransactionValue},
+        types::{
+            Transaction, TransactionData, TransactionId, TransactionNonce, TransactionStatus,
+            TransactionValue,
+        },
     },
     webhooks::WebhookManager,
 };
@@ -81,22 +82,40 @@ impl TransactionsQueues {
         let mut relayer_block_times_ms = HashMap::new();
 
         for setup in setups {
-            let onchain_nonce = setup.evm_provider.get_nonce(&setup.relayer).await?;
-            // Loaded rows hold nonces the chain may not have seen yet (unsent PENDING rows after a
-            // restart), so new transactions are numbered after them, not from the chain's nonce.
-            let current_nonce = first_free_nonce(
-                onchain_nonce,
-                setup
+            let current_nonce = match setup.evm_provider.get_nonce(&setup.relayer).await {
+                Ok(nonce) => nonce,
+                Err(error) if setup.evm_provider.is_isolated_limit_base() => {
+                    warn!("Fixed Base gateway nonce unavailable for relayer {}; leaving its queue offline: {}", setup.relayer.id, error);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let reserved_nonce = if setup.evm_provider.is_isolated_limit_base() {
+                let highest = setup
                     .pending_transactions
                     .iter()
-                    .map(|transaction| transaction.nonce)
-                    .chain(setup.inmempool_transactions.iter().map(|c| c.original.nonce))
-                    .chain(setup.mined_transactions.values().map(|transaction| transaction.nonce)),
-            );
+                    .map(|tx| tx.nonce.into_inner())
+                    .chain(
+                        setup
+                            .inmempool_transactions
+                            .iter()
+                            .map(|tx| tx.original.nonce.into_inner()),
+                    )
+                    .max();
+                highest
+                    .map(|nonce| {
+                        TransactionNonce::new(
+                            current_nonce.into_inner().max(nonce.saturating_add(1)),
+                        )
+                    })
+                    .unwrap_or(current_nonce)
+            } else {
+                current_nonce
+            };
 
             info!(
-                "Startup nonce synchronization for relayer {} ({}): synchronizing nonce manager with on-chain nonce {}, next nonce after loaded transactions {}",
-                setup.relayer.name, setup.relayer.id, onchain_nonce.into_inner(), current_nonce.into_inner()
+                "Startup nonce synchronization for relayer {} ({}): synchronizing nonce manager with on-chain nonce {}",
+                setup.relayer.name, setup.relayer.id, current_nonce.into_inner()
             );
 
             relayer_block_times_ms.insert(setup.relayer.id, setup.evm_provider.blocks_every);
@@ -107,7 +126,7 @@ impl TransactionsQueues {
                     TransactionsQueueSetup::new(
                         setup.relayer,
                         setup.evm_provider,
-                        NonceManager::new(current_nonce),
+                        NonceManager::new(reserved_nonce),
                         setup.pending_transactions,
                         setup.inmempool_transactions,
                         setup.mined_transactions,
@@ -163,23 +182,24 @@ impl TransactionsQueues {
     }
 
     /// Returns the count of pending transactions for a specific relayer.
-    pub async fn pending_transactions_count(&self, relayer_id: &RelayerId) -> usize {
-        if let Some(queue_arc) = self.get_transactions_queue(relayer_id) {
-            let queue = queue_arc.lock().await;
-            queue.get_pending_transaction_count().await
-        } else {
-            0
-        }
+    pub async fn pending_transactions_count(
+        &self,
+        relayer_id: &RelayerId,
+    ) -> Result<usize, crate::postgres::PostgresError> {
+        self.db
+            .query_one(
+                "SELECT COUNT(*) FROM relayer.transaction WHERE relayer_id=$1 AND status='PENDING'",
+                &[relayer_id],
+            )
+            .await
+            .map(|r| r.get::<_, i64>(0) as usize)
     }
 
-    /// Returns the count of in-mempool transactions for a specific relayer.
-    pub async fn inmempool_transactions_count(&self, relayer_id: &RelayerId) -> usize {
-        if let Some(queue_arc) = self.get_transactions_queue(relayer_id) {
-            let queue = queue_arc.lock().await;
-            queue.get_inmempool_transaction_count().await
-        } else {
-            0
-        }
+    pub async fn inmempool_transactions_count(
+        &self,
+        relayer_id: &RelayerId,
+    ) -> Result<usize, crate::postgres::PostgresError> {
+        self.db.query_one("SELECT COUNT(*) FROM relayer.transaction WHERE relayer_id=$1 AND status='INMEMPOOL'", &[relayer_id]).await.map(|r|r.get::<_,i64>(0) as usize)
     }
 
     /// Adds a new relayer and its transaction queue to the system.
@@ -217,25 +237,6 @@ impl TransactionsQueues {
 
     fn expires_at(&self) -> DateTime<Utc> {
         Utc::now() + chrono::Duration::hours(12)
-    }
-
-    /// Checks if a transaction has expired.
-    fn has_expired(&self, transaction: &Transaction) -> bool {
-        transaction.expires_at < Utc::now()
-    }
-
-    /// Converts a transaction to a no-op transaction.
-    fn transaction_to_noop(
-        &self,
-        transactions_queue: &mut TransactionsQueue,
-        transaction: &mut Transaction,
-    ) {
-        transaction.to = transactions_queue.relay_address();
-        transaction.value = TransactionValue::zero();
-        transaction.data = TransactionData::empty();
-        transaction.gas_limit = Some(GasLimit::new(21000_u128));
-        transaction.is_noop = true;
-        transaction.speed = TransactionSpeed::FAST;
     }
 
     /// Replaces the content of an existing transaction with new parameters.
@@ -371,6 +372,11 @@ impl TransactionsQueues {
         relayer_id: &RelayerId,
         transaction_to_send: &TransactionToSend,
     ) -> Result<Transaction, AddTransactionError> {
+        let _sender = self
+            .db
+            .acquire_sender(relayer_id, false)
+            .await
+            .map_err(AddTransactionError::CouldNotSaveTransactionDb)?;
         let expires_at = self.expires_at();
 
         let queue_arc = self
@@ -379,8 +385,19 @@ impl TransactionsQueues {
 
         let mut transactions_queue = queue_arc.lock().await;
 
+        transactions_queue
+            .reload(&self.db)
+            .await
+            .map_err(AddTransactionError::CouldNotSaveTransactionDb)?;
         if transactions_queue.is_paused() {
             return Err(AddTransactionError::RelayerIsPaused(*relayer_id));
+        }
+
+        if transactions_queue.is_isolated_limit_base()
+            && (transactions_queue.get_pending_transaction_count().await > 0
+                || transactions_queue.get_inmempool_transaction_count().await > 0)
+        {
+            return Err(AddTransactionError::FixedBaseLaneBusy);
         }
 
         // Check if this is a blob transaction and if the wallet manager supports blobs
@@ -473,7 +490,34 @@ impl TransactionsQueues {
             }
         };
 
-        let assigned_nonce = transactions_queue.nonce_manager.get_and_increment().await;
+        let fixed_lane = transactions_queue.is_isolated_limit_base();
+        let assigned_nonce = if fixed_lane {
+            transactions_queue.nonce_manager.get_current_nonce().await
+        } else {
+            // The sender lock covers this read through admission. Fill unused gaps,
+            // but keep every durable admission/attempt at its original nonce,
+            // including rows belonging to another relayer with the same signer.
+            let reserved = self
+                .db
+                .query(
+                    "SELECT DISTINCT nonce FROM relayer.transaction
+                 WHERE chain_id=$1 AND \"from\"=$2 AND nonce >= $3
+                   AND (status <> 'FAILED' OR broadcast_attempted)
+                 ORDER BY nonce",
+                    &[&transaction.chain_id, &transaction.from, &current_onchain_nonce],
+                )
+                .await
+                .map_err(AddTransactionError::CouldNotSaveTransactionDb)?;
+            let mut next = current_onchain_nonce;
+            for row in reserved {
+                let occupied: TransactionNonce = row.get("nonce");
+                if occupied != next {
+                    break;
+                }
+                next = next + 1;
+            }
+            next
+        };
         transaction.nonce = assigned_nonce;
         transaction.gas_limit = Some(estimated_gas_limit);
 
@@ -485,13 +529,37 @@ impl TransactionsQueues {
             estimated_gas_limit,
         )?;
 
-        transaction.known_transaction_hash =
-            Some(transactions_queue.compute_tx_hash(&transaction_request).await?);
+        let fixed_signed_envelope = if fixed_lane {
+            let (bytes, hash) =
+                transactions_queue.prepare_fixed_signed_transaction(&transaction_request).await?;
+            transaction.known_transaction_hash = Some(hash);
+            transaction.sent_with_gas = Some(gas_price);
+            Some(bytes)
+        } else {
+            transaction.known_transaction_hash =
+                Some(transactions_queue.compute_tx_hash(&transaction_request).await?);
+            None
+        };
 
-        self.db
-            .save_transaction(relayer_id, &transaction)
-            .await
-            .map_err(AddTransactionError::CouldNotSaveTransactionDb)?;
+        let save_result = self
+            .db
+            .save_transaction_with_signed_envelope(
+                relayer_id,
+                &transaction,
+                fixed_signed_envelope.as_deref(),
+            )
+            .await;
+        match save_result {
+            Ok(()) => {
+                if fixed_lane {
+                    let _ = transactions_queue.nonce_manager.get_and_increment().await;
+                }
+            }
+            Err(crate::postgres::PostgresError::FixedBaseLaneBusy) => {
+                return Err(AddTransactionError::FixedBaseLaneBusy);
+            }
+            Err(error) => return Err(AddTransactionError::CouldNotSaveTransactionDb(error)),
+        }
 
         transactions_queue.add_pending_transaction(transaction.clone()).await;
         self.invalidate_transaction_cache(&transaction.id).await;
@@ -508,914 +576,211 @@ impl TransactionsQueues {
         Ok(transaction)
     }
 
-    /// Cancels an existing transaction.
+    /// Persist the whole competition before either process can broadcast it.
+    async fn queue_competitor(
+        &mut self,
+        original: &Transaction,
+        replace: Option<&RelayTransactionRequest>,
+    ) -> Result<Transaction, crate::postgres::PostgresError> {
+        if let Some(id) = original.cancelled_by_transaction_id {
+            return Err(crate::postgres::PostgresError::Handoff(format!(
+                "Competition already exists: {id}; inspect its status"
+            )));
+        }
+        let mut competitor = original.clone();
+        competitor.id = TransactionId::new();
+        competitor.status = TransactionStatus::PENDING;
+        competitor.cancelled_by_transaction_id = None;
+        competitor.known_transaction_hash = None;
+        competitor.sent_at = None;
+        competitor.mined_at = None;
+        competitor.confirmed_at = None;
+        competitor.queued_at = Utc::now();
+        competitor.expires_at = self.expires_at();
+        competitor.speed = TransactionSpeed::SUPER;
+        if let Some(request) = replace {
+            competitor.is_noop = false;
+            self.transaction_replace(&mut competitor, request);
+        } else {
+            competitor.to = original.from;
+            competitor.value = TransactionValue::zero();
+            competitor.data = TransactionData::empty();
+            competitor.authorization_list = None;
+            competitor.blobs = None;
+            competitor.is_noop = true;
+            competitor.gas_limit = Some(GasLimit::new(21_000));
+            competitor.external_id = Some(format!("cancel_{}", original.id));
+        }
+        self.db.save_competitor(&original.id, &competitor).await?;
+        self.invalidate_transaction_cache(&original.id).await;
+        Ok(competitor)
+    }
+
     pub async fn cancel_transaction(
         &mut self,
         transaction: &Transaction,
     ) -> Result<CancelTransactionResult, CancelTransactionError> {
-        if let Some(queue_arc) = self.get_transactions_queue(&transaction.relayer_id) {
-            let mut transactions_queue = queue_arc.lock().await;
-            if transactions_queue.is_paused() {
-                return Err(CancelTransactionError::RelayerIsPaused(transaction.relayer_id));
-            }
-
-            if let Some(mut result) =
-                transactions_queue.get_editable_transaction_by_id(&transaction.id).await
-            {
-                let _guard = enter_critical_operation().ok_or_else(|| {
-                    info!(
-                        "cancel_transaction: refusing to start during shutdown for transaction {}",
-                        transaction.id
-                    );
-                    CancelTransactionError::RelayerIsPaused(transaction.relayer_id)
-                })?;
-
-                match result.type_name {
-                    EditableTransactionType::Pending => {
-                        info!("cancel_transaction: removing pending transaction from queue and marking as cancelled");
-
-                        result.transaction.status = TransactionStatus::CANCELLED;
-                        transactions_queue.remove_pending_transaction_by_id(&transaction.id).await;
-
-                        self.db
-                            .transaction_update(&result.transaction)
-                            .await
-                            .map_err(CancelTransactionError::CouldNotUpdateTransactionDb)?;
-
-                        self.invalidate_transaction_cache(&transaction.id).await;
-
-                        if let Some(webhook_manager) = &self.webhook_manager {
-                            let webhook_manager = webhook_manager.clone();
-                            let original_transaction = result.transaction.clone();
-                            tokio::spawn(async move {
-                                let webhook_manager = webhook_manager.lock().await;
-                                webhook_manager
-                                    .on_transaction_cancelled(&original_transaction)
-                                    .await;
-                            });
-                        }
-
-                        Ok(CancelTransactionResult { success: true, cancel_transaction_id: None })
-                    }
-                    EditableTransactionType::Inmempool => {
-                        let cancel_transaction_id = TransactionId::new();
-                        let expires_at = self.expires_at();
-
-                        let original_gas_limit = result.transaction.gas_limit.ok_or_else(|| {
-                            CancelTransactionError::SendTransactionError(
-                                TransactionQueueSendTransactionError::GasCalculationError,
-                            )
-                        })?;
-                        let bumped_gas_limit = GasLimit::new(
-                            original_gas_limit.into_inner() + (original_gas_limit.into_inner() / 5),
-                        );
-
-                        let mut cancel_transaction = Transaction {
-                            id: cancel_transaction_id,
-                            relayer_id: transaction.relayer_id,
-                            // Send to self (no-op)
-                            authorization_list: None,
-                            to: transactions_queue.relay_address(),
-                            from: transactions_queue.relay_address(),
-                            value: TransactionValue::zero(),
-                            data: TransactionData::empty(),
-                            // Use the same nonce as the original transaction to replace it
-                            nonce: result.transaction.nonce,
-                            // Use original gas + 20% instead of estimating
-                            gas_limit: Some(bumped_gas_limit),
-                            status: TransactionStatus::PENDING,
-                            blobs: None,
-                            chain_id: transactions_queue.chain_id(),
-                            known_transaction_hash: None,
-                            queued_at: Utc::now(),
-                            expires_at,
-                            sent_at: None,
-                            mined_at: None,
-                            mined_at_block_number: None,
-                            confirmed_at: None,
-                            // Use highest speed for faster replacement
-                            speed: TransactionSpeed::SUPER,
-                            sent_with_max_priority_fee_per_gas: None,
-                            sent_with_max_fee_per_gas: None,
-                            is_noop: true,
-                            sent_with_gas: None,
-                            sent_with_blob_gas: None,
-                            external_id: Some(format!("cancel_{}", transaction.id)),
-                            cancelled_by_transaction_id: None,
-                        };
-
-                        info!("cancel_transaction: creating higher gas cancel transaction for inmempool tx with same nonce {:?}", cancel_transaction.nonce);
-
-                        // For cancel transactions, we need to bump the original transaction's gas prices
-                        // rather than using a fixed speed, since we're competing with the same nonce
-                        let original_gas =
-                            result.transaction.sent_with_gas.as_ref().ok_or_else(|| {
-                                CancelTransactionError::SendTransactionError(
-                                    TransactionQueueSendTransactionError::GasCalculationError,
-                                )
-                            })?;
-
-                        // Bump original gas prices by 20% to ensure replacement
-                        let bumped_max_fee = original_gas.max_fee + (original_gas.max_fee / 5);
-                        let bumped_max_priority_fee =
-                            original_gas.max_priority_fee + (original_gas.max_priority_fee / 5);
-
-                        let gas_price = GasPriceResult {
-                            max_fee: bumped_max_fee,
-                            max_priority_fee: bumped_max_priority_fee,
-                            min_wait_time_estimate: None,
-                            max_wait_time_estimate: None,
-                        };
-
-                        // Blob gas price is not needed for cancel transactions (they're simple transfers)
-                        let blob_gas_price = None;
-                        // Apply gas prices to cancel transaction
-                        cancel_transaction.sent_with_gas = Some(gas_price);
-                        cancel_transaction.sent_with_blob_gas = blob_gas_price;
-
-                        let transaction_sent = match transactions_queue
-                            .send_transaction(&mut self.db, &mut cancel_transaction)
-                            .await
-                        {
-                            Ok(tx_sent) => tx_sent,
-                            Err(TransactionQueueSendTransactionError::TransactionSendError(
-                                error,
-                            )) => {
-                                let error_msg = error.to_string().to_lowercase();
-                                if error_msg.contains("nonce too low")
-                                    || error_msg.contains("nonce is too low")
-                                    || error_msg.contains("invalid nonce")
-                                    || error_msg.contains("nonce has already been used")
-                                    || error_msg.contains("already known")
-                                {
-                                    warn!("cancel_transaction: nonce synchronization issue detected for relayer {}: {}", transaction.relayer_id, error);
-
-                                    if let Err(sync_error) = self
-                                        .recover_nonce_synchronization(
-                                            &transaction.relayer_id,
-                                            &mut transactions_queue,
-                                        )
-                                        .await
-                                    {
-                                        error!("Failed to recover nonce synchronization for relayer {}: {}", transaction.relayer_id, sync_error);
-                                        return Err(CancelTransactionError::SendTransactionError(
-                                            TransactionQueueSendTransactionError::TransactionSendError(error)
-                                        ));
-                                    }
-
-                                    info!("Nonce synchronization recovered for relayer {}, cancel transaction will be retried", transaction.relayer_id);
-                                    return Err(
-                                        CancelTransactionError::NonceSynchronizationRecovered,
-                                    );
-                                }
-                                return Err(CancelTransactionError::SendTransactionError(
-                                    TransactionQueueSendTransactionError::TransactionSendError(
-                                        error,
-                                    ),
-                                ));
-                            }
-                            Err(e) => return Err(CancelTransactionError::SendTransactionError(e)),
-                        };
-
-                        // DON'T mark original as CANCELLED yet - that's premature!
-                        // We have a race condition: both transactions will compete with same nonce
-                        // The monitoring logic will determine which one wins and update statuses accordingly
-
-                        cancel_transaction.status = TransactionStatus::INMEMPOOL;
-                        cancel_transaction.known_transaction_hash = Some(transaction_sent.hash);
-                        cancel_transaction.sent_at = Some(Utc::now());
-
-                        self.db
-                            .save_transaction(&transaction.relayer_id, &cancel_transaction)
-                            .await
-                            .map_err(CancelTransactionError::CouldNotUpdateTransactionDb)?;
-
-                        transactions_queue
-                            .add_competitor_to_inmempool_transaction(
-                                &transaction.id,
-                                cancel_transaction.clone(),
-                                CompetitionType::Cancel,
-                            )
-                            .await
-                            .map_err(CancelTransactionError::SendTransactionError)?;
-
-                        // Now we can safely set the foreign key reference and update the original transaction
-                        // For now, we track that a cancellation is pending by setting the cancelled_by_transaction_id
-                        // but keep the original status as INMEMPOOL since it's still competing
-                        result.transaction.cancelled_by_transaction_id =
-                            Some(cancel_transaction_id);
-
-                        self.db
-                            .transaction_update(&result.transaction)
-                            .await
-                            .map_err(CancelTransactionError::CouldNotUpdateTransactionDb)?;
-
-                        self.invalidate_transaction_cache(&transaction.id).await;
-
-                        info!("cancel_transaction: sent cancel tx {} with hash {} and nonce {:?} to replace original tx {}",
-                              cancel_transaction_id, transaction_sent.hash, cancel_transaction.nonce, transaction.id);
-
-                        if let Some(webhook_manager) = &self.webhook_manager {
-                            let webhook_manager = webhook_manager.clone();
-                            let original_transaction = result.transaction.clone();
-                            let cancel_transaction_clone = cancel_transaction.clone();
-                            tokio::spawn(async move {
-                                let webhook_manager = webhook_manager.lock().await;
-                                webhook_manager
-                                    .on_transaction_cancelled(&original_transaction)
-                                    .await;
-                                webhook_manager
-                                    .on_transaction_sent(&cancel_transaction_clone)
-                                    .await;
-                            });
-                        }
-
-                        Ok(CancelTransactionResult::success(cancel_transaction_id))
-                    }
-                }
-            } else if transactions_queue.is_transaction_mined(&transaction.id).await {
-                info!(
-                    "cancel_transaction: transaction {} is already mined, cannot cancel",
-                    transaction.id
-                );
-                Ok(CancelTransactionResult::failed())
-            } else {
-                info!("cancel_transaction: transaction {} not found in any queue", transaction.id);
-                Ok(CancelTransactionResult::failed())
-            }
-        } else {
-            Err(CancelTransactionError::RelayerNotFound(transaction.relayer_id))
+        let _sender = self
+            .db
+            .acquire_sender(&transaction.relayer_id, false)
+            .await
+            .map_err(CancelTransactionError::Handoff)?;
+        if self
+            .db
+            .get_relayer(&transaction.relayer_id)
+            .await
+            .map_err(CancelTransactionError::Handoff)?
+            .map(|r| r.paused)
+            .unwrap_or(true)
+        {
+            return Err(CancelTransactionError::RelayerIsPaused(transaction.relayer_id));
         }
+        let original = self
+            .db
+            .get_transaction(&transaction.id)
+            .await
+            .map_err(CancelTransactionError::Handoff)?
+            .ok_or(CancelTransactionError::RelayerNotFound(transaction.relayer_id))?;
+        if !matches!(original.status, TransactionStatus::PENDING | TransactionStatus::INMEMPOOL) {
+            return Ok(CancelTransactionResult::failed());
+        }
+        if let Some(id) = original.cancelled_by_transaction_id {
+            let competitor = self
+                .db
+                .get_transaction(&id)
+                .await
+                .map_err(CancelTransactionError::Handoff)?
+                .ok_or(CancelTransactionError::RelayerNotFound(transaction.relayer_id))?;
+            if competitor.is_noop {
+                return Ok(CancelTransactionResult::success(id));
+            }
+        }
+        let competitor = self
+            .queue_competitor(&original, None)
+            .await
+            .map_err(CancelTransactionError::Handoff)?;
+        Ok(CancelTransactionResult::success(competitor.id))
     }
 
-    /// Replaces an existing transaction with new parameters.
     pub async fn replace_transaction(
         &mut self,
         transaction: &Transaction,
         replace_with: &RelayTransactionRequest,
     ) -> Result<ReplaceTransactionResult, ReplaceTransactionError> {
-        if let Some(queue_arc) = self.get_transactions_queue(&transaction.relayer_id) {
-            let mut transactions_queue = queue_arc.lock().await;
-
-            if transactions_queue.is_paused() {
-                return Err(ReplaceTransactionError::RelayerIsPaused(transaction.relayer_id));
-            }
-
-            if let Some(mut result) =
-                transactions_queue.get_editable_transaction_by_id(&transaction.id).await
-            {
-                let _guard = enter_critical_operation().ok_or_else(|| {
-                    info!(
-                        "replace_transaction: refusing to start during shutdown for transaction {}",
-                        transaction.id
-                    );
-                    ReplaceTransactionError::RelayerIsPaused(transaction.relayer_id)
-                })?;
-
-                match result.type_name {
-                    EditableTransactionType::Pending => {
-                        let original_transaction = result.transaction.clone();
-                        self.transaction_replace(&mut result.transaction, replace_with);
-                        self.invalidate_transaction_cache(&transaction.id).await;
-
-                        if let Some(webhook_manager) = &self.webhook_manager {
-                            let webhook_manager = webhook_manager.clone();
-                            let new_transaction = result.transaction.clone();
-                            let original_transaction_clone = original_transaction.clone();
-                            tokio::spawn(async move {
-                                let webhook_manager = webhook_manager.lock().await;
-                                webhook_manager
-                                    .on_transaction_replaced(
-                                        &new_transaction,
-                                        &original_transaction_clone,
-                                    )
-                                    .await;
-                            });
-                        }
-
-                        Ok(ReplaceTransactionResult {
-                            success: true,
-                            replace_transaction_id: Some(result.transaction.id),
-                            replace_transaction_hash: result.transaction.known_transaction_hash,
-                        })
-                    }
-                    EditableTransactionType::Inmempool => {
-                        let replace_transaction_id = TransactionId::new();
-                        let expires_at = self.expires_at();
-
-                        let mut replace_transaction = Transaction {
-                            id: replace_transaction_id,
-                            relayer_id: transaction.relayer_id,
-                            authorization_list: transaction.authorization_list.clone(),
-                            to: replace_with.to,
-                            from: transactions_queue.relay_address(),
-                            value: replace_with.value,
-                            data: replace_with.data.clone(),
-                            // Use the same nonce as the original transaction to replace it
-                            nonce: result.transaction.nonce,
-                            gas_limit: None, // Will be estimated during send_transaction
-                            status: TransactionStatus::PENDING,
-                            blobs: replace_with
-                                .blobs
-                                .as_ref()
-                                .map(|blobs| {
-                                    blobs
-                                        .iter()
-                                        .map(|blob_hex| TransactionBlob::from_hex(blob_hex))
-                                        .collect::<Result<Vec<_>, _>>()
-                                })
-                                .transpose()
-                                .map_err(|e| {
-                                    ReplaceTransactionError::SendTransactionError(
-                                TransactionQueueSendTransactionError::TransactionConversionError(
-                                    format!("Failed to convert blob hex to TransactionBlob: {}", e)
-                                )
-                            )
-                                })?,
-                            chain_id: transactions_queue.chain_id(),
-                            known_transaction_hash: None,
-                            queued_at: Utc::now(),
-                            expires_at,
-                            sent_at: None,
-                            mined_at: None,
-                            mined_at_block_number: None,
-                            confirmed_at: None,
-                            speed: TransactionSpeed::SUPER, // Use highest speed for faster replacement
-                            sent_with_max_priority_fee_per_gas: None,
-                            sent_with_max_fee_per_gas: None,
-                            is_noop: false,
-                            sent_with_gas: None,
-                            sent_with_blob_gas: None,
-                            external_id: replace_with
-                                .external_id
-                                .clone()
-                                .or_else(|| Some(format!("replace_{}", transaction.id))),
-                            cancelled_by_transaction_id: None,
-                        };
-
-                        info!("replace_transaction: creating competitive replace transaction for inmempool tx with same nonce {:?}", replace_transaction.nonce);
-
-                        // For replace transactions, we need to bump the original transaction's gas prices and gas limit
-                        // rather than using a fixed speed or estimating, since we're competing with the same nonce
-                        let original_gas =
-                            result.transaction.sent_with_gas.as_ref().ok_or_else(|| {
-                                ReplaceTransactionError::SendTransactionError(
-                                    TransactionQueueSendTransactionError::GasCalculationError,
-                                )
-                            })?;
-
-                        // Use original gas limit + 20% to avoid "nonce too low" errors during gas estimation
-                        let original_gas_limit = result.transaction.gas_limit.ok_or_else(|| {
-                            ReplaceTransactionError::SendTransactionError(
-                                TransactionQueueSendTransactionError::GasCalculationError,
-                            )
-                        })?;
-                        let bumped_gas_limit = GasLimit::new(
-                            original_gas_limit.into_inner() + (original_gas_limit.into_inner() / 5),
-                        );
-                        replace_transaction.gas_limit = Some(bumped_gas_limit);
-
-                        // Bump original gas prices by 20% to ensure replacement
-                        let bumped_max_fee = original_gas.max_fee + (original_gas.max_fee / 5);
-                        let bumped_max_priority_fee =
-                            original_gas.max_priority_fee + (original_gas.max_priority_fee / 5);
-
-                        let gas_price = GasPriceResult {
-                            max_fee: bumped_max_fee,
-                            max_priority_fee: bumped_max_priority_fee,
-                            min_wait_time_estimate: None,
-                            max_wait_time_estimate: None,
-                        };
-
-                        let blob_gas_price = if replace_transaction.is_blob_transaction() {
-                            Some(
-                                transactions_queue
-                                    .compute_blob_gas_price_for_transaction(
-                                        &TransactionSpeed::SUPER,
-                                        &None,
-                                    )
-                                    .await
-                                    .map_err(|e| {
-                                        ReplaceTransactionError::SendTransactionError(e.into())
-                                    })?,
-                            )
-                        } else {
-                            None
-                        };
-
-                        // Apply gas prices to replace transaction
-                        replace_transaction.sent_with_gas = Some(gas_price);
-                        replace_transaction.sent_with_blob_gas = blob_gas_price;
-
-                        let transaction_sent = match transactions_queue
-                            .send_transaction(&mut self.db, &mut replace_transaction)
-                            .await
-                        {
-                            Ok(tx_sent) => tx_sent,
-                            Err(TransactionQueueSendTransactionError::TransactionSendError(
-                                error,
-                            )) => {
-                                let error_msg = error.to_string().to_lowercase();
-                                if error_msg.contains("nonce too low")
-                                    || error_msg.contains("nonce is too low")
-                                    || error_msg.contains("invalid nonce")
-                                    || error_msg.contains("nonce has already been used")
-                                    || error_msg.contains("already known")
-                                {
-                                    warn!("replace_transaction: nonce synchronization issue detected for relayer {}: {}", transaction.relayer_id, error);
-
-                                    if let Err(sync_error) = self
-                                        .recover_nonce_synchronization(
-                                            &transaction.relayer_id,
-                                            &mut transactions_queue,
-                                        )
-                                        .await
-                                    {
-                                        error!("Failed to recover nonce synchronization for relayer {}: {}", transaction.relayer_id, sync_error);
-                                        return Err(ReplaceTransactionError::SendTransactionError(
-                                            TransactionQueueSendTransactionError::TransactionSendError(error)
-                                        ));
-                                    }
-
-                                    info!("Nonce synchronization recovered for relayer {}, replacement transaction will be retried", transaction.relayer_id);
-                                    return Err(
-                                        ReplaceTransactionError::NonceSynchronizationRecovered,
-                                    );
-                                }
-                                return Err(ReplaceTransactionError::SendTransactionError(
-                                    TransactionQueueSendTransactionError::TransactionSendError(
-                                        error,
-                                    ),
-                                ));
-                            }
-                            Err(e) => return Err(ReplaceTransactionError::SendTransactionError(e)),
-                        };
-
-                        replace_transaction.status = TransactionStatus::INMEMPOOL;
-                        replace_transaction.known_transaction_hash = Some(transaction_sent.hash);
-                        replace_transaction.sent_at = Some(Utc::now());
-
-                        transactions_queue
-                            .add_competitor_to_inmempool_transaction(
-                                &transaction.id,
-                                replace_transaction.clone(),
-                                CompetitionType::Replace,
-                            )
-                            .await
-                            .map_err(ReplaceTransactionError::SendTransactionError)?;
-
-                        self.db
-                            .save_transaction(&transaction.relayer_id, &replace_transaction)
-                            .await
-                            .map_err(ReplaceTransactionError::CouldNotUpdateTransactionInDb)?;
-
-                        transactions_queue
-                            .add_competitor_to_inmempool_transaction(
-                                &transaction.id,
-                                replace_transaction.clone(),
-                                CompetitionType::Replace,
-                            )
-                            .await
-                            .map_err(ReplaceTransactionError::SendTransactionError)?;
-
-                        result.transaction.cancelled_by_transaction_id =
-                            Some(replace_transaction_id);
-                        self.db
-                            .transaction_update(&result.transaction)
-                            .await
-                            .map_err(ReplaceTransactionError::CouldNotUpdateTransactionInDb)?;
-
-                        self.invalidate_transaction_cache(&transaction.id).await;
-
-                        info!("replace_transaction: added competitive replace tx {} with hash {} and nonce {:?} to replace original tx {}",
-                              replace_transaction_id, transaction_sent.hash, replace_transaction.nonce, transaction.id);
-
-                        if let Some(webhook_manager) = &self.webhook_manager {
-                            let webhook_manager = webhook_manager.clone();
-                            let original_transaction = result.transaction.clone();
-                            let replace_transaction_clone = replace_transaction.clone();
-                            tokio::spawn(async move {
-                                let webhook_manager = webhook_manager.lock().await;
-                                webhook_manager
-                                    .on_transaction_replaced(
-                                        &replace_transaction_clone,
-                                        &original_transaction,
-                                    )
-                                    .await;
-                                webhook_manager
-                                    .on_transaction_sent(&replace_transaction_clone)
-                                    .await;
-                            });
-                        }
-
-                        Ok(ReplaceTransactionResult::success(
-                            replace_transaction_id,
-                            transaction_sent.hash,
-                        ))
-                    }
-                }
-            } else {
-                Ok(ReplaceTransactionResult::failed())
-            }
-        } else {
-            Err(ReplaceTransactionError::TransactionNotFound(transaction.id))
-        }
-    }
-
-    /// Returns how many pending nonces changed. Nothing is renumbered unless the persisted
-    /// high-water mark could be read. See `TransactionsQueue::resync_pending_nonces`.
-    async fn resync_pending_nonces(
-        &mut self,
-        relayer_id: &RelayerId,
-        transactions_queue: &mut TransactionsQueue,
-        lower_only: bool,
-    ) -> Result<usize, String> {
-        let highest_used =
-            self.db.get_highest_used_nonce(relayer_id).await.map_err(|e| e.to_string())?;
-        let changed = transactions_queue
-            .resync_pending_nonces(highest_used, lower_only)
+        let _sender = self
+            .db
+            .acquire_sender(&transaction.relayer_id, false)
             .await
-            .map_err(|e| e.to_string())?;
-        for (transaction_id, nonce) in &changed {
-            if let Err(db_error) = self.db.transaction_update_nonce(transaction_id, nonce).await {
-                error!(
-                    "Failed to persist nonce update to database for transaction {}: {}",
-                    transaction_id, db_error
-                );
-            }
-            self.invalidate_transaction_cache(transaction_id).await;
-        }
-        if !changed.is_empty() {
-            info!(
-                "Resynced {} pending transaction nonces for relayer {}, next nonce {}",
-                changed.len(),
-                relayer_id,
-                transactions_queue.nonce_manager.get_current_nonce().await.into_inner()
-            );
-        }
-        Ok(changed.len())
-    }
-
-    async fn recover_nonce_synchronization(
-        &mut self,
-        relayer_id: &RelayerId,
-        transactions_queue: &mut TransactionsQueue,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!("Attempting nonce recovery for relayer {}", relayer_id);
-
-        let current_onchain_nonce = transactions_queue
-            .get_nonce()
+            .map_err(ReplaceTransactionError::Handoff)?;
+        if self
+            .db
+            .get_relayer(&transaction.relayer_id)
             .await
-            .map_err(|e| format!("Failed to get on-chain nonce: {}", e))?;
-
-        let current_internal_nonce = transactions_queue.nonce_manager.get_current_nonce().await;
-
-        warn!(
-            "Nonce synchronization issue detected for relayer {}: on-chain nonce is {}, internal nonce is {}",
-            relayer_id, current_onchain_nonce.into_inner(), current_internal_nonce.into_inner()
-        );
-
-        transactions_queue.nonce_manager.sync_with_onchain_nonce(current_onchain_nonce).await;
-
-        let updated_nonce = transactions_queue.nonce_manager.get_current_nonce().await;
-        info!(
-            "Nonce recovery completed for relayer {}: updated internal nonce to {}",
-            relayer_id,
-            updated_nonce.into_inner()
-        );
-
-        Ok(())
+            .map_err(ReplaceTransactionError::Handoff)?
+            .map(|r| r.paused)
+            .unwrap_or(true)
+        {
+            return Err(ReplaceTransactionError::RelayerIsPaused(transaction.relayer_id));
+        }
+        let mut original = self
+            .db
+            .get_transaction(&transaction.id)
+            .await?
+            .ok_or(ReplaceTransactionError::TransactionNotFound(transaction.id))?;
+        if !matches!(original.status, TransactionStatus::PENDING | TransactionStatus::INMEMPOOL) {
+            return Ok(ReplaceTransactionResult::failed());
+        }
+        if original.status == TransactionStatus::PENDING {
+            self.transaction_replace(&mut original, replace_with);
+            original.known_transaction_hash = None;
+            if !self.db.transaction_replace_unbroadcast(&original).await? {
+                return Err(ReplaceTransactionError::BroadcastAlreadyAttempted(original.id));
+            }
+            self.invalidate_transaction_cache(&original.id).await;
+            return Ok(ReplaceTransactionResult {
+                success: true,
+                replace_transaction_id: Some(original.id),
+                replace_transaction_hash: None,
+            });
+        }
+        let competitor = self.queue_competitor(&original, Some(replace_with)).await?;
+        Ok(ReplaceTransactionResult {
+            success: true,
+            replace_transaction_id: Some(competitor.id),
+            replace_transaction_hash: None,
+        })
     }
 
     pub async fn process_single_pending(
         &mut self,
         relayer_id: &RelayerId,
     ) -> Result<ProcessResult<ProcessPendingStatus>, ProcessPendingTransactionError> {
-        if let Some(queue_arc) = self.get_transactions_queue(relayer_id) {
-            let mut transactions_queue = queue_arc.lock().await;
-
-            if transactions_queue.is_paused() {
-                return Ok(ProcessResult::<ProcessPendingStatus>::other(
-                    ProcessPendingStatus::RelayerPaused,
-                    Some(&30000), // relayer paused we will wait 30 seconds to get new stuff
-                ));
+        let _sender = self
+            .db
+            .acquire_sender(relayer_id, true)
+            .await
+            .map_err(ProcessPendingTransactionError::Handoff)?;
+        let queue = self
+            .get_transactions_queue(relayer_id)
+            .ok_or(ProcessPendingTransactionError::RelayerTransactionsQueueNotFound(*relayer_id))?;
+        let mut queue = queue.lock().await;
+        queue.reload(&self.db).await.map_err(ProcessPendingTransactionError::Handoff)?;
+        if queue.is_paused() {
+            return Ok(ProcessResult::other(ProcessPendingStatus::RelayerPaused, Some(&250)));
+        }
+        if let Some(mut transaction) = queue.get_next_pending_transaction().await {
+            let _critical = enter_critical_operation().ok_or(
+                ProcessPendingTransactionError::RelayerTransactionsQueueNotFound(*relayer_id),
+            )?;
+            // An unattempted expired request becomes a durable nonce-consuming
+            // no-op competitor. Attempted sends remain ambiguous until receipt.
+            if transaction.expires_at <= Utc::now() && !transaction.is_noop {
+                let attempted: bool = self
+                    .db
+                    .query_one(
+                        "SELECT broadcast_attempted FROM relayer.transaction WHERE id=$1",
+                        &[&transaction.id],
+                    )
+                    .await
+                    .map_err(ProcessPendingTransactionError::Handoff)?
+                    .get(0);
+                if !attempted && !queue.is_isolated_limit_base() {
+                    self.queue_competitor(&transaction, None)
+                        .await
+                        .map_err(ProcessPendingTransactionError::Handoff)?;
+                    return Ok(ProcessResult::success());
+                }
             }
-
-            let relayer_address = transactions_queue.relay_address();
-
-            if let Some(mut transaction) = transactions_queue.get_next_pending_transaction().await {
-                let _guard = enter_critical_operation().ok_or_else(|| {
-                    info!(
-                        "process_single_pending: refusing to start during shutdown for relayer {}",
-                        relayer_id
-                    );
-                    ProcessPendingTransactionError::RelayerTransactionsQueueNotFound(*relayer_id)
+            // Expiry is not evidence that a prior broadcast failed. Never turn an
+            // uncertain send into a new payload, a fresh nonce, or a refund signal.
+            let sent =
+                queue.send_transaction(&mut self.db, &mut transaction).await.map_err(|e| {
+                    ProcessPendingTransactionError::SendTransactionError(
+                        *relayer_id,
+                        queue.relay_address(),
+                        e,
+                    )
                 })?;
-                if self.has_expired(&transaction) {
-                    self.transaction_to_noop(&mut transactions_queue, &mut transaction);
-                }
-
-                match transactions_queue.send_transaction(&mut self.db, &mut transaction).await {
-                    Ok(transaction_sent) => {
-                        transactions_queue.move_pending_to_inmempool(&transaction_sent).await
-                            .map_err(|e| ProcessPendingTransactionError::MovePendingTransactionToInmempoolError(*relayer_id, relayer_address, e))?;
-
-                        self.invalidate_transaction_cache(&transaction.id).await;
-
-                        if let Some(webhook_manager) = &self.webhook_manager {
-                            let webhook_manager = webhook_manager.clone();
-                            let sent_transaction = Transaction {
-                                status: TransactionStatus::INMEMPOOL,
-                                known_transaction_hash: Some(transaction_sent.hash),
-                                sent_at: Some(Utc::now()),
-                                ..transaction
-                            };
-                            tokio::spawn(async move {
-                                let webhook_manager = webhook_manager.lock().await;
-                                webhook_manager.on_transaction_sent(&sent_transaction).await;
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        return match e {
-                            TransactionQueueSendTransactionError::GasPriceTooHigh => {
-                                Ok(ProcessResult::<ProcessPendingStatus>::other(
-                                    ProcessPendingStatus::GasPriceTooHigh,
-                                    self.relayer_block_times_ms.get(relayer_id), // gas to high check back on the next block - do not do the / 10 part
-                                ))
-                            }
-                            TransactionQueueSendTransactionError::GasCalculationError => {
-                                Err(ProcessPendingTransactionError::GasCalculationError(
-                                    *relayer_id,
-                                    relayer_address,
-                                    transaction.clone(),
-                                ))
-                            }
-                            TransactionQueueSendTransactionError::TransactionEstimateGasError(
-                                error,
-                            ) => {
-                                self.db
-                                    .update_transaction_failed(&transaction.id, &error.to_string())
-                                    .await
-                                    .map_err(|e| {
-                                        ProcessPendingTransactionError::DbError(
-                                            *relayer_id,
-                                            relayer_address,
-                                            e,
-                                        )
-                                    })?;
-
-                                transactions_queue.move_next_pending_to_failed().await;
-
-                                self.invalidate_transaction_cache(&transaction.id).await;
-
-                                Err(ProcessPendingTransactionError::TransactionEstimateGasError(
-                                    *relayer_id,
-                                    relayer_address,
-                                    error,
-                                ))
-                            }
-                            TransactionQueueSendTransactionError::TransactionSendError(error) => {
-                                let error_msg = error.to_string().to_lowercase();
-                                // Check if this is an insufficient funds error - auto-fail these
-                                let insufficient_funds = error_msg.contains("insufficient funds")
-                                    || error_msg.contains("balance")
-                                    || error_msg.contains("overshot");
-                                let will_revert = error_msg.contains("execution reverted");
-                                let intrinsic_gas_too_low =
-                                    error_msg.contains("intrinsic gas too low");
-                                // Some nodes answer "invalid nonce" for a future nonce, so it only
-                                // means "used" when the head is below the chain's nonce.
-                                let nonce_gap = error_msg.contains("nonce too high")
-                                    || (error_msg.contains("invalid nonce")
-                                        && matches!(
-                                            transactions_queue.get_nonce().await,
-                                            Ok(chain) if transaction.nonce.into_inner() >= chain.into_inner()
-                                        ));
-                                if insufficient_funds || will_revert || intrinsic_gas_too_low {
-                                    if insufficient_funds {
-                                        error!("process_single_pending: transaction {} failed due to insufficient funds moved to failed - error {}", transaction.id, error_msg);
-                                    }
-                                    if will_revert {
-                                        error!("process_single_pending: transaction {} failed as would always revert - error {}", transaction.id, error_msg);
-                                    }
-                                    if intrinsic_gas_too_low {
-                                        error!("process_single_pending: transaction {} failed due to intrinsic gas too low - error {}", transaction.id, error_msg);
-                                    }
-                                    self.db
-                                        .update_transaction_failed(
-                                            &transaction.id,
-                                            &error.to_string(),
-                                        )
-                                        .await
-                                        .map_err(|e| {
-                                            ProcessPendingTransactionError::DbError(
-                                                *relayer_id,
-                                                relayer_address,
-                                                e,
-                                            )
-                                        })?;
-
-                                    transactions_queue.move_next_pending_to_failed().await;
-
-                                    self.invalidate_transaction_cache(&transaction.id).await;
-
-                                    Err(ProcessPendingTransactionError::SendTransactionError(
-                                        *relayer_id,
-                                        relayer_address,
-                                        TransactionQueueSendTransactionError::TransactionSendError(
-                                            error,
-                                        ),
-                                    ))
-                                } else if !nonce_gap
-                                    && (error_msg.contains("nonce too low")
-                                        || error_msg.contains("nonce is too low")
-                                        || error_msg.contains("invalid nonce")
-                                        || error_msg.contains("nonce has already been used")
-                                        || error_msg.contains("already known"))
-                                {
-                                    // A used nonce on a first send is normally tracked as sent by
-                                    // `send_transaction`; this is a nonce error it could not attribute to
-                                    // this broadcast (e.g. "invalid nonce"). Re-sending the payload at a new
-                                    // nonce could execute it twice, so fail it instead.
-                                    error!("process_single_pending: transaction {} failed, its nonce {} is already used and it was not re-sent at a new nonce - error {}", transaction.id, transaction.nonce.into_inner(), error_msg);
-                                    self.db
-                                        .update_transaction_failed(
-                                            &transaction.id,
-                                            &format!("Nonce already used; not re-sent to avoid a duplicate: {}", error),
-                                        )
-                                        .await
-                                        .map_err(|e| {
-                                            ProcessPendingTransactionError::DbError(
-                                                *relayer_id,
-                                                relayer_address,
-                                                e,
-                                            )
-                                        })?;
-
-                                    transactions_queue.move_next_pending_to_failed().await;
-
-                                    self.invalidate_transaction_cache(&transaction.id).await;
-
-                                    // The rest of the queue has never been sent, so it can safely move to
-                                    // the nonces that are actually free.
-                                    if let Err(sync_error) = self
-                                        .resync_pending_nonces(
-                                            relayer_id,
-                                            &mut transactions_queue,
-                                            false,
-                                        )
-                                        .await
-                                    {
-                                        error!(
-                                            "Failed to resync pending nonces for relayer {}: {}",
-                                            relayer_id, sync_error
-                                        );
-                                    }
-
-                                    Err(ProcessPendingTransactionError::SendTransactionError(
-                                        *relayer_id,
-                                        relayer_address,
-                                        TransactionQueueSendTransactionError::TransactionSendError(
-                                            error,
-                                        ),
-                                    ))
-                                } else if nonce_gap {
-                                    // A gap below the head never fills by itself: a cancelled or failed
-                                    // transaction left it, or a restart reloaded stale nonces.
-                                    match self
-                                        .resync_pending_nonces(relayer_id, &mut transactions_queue, true)
-                                        .await
-                                    {
-                                        Ok(changed) if changed > 0 => {
-                                            Ok(ProcessResult::<ProcessPendingStatus>::other(
-                                                ProcessPendingStatus::NonceSynchronized,
-                                                Some(&100),
-                                            ))
-                                        }
-                                        // Nothing to move: the gap belongs to an in-flight transaction.
-                                        Ok(_) => Err(ProcessPendingTransactionError::SendTransactionError(
-                                            *relayer_id,
-                                            relayer_address,
-                                            TransactionQueueSendTransactionError::TransactionSendError(
-                                                error,
-                                            ),
-                                        )),
-                                        Err(sync_error) => {
-                                            error!("Failed to resync pending nonces for relayer {}: {}", relayer_id, sync_error);
-                                            Err(ProcessPendingTransactionError::SendTransactionError(
-                                                *relayer_id,
-                                                relayer_address,
-                                                TransactionQueueSendTransactionError::TransactionSendError(
-                                                    error,
-                                                ),
-                                            ))
-                                        }
-                                    }
-                                } else {
-                                    // For other send errors (RPC down, etc), keep as temp issue
-                                    Err(ProcessPendingTransactionError::SendTransactionError(
-                                        *relayer_id,
-                                        relayer_address,
-                                        TransactionQueueSendTransactionError::TransactionSendError(
-                                            error,
-                                        ),
-                                    ))
-                                }
-                            }
-                            TransactionQueueSendTransactionError::CouldNotUpdateTransactionDb(
-                                error,
-                            ) => {
-                                // just keep the transaction in pending state as could be a bad
-                                // db connection or temp
-                                // outage
-                                Err(ProcessPendingTransactionError::SendTransactionError(
-                                    *relayer_id,
-                                    relayer_address,
-                                    TransactionQueueSendTransactionError::CouldNotUpdateTransactionDb(error),
-                                ))
-                            }
-                            TransactionQueueSendTransactionError::SendTransactionGasPriceError(
-                                error,
-                            ) => {
-                                // should never happen if it does something internal is wrong,
-                                // and we don't want to
-                                // continue processing the queue
-                                // it can stay in a loop forever, so we don't fail pending
-                                // transactions
-                                Err(ProcessPendingTransactionError::SendTransactionError(
-                                    *relayer_id,
-                                    relayer_address,
-                                    TransactionQueueSendTransactionError::SendTransactionGasPriceError(error),
-                                ))
-                            }
-                            TransactionQueueSendTransactionError::TransactionConversionError(
-                                error,
-                            ) => {
-                                self.db
-                                    .update_transaction_failed(&transaction.id, &error)
-                                    .await
-                                    .map_err(|e| {
-                                        ProcessPendingTransactionError::DbError(
-                                            *relayer_id,
-                                            relayer_address,
-                                            e,
-                                        )
-                                    })?;
-
-                                transactions_queue.move_next_pending_to_failed().await;
-
-                                self.invalidate_transaction_cache(&transaction.id).await;
-
-                                Err(ProcessPendingTransactionError::TransactionEstimateGasError(
-                                    *relayer_id,
-                                    relayer_address,
-                                    RpcError::Transport(TransportErrorKind::Custom(error.into())),
-                                ))
-                            }
-                            TransactionQueueSendTransactionError::SafeProxyError(error) => {
-                                self.db
-                                    .update_transaction_failed(&transaction.id, &error.to_string())
-                                    .await
-                                    .map_err(|e| {
-                                        ProcessPendingTransactionError::DbError(
-                                            *relayer_id,
-                                            relayer_address,
-                                            e,
-                                        )
-                                    })?;
-
-                                transactions_queue.move_next_pending_to_failed().await;
-
-                                self.invalidate_transaction_cache(&transaction.id).await;
-
-                                Err(ProcessPendingTransactionError::TransactionEstimateGasError(
-                                    *relayer_id,
-                                    relayer_address,
-                                    RpcError::Transport(TransportErrorKind::Custom(error.into())),
-                                ))
-                            }
-                            TransactionQueueSendTransactionError::NoTransactionInQueue => {
-                                // This shouldn't happen in normal flow, but if it does, keep the transaction pending
-                                Err(ProcessPendingTransactionError::SendTransactionError(
-                                    *relayer_id,
-                                    relayer_address,
-                                    TransactionQueueSendTransactionError::NoTransactionInQueue,
-                                ))
-                            }
-                        };
-                    }
-                }
-
-                Ok(ProcessResult::<ProcessPendingStatus>::success())
-            } else {
-                Ok(ProcessResult::<ProcessPendingStatus>::other(
-                    ProcessPendingStatus::NoPendingTransactions,
-                    Default::default(),
-                ))
+            queue.move_pending_to_inmempool(&sent).await.map_err(|e| {
+                ProcessPendingTransactionError::MovePendingTransactionToInmempoolError(
+                    *relayer_id,
+                    queue.relay_address(),
+                    Box::new(e),
+                )
+            })?;
+            self.invalidate_transaction_cache(&transaction.id).await;
+            if let Some(manager) = &self.webhook_manager {
+                let sent_transaction = Transaction {
+                    status: TransactionStatus::INMEMPOOL,
+                    known_transaction_hash: Some(sent.hash),
+                    sent_at: Some(Utc::now()),
+                    ..transaction
+                };
+                manager.lock().await.on_transaction_sent(&sent_transaction).await;
             }
+            Ok(ProcessResult::success())
         } else {
-            Err(ProcessPendingTransactionError::RelayerTransactionsQueueNotFound(*relayer_id))
+            Ok(ProcessResult::other(ProcessPendingStatus::NoPendingTransactions, Some(&250)))
         }
     }
 
@@ -1424,8 +789,17 @@ impl TransactionsQueues {
         &mut self,
         relayer_id: &RelayerId,
     ) -> Result<ProcessResult<ProcessInmempoolStatus>, ProcessInmempoolTransactionError> {
+        let _sender = self
+            .db
+            .acquire_sender(relayer_id, true)
+            .await
+            .map_err(ProcessInmempoolTransactionError::Handoff)?;
         if let Some(queue_arc) = self.get_transactions_queue(relayer_id) {
             let mut transactions_queue = queue_arc.lock().await;
+            transactions_queue
+                .reload(&self.db)
+                .await
+                .map_err(ProcessInmempoolTransactionError::Handoff)?;
 
             let relayer_address = transactions_queue.relay_address();
 
@@ -1438,176 +812,39 @@ impl TransactionsQueues {
                     );
                     ProcessInmempoolTransactionError::RelayerTransactionsQueueNotFound(*relayer_id)
                 })?;
-                if let Some(known_transaction_hash) = transaction.known_transaction_hash {
-                    match transactions_queue.get_receipt(&known_transaction_hash).await {
-                        Ok(Some(receipt)) => {
-                            transactions_queue.forget_nonce_used(&transaction.id).await;
+                {
+                    match transactions_queue.receipt_for_competition(&self.db, &transaction).await {
+                        Ok(Some((winner, receipt))) => {
                             let competition_result = transactions_queue
-                                .move_inmempool_to_mining(&transaction.id, &receipt)
-                                .await.map_err(|e| ProcessInmempoolTransactionError::MoveInmempoolTransactionToMinedError(*relayer_id, relayer_address, e))?;
+                                .move_inmempool_to_mining(&winner.id, &receipt)
+                                .await.map_err(|e| ProcessInmempoolTransactionError::MoveInmempoolTransactionToMinedError(*relayer_id, relayer_address, Box::new(e)))?;
 
-                            // Save the winning transaction to database
-                            match competition_result.winner_status {
-                                TransactionStatus::MINED => {
-                                    self.db
-                                        .transaction_mined(&competition_result.winner, &receipt)
-                                        .await.map_err(|e| ProcessInmempoolTransactionError::CouldNotUpdateTransactionStatusInTheDatabase(*relayer_id, relayer_address, competition_result.winner.clone(), TransactionStatus::MINED, e))?;
-                                    self.invalidate_transaction_cache(
-                                        &competition_result.winner.id,
-                                    )
-                                    .await;
-
-                                    // Save the loser transaction to database if there was competition
-                                    if let Some(loser) = &competition_result.loser {
-                                        self.db
-                                            .transaction_update(loser)
-                                            .await.map_err(|e| ProcessInmempoolTransactionError::CouldNotUpdateTransactionStatusInTheDatabase(*relayer_id, relayer_address, loser.clone(), loser.status, e))?;
-                                        self.invalidate_transaction_cache(&loser.id).await;
-
-                                        info!("Updated loser transaction {} with status {:?} in database", loser.id, loser.status);
-                                    }
-
-                                    if let Some(webhook_manager) = &self.webhook_manager {
-                                        let webhook_manager = webhook_manager.clone();
-                                        let mined_transaction = competition_result.winner.clone();
-                                        let receipt_clone = receipt.clone();
-                                        tokio::spawn(async move {
-                                            let webhook_manager = webhook_manager.lock().await;
-                                            webhook_manager
-                                                .on_transaction_mined(
-                                                    &mined_transaction,
-                                                    &receipt_clone,
-                                                )
-                                                .await;
-                                        });
-                                    }
+                            self.db.transaction_mined(&competition_result.winner, &receipt, competition_result.loser.as_ref()).await
+                                .map_err(|e| ProcessInmempoolTransactionError::CouldNotUpdateTransactionStatusInTheDatabase(*relayer_id,relayer_address,Box::new(competition_result.winner.clone()),competition_result.winner_status,e))?;
+                            self.invalidate_transaction_cache(&competition_result.winner.id).await;
+                            if let Some(loser) = &competition_result.loser {
+                                self.invalidate_transaction_cache(&loser.id).await;
+                            }
+                            if let Some(manager) = &self.webhook_manager {
+                                let manager = manager.lock().await;
+                                if competition_result.winner_status == TransactionStatus::MINED {
+                                    manager
+                                        .on_transaction_mined(&competition_result.winner, &receipt)
+                                        .await;
+                                } else {
+                                    manager.on_transaction_failed(&competition_result.winner).await;
                                 }
-                                TransactionStatus::EXPIRED => {
-                                    self.db.transaction_expired(&competition_result.winner.id).await.map_err(|e| ProcessInmempoolTransactionError::CouldNotUpdateTransactionStatusInTheDatabase(*relayer_id, relayer_address, competition_result.winner.clone(), TransactionStatus::EXPIRED, e))?;
-                                    self.invalidate_transaction_cache(
-                                        &competition_result.winner.id,
-                                    )
-                                    .await;
-
-                                    if let Some(webhook_manager) = &self.webhook_manager {
-                                        let webhook_manager = webhook_manager.clone();
-                                        let expired_transaction = competition_result.winner.clone();
-                                        tokio::spawn(async move {
-                                            let webhook_manager = webhook_manager.lock().await;
-                                            webhook_manager
-                                                .on_transaction_expired(&expired_transaction)
-                                                .await;
-                                        });
-                                    }
-                                }
-                                TransactionStatus::FAILED => {
-                                    self.db
-                                        .update_transaction_failed(&competition_result.winner.id, "Failed onchain")
-                                        .await.map_err(|e| ProcessInmempoolTransactionError::CouldNotUpdateTransactionStatusInTheDatabase(*relayer_id, relayer_address, competition_result.winner.clone(), TransactionStatus::FAILED, e))?;
-                                    self.invalidate_transaction_cache(
-                                        &competition_result.winner.id,
-                                    )
-                                    .await;
-
-                                    if let Some(webhook_manager) = &self.webhook_manager {
-                                        let webhook_manager = webhook_manager.clone();
-                                        let failed_transaction = competition_result.winner.clone();
-                                        tokio::spawn(async move {
-                                            let webhook_manager = webhook_manager.lock().await;
-                                            webhook_manager
-                                                .on_transaction_failed(&failed_transaction)
-                                                .await;
-                                        });
-                                    }
-                                }
-                                _ => {}
                             }
 
                             Ok(ProcessResult::<ProcessInmempoolStatus>::success())
                         }
                         Ok(None) => {
-                            // The node has said this nonce is used (on the first send or a gas
-                            // bump), so more bumps can only be rejected: wait for the tracked hash.
-                            // If it still has no receipt once the chain has mined past the nonce,
-                            // another broadcast used it (an earlier send or bump of this payload
-                            // whose hash is not tracked, or another signer). The tracked hash can
-                            // then never land and this queue is FIFO, so waiting would hold back
-                            // every later receipt: fail it for review, never re-send it at a new
-                            // nonce. The grace period counts from when the used nonce was first
-                            // seen and the receipt was re-checked on every pass above, so a node
-                            // that reports a nonce as used before serving the receipt gets that long.
-                            if let Some(nonce_used_since) =
-                                transactions_queue.nonce_used_since(&transaction.id).await
-                            {
-                                let still_waiting =
-                                    Ok(ProcessResult::<ProcessInmempoolStatus>::other(
-                                        ProcessInmempoolStatus::StillInmempool,
-                                        self.relayer_block_times_ms.get(relayer_id),
-                                    ));
-                                if (Utc::now() - nonce_used_since).num_seconds() <= 60
-                                    || !transactions_queue.get_mined_nonce().await.is_ok_and(
-                                        |mined| mined.into_inner() > transaction.nonce.into_inner(),
-                                    )
-                                    || !matches!(
-                                        transactions_queue
-                                            .get_receipt(&known_transaction_hash)
-                                            .await,
-                                        Ok(None)
-                                    )
-                                {
-                                    return still_waiting;
-                                }
-                                // Another rrelayer process on this database (a rolling deploy) may
-                                // have sent and settled this row; its result must not be overwritten.
-                                let Ok(Some(stored)) =
-                                    self.db.get_transaction(&transaction.id).await
-                                else {
-                                    return still_waiting;
-                                };
-                                if !transactions_queue
-                                    .remove_inmempool_head_without_competitor(&transaction.id)
-                                    .await
-                                {
-                                    return still_waiting;
-                                }
-                                transactions_queue.forget_nonce_used(&transaction.id).await;
-                                self.invalidate_transaction_cache(&transaction.id).await;
-                                if stored.status != TransactionStatus::INMEMPOOL {
-                                    warn!(
-                                        "process_single_inmempool: transaction {} is {} in the database, settled by another process; dropped from this queue",
-                                        transaction.id, stored.status
-                                    );
-                                    return Ok(ProcessResult::<ProcessInmempoolStatus>::success());
-                                }
-
-                                let reason = format!(
-                                    "Nonce {} was used on-chain but tracked hash {} has no receipt; the payload may have executed through another broadcast. Needs review; not re-sent.",
-                                    transaction.nonce.into_inner(),
-                                    known_transaction_hash
-                                );
-                                error!(
-                                    "process_single_inmempool: transaction {} failed - {}",
-                                    transaction.id, reason
-                                );
-                                self.db
-                                    .update_transaction_failed(&transaction.id, &reason)
-                                    .await
-                                    .map_err(|e| ProcessInmempoolTransactionError::CouldNotUpdateTransactionStatusInTheDatabase(*relayer_id, relayer_address, transaction.clone(), TransactionStatus::FAILED, e))?;
-
-                                if let Some(webhook_manager) = &self.webhook_manager {
-                                    let webhook_manager = webhook_manager.clone();
-                                    let failed_transaction = transaction.clone();
-                                    tokio::spawn(async move {
-                                        let webhook_manager = webhook_manager.lock().await;
-                                        webhook_manager
-                                            .on_transaction_failed(&failed_transaction)
-                                            .await;
-                                    });
-                                }
-
-                                return Ok(ProcessResult::<ProcessInmempoolStatus>::success());
+                            if transactions_queue.is_isolated_limit_base() {
+                                return Ok(ProcessResult::<ProcessInmempoolStatus>::other(
+                                    ProcessInmempoolStatus::StillInmempool,
+                                    Some(&1_000),
+                                ));
                             }
-
                             if let Some(sent_at) = transaction.sent_at {
                                 let elapsed = Utc::now() - sent_at;
 
@@ -1642,43 +879,22 @@ impl TransactionsQueues {
                                     ));
                                 }
 
-                                if transactions_queue.should_bump_gas(
-                                    elapsed.num_milliseconds() as u64,
-                                    &transaction.speed,
-                                ) {
-                                    let transaction_sent = match transactions_queue
+                                if transaction.cancelled_by_transaction_id.is_none()
+                                    && transactions_queue.should_bump_gas(
+                                        elapsed.num_milliseconds() as u64,
+                                        &transaction.speed,
+                                    )
+                                {
+                                    let transaction_sent = transactions_queue
                                         .send_transaction(&mut self.db, &mut transaction)
                                         .await
-                                    {
-                                        Ok(tx_sent) => tx_sent,
-                                        Err(TransactionQueueSendTransactionError::TransactionSendError(error)) => {
-                                            let error_msg = error.to_string().to_lowercase();
-                                            if error_msg.contains("nonce too low")
-                                                || error_msg.contains("nonce is too low")
-                                                || error_msg.contains("invalid nonce")
-                                                || error_msg.contains("nonce has already been used")
-                                                || error_msg.contains("already known")
-                                            {
-                                                // An earlier broadcast of this transaction used the nonce, most
-                                                // often one whose receipt the node is not serving yet.
-                                                // Re-sending the payload at a new nonce would execute it twice,
-                                                // so stop bumping and let the used-nonce check above settle it.
-                                                warn!("process_single_inmempool: gas bump for transaction {} rejected, nonce {} already used; waiting for the tracked hash - error {}", transaction.id, transaction.nonce.into_inner(), error);
-                                                transactions_queue.mark_nonce_used(&transaction.id).await;
-
-                                                return Ok(ProcessResult::<ProcessInmempoolStatus>::other(
-                                                    ProcessInmempoolStatus::StillInmempool,
-                                                    self.relayer_block_times_ms.get(relayer_id),
-                                                ));
-                                            }
-                                            return Err(ProcessInmempoolTransactionError::SendTransactionError(
+                                        .map_err(|e| {
+                                            ProcessInmempoolTransactionError::SendTransactionError(
                                                 *relayer_id,
                                                 relayer_address,
-                                                TransactionQueueSendTransactionError::TransactionSendError(error)
-                                            ));
-                                        }
-                                        Err(e) => return Err(ProcessInmempoolTransactionError::SendTransactionError(*relayer_id, relayer_address, e)),
-                                    };
+                                                e,
+                                            )
+                                        })?;
 
                                     // Update the actual transaction in the inmempool queue
                                     transactions_queue
@@ -1695,20 +911,6 @@ impl TransactionsQueues {
                                     transaction.sent_with_gas =
                                         Some(transaction_sent.sent_with_gas.clone());
                                     transaction.sent_at = Some(Utc::now());
-
-                                    if let Err(db_error) = self
-                                        .db
-                                        .transaction_sent(
-                                            &transaction_sent.id,
-                                            &transaction_sent.hash,
-                                            &transaction_sent.sent_with_gas,
-                                            transaction_sent.sent_with_blob_gas.as_ref(),
-                                            transactions_queue.is_legacy_transactions(),
-                                        )
-                                        .await
-                                    {
-                                        error!("Failed to persist gas bump to database for transaction {}: {}", transaction.id, db_error);
-                                    }
 
                                     self.invalidate_transaction_cache(&transaction.id).await;
 
@@ -1731,17 +933,11 @@ impl TransactionsQueues {
                             Err(ProcessInmempoolTransactionError::CouldNotGetTransactionReceipt(
                                 *relayer_id,
                                 relayer_address,
-                                transaction.clone(),
+                                Box::new(transaction.clone()),
                                 e,
                             ))
                         }
                     }
-                } else {
-                    Err(ProcessInmempoolTransactionError::UnknownTransactionHash(
-                        *relayer_id,
-                        relayer_address,
-                        transaction.clone(),
-                    ))
                 }
             } else {
                 Ok(ProcessResult::<ProcessInmempoolStatus>::other(
@@ -1759,8 +955,17 @@ impl TransactionsQueues {
         &mut self,
         relayer_id: &RelayerId,
     ) -> Result<ProcessResult<ProcessMinedStatus>, ProcessMinedTransactionError> {
+        let _sender = self
+            .db
+            .acquire_sender(relayer_id, true)
+            .await
+            .map_err(ProcessMinedTransactionError::Handoff)?;
         if let Some(queue_arc) = self.get_transactions_queue(relayer_id) {
             let mut transactions_queue = queue_arc.lock().await;
+            transactions_queue
+                .reload(&self.db)
+                .await
+                .map_err(ProcessMinedTransactionError::Handoff)?;
 
             let relayer_address = transactions_queue.relay_address();
 
@@ -1784,7 +989,7 @@ impl TransactionsQueues {
                                     ProcessMinedTransactionError::CouldNotGetTransactionReceipt(
                                         *relayer_id,
                                         relayer_address,
-                                        transaction.clone(),
+                                        Box::new(transaction.clone()),
                                         e,
                                     )
                                 })?
@@ -1792,7 +997,7 @@ impl TransactionsQueues {
                                     ProcessMinedTransactionError::CouldNotGetTransactionReceipt(
                                         *relayer_id,
                                         relayer_address,
-                                        transaction.clone(),
+                                        Box::new(transaction.clone()),
                                         RpcError::Transport(TransportErrorKind::Custom(
                                             "No receipt".to_string().into(),
                                         )),
@@ -1803,7 +1008,7 @@ impl TransactionsQueues {
                                 ProcessMinedTransactionError::CouldNotGetTransactionReceipt(
                                     *relayer_id,
                                     relayer_address,
-                                    transaction.clone(),
+                                    Box::new(transaction.clone()),
                                     RpcError::Transport(TransportErrorKind::Custom(
                                         "Transaction hash not found".to_string().into(),
                                     )),
@@ -1815,7 +1020,7 @@ impl TransactionsQueues {
                             ProcessMinedTransactionError::TransactionConfirmedNotSaveToDatabase(
                                 *relayer_id,
                                 relayer_address,
-                                transaction.clone(),
+                                Box::new(transaction.clone()),
                                 e,
                             )
                         })?;
@@ -1854,7 +1059,7 @@ impl TransactionsQueues {
                     Err(ProcessMinedTransactionError::NoMinedAt(
                         *relayer_id,
                         relayer_address,
-                        transaction.clone(),
+                        Box::new(transaction.clone()),
                     ))
                 }
             } else {

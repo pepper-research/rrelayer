@@ -33,6 +33,10 @@ pub async fn cancel_transaction(
         .await?
         .ok_or(not_found("Could not find transaction id".to_string()))?;
 
+    if crate::provider::is_limit_base_address(&transaction.chain_id, &transaction.from) {
+        return Err(unauthorized(Some("Fixed Base transactions cannot be cancelled".to_string())));
+    }
+
     if state.relayer_internal_only.restricted(&transaction.from, &transaction.chain_id) {
         return Err(unauthorized(Some("Relayer can only be used internally".to_string())));
     }

@@ -14,12 +14,15 @@ WORKDIR /app
 COPY . .
 
 RUN if [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
-        RUSTFLAGS='-C target-cpu=x86-64-v2' cargo build --release --features jemalloc -p rrelayer_cli; \
+        RUSTFLAGS='-C target-cpu=x86-64-v2' cargo build --locked --release --features jemalloc -p rrelayer_cli; \
     else \
-        RUSTFLAGS="-C target-cpu=neoverse-n1" cargo build --release --features jemalloc -p rrelayer_cli; \
+        RUSTFLAGS="-C target-cpu=neoverse-n1" cargo build --locked --release --features jemalloc -p rrelayer_cli; \
     fi
 
 FROM debian:trixie-slim
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION
+ENV RRELAYER_RELEASE_ID=$SOURCE_REVISION
 ARG RRELAYER_CONFIG=deploy/rrelayer-dev.yaml
 RUN apt-get update && apt-get install -y \
     libssl3 \

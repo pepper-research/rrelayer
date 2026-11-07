@@ -91,6 +91,27 @@ impl TransactionApi {
             )
             .await
     }
+    pub async fn send_idempotent(
+        &self,
+        chain_id: u64,
+        transaction: &RelayTransactionRequest,
+        rate_limit_key: Option<String>,
+    ) -> ApiResult<SendTransactionResult> {
+        let mut headers = HeaderMap::new();
+        if let Some(rate_limit_key) = rate_limit_key.as_ref() {
+            headers.insert(
+                RATE_LIMIT_HEADER_NAME,
+                HeaderValue::from_str(rate_limit_key).expect("Invalid rate limit key"),
+            );
+        }
+        self.client
+            .post_with_headers(
+                &format!("transactions/relayers/{}/send-idempotent", chain_id),
+                transaction,
+                headers,
+            )
+            .await
+    }
 
     pub async fn cancel(
         &self,

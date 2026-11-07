@@ -3,12 +3,23 @@ use crate::{
     postgres::{PostgresClient, PostgresError},
     relayer::RelayerId,
     shared::common_types::{PagingContext, PagingResult},
-    transaction::types::{
-        Transaction, TransactionHash, TransactionId, TransactionNonce, TransactionStatus,
-    },
+    transaction::types::{Transaction, TransactionHash, TransactionId, TransactionStatus},
 };
 
 impl PostgresClient {
+    pub async fn get_fixed_signed_envelope(
+        &self,
+        id: &TransactionId,
+    ) -> Result<Option<Vec<u8>>, PostgresError> {
+        let row = self
+            .query_one_or_none(
+                "SELECT signed_envelope FROM relayer.transaction WHERE id = $1",
+                &[id],
+            )
+            .await?;
+        Ok(row.and_then(|row| row.get::<_, Option<Vec<u8>>>("signed_envelope")))
+    }
+
     pub async fn get_transaction(
         &self,
         id: &TransactionId,
@@ -85,34 +96,6 @@ impl PostgresClient {
         Ok(PagingResult::new(results, paging_context.next(result_count), paging_context.previous()))
     }
 
-    /// The highest nonce this relayer has broadcast at, from transactions that are in the mempool,
-    /// mined or confirmed. Unlike the in-memory queues this still covers confirmed transactions.
-    pub async fn get_highest_used_nonce(
-        &self,
-        relayer_id: &RelayerId,
-    ) -> Result<Option<TransactionNonce>, PostgresError> {
-        let row = self
-            .query_one_or_none(
-                "
-                    SELECT MAX(nonce) AS nonce
-                    FROM relayer.transaction
-                    WHERE relayer_id = $1
-                    AND status IN ($2, $3, $4);
-                ",
-                &[
-                    relayer_id,
-                    &TransactionStatus::INMEMPOOL,
-                    &TransactionStatus::MINED,
-                    &TransactionStatus::CONFIRMED,
-                ],
-            )
-            .await?;
-
-        Ok(row
-            .and_then(|row| row.get::<_, Option<i64>>("nonce"))
-            .map(|nonce| TransactionNonce::new(nonce as u64)))
-    }
-
     pub async fn get_transaction_by_hash(
         &self,
         hash: &TransactionHash,
@@ -122,7 +105,7 @@ impl PostgresClient {
                 "
                     SELECT *
                     FROM relayer.transaction
-                    WHERE hash = $1;
+                    WHERE hash = $1 OR id IN (SELECT transaction_id FROM relayer.transaction_attempt WHERE hash=$1);
                 ",
                 &[hash],
             )

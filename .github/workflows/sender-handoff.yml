@@ -1,0 +1,26 @@
+name: Sender handoff recovery
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: cargo build --locked -p rrelayer_cli
+      - run: python3 -m unittest discover -s deploy/handoff -p 'test_*.py'
+      - name: Real processes, database and chain
+        env:
+          LAB_PG_BIN: /usr/lib/postgresql/16/bin
+        run: python3 scripts/handoff/test_handoff.py --binary "$PWD/target/debug/rrelayer_cli" --out "$RUNNER_TEMP/handoff"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sender-handoff-evidence
+          path: ${{ runner.temp }}/handoff

@@ -91,7 +91,7 @@ fn summarize_revert_bytes(bytes: &[u8]) -> String {
         return format!("raw_bytes={}", bytes.len());
     }
 
-    let selector = selector(&bytes);
+    let selector = selector(bytes);
     if selector == CALL_REVERTED_SELECTOR {
         if let Some(decoded) = decode_call_reverted(bytes, 0) {
             return decoded.summary();
@@ -124,7 +124,10 @@ fn extract_longest_hex(input: &str) -> Option<String> {
             }
 
             let candidate = &input[start..i];
-            if candidate.len() > best.len() && candidate.len() >= 10 && candidate.len() % 2 == 0 {
+            if candidate.len() > best.len()
+                && candidate.len() >= 10
+                && candidate.len().is_multiple_of(2)
+            {
                 best = candidate.to_string();
             }
         } else {
@@ -197,8 +200,8 @@ fn decode_call_reverted(bytes: &[u8], depth: usize) -> Option<DecodedCallReverte
     let call_data = decoded.callData.as_ref();
     let error = decoded.innerError.as_ref();
 
-    let call_selector = selector(&call_data);
-    let error_selector = selector(&error);
+    let call_selector = selector(call_data);
+    let error_selector = selector(error);
     let nested = if error_selector == CALL_REVERTED_SELECTOR {
         decode_call_reverted(error, depth + 1).map(Box::new)
     } else {

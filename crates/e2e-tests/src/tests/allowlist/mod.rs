@@ -1,3 +1,4 @@
+mod replacement;
 mod restrictions;
 
 use crate::tests::registry::{TestDefinition, TestModule};

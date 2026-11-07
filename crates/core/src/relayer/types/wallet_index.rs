@@ -17,7 +17,7 @@ impl WalletIndex {
                 // Convert negative database index to positive array index using maximum u32 range
                 // to completely avoid conflicts with mnemonic-derived wallets
                 // u32::MAX = 4,294,967,295, so we use high range for private keys
-                // -1 -> 4,294,967,294, -2 -> 4,294,967,293, -3 -> 4,294,967,292, etc.
+                // -1 -> 4,294,967,295, -2 -> 4,294,967,294, -3 -> 4,294,967,293, etc.
                 u32::MAX - (-db_index - 1) as u32
             }
         }

@@ -20,7 +20,7 @@ use crate::{
     },
     network::ChainId,
     postgres::PostgresClient,
-    provider::{EvmProvider, SendTransactionError},
+    provider::EvmProvider,
     relayer::{Relayer, RelayerId},
     safe_proxy::SafeProxyManager,
     shared::common_types::EvmAddress,
@@ -38,17 +38,50 @@ use alloy::{
     hex,
     transports::{RpcError, TransportErrorKind},
 };
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use tokio::sync::Mutex;
+use tracing::error;
 use tracing::info;
-use tracing::{error, warn};
+
+fn fixed_envelope_matches_hash(bytes: &[u8], hash: TransactionHash) -> bool {
+    alloy::primitives::keccak256(bytes) == hash.into_alloy_hash()
+}
+
+fn fixed_nonce_available(
+    latest: TransactionNonce,
+    pending: TransactionNonce,
+    signed: TransactionNonce,
+) -> bool {
+    latest.into_inner() <= signed.into_inner() && pending == signed
+}
+
+#[cfg(test)]
+mod fixed_envelope_tests {
+    use super::{fixed_envelope_matches_hash, fixed_nonce_available};
+    use crate::transaction::types::{TransactionHash, TransactionNonce};
+
+    #[test]
+    fn restart_recovery_accepts_only_original_signed_bytes() {
+        let original = [0x02, 0x80, 0x01, 0x00];
+        let hash = TransactionHash::from_alloy_hash(&alloy::primitives::keccak256(original));
+        assert!(fixed_envelope_matches_hash(&original, hash));
+        assert!(!fixed_envelope_matches_hash(&[0x02, 0x80, 0x01, 0x01], hash));
+    }
+
+    #[test]
+    fn consumed_nonce_blocks_rebroadcast_of_original() {
+        let nonce = TransactionNonce::new(7);
+        assert!(fixed_nonce_available(nonce, nonce, nonce));
+        assert!(!fixed_nonce_available(TransactionNonce::new(8), nonce, nonce));
+        assert!(!fixed_nonce_available(nonce, TransactionNonce::new(8), nonce));
+        assert!(!fixed_nonce_available(nonce, TransactionNonce::new(6), nonce));
+    }
+}
 
 pub struct TransactionsQueue {
     pending_transactions: Mutex<VecDeque<Transaction>>,
     inmempool_transactions: Mutex<VecDeque<CompetitiveTransaction>>,
     mined_transactions: Mutex<HashMap<TransactionId, Transaction>>,
-    /// When the node first reported each in-mempool transaction's nonce as used.
-    nonce_used_since: Mutex<HashMap<TransactionId, DateTime<Utc>>>,
     evm_provider: EvmProvider,
     relayer: Relayer,
     pub nonce_manager: NonceManager,
@@ -61,6 +94,74 @@ pub struct TransactionsQueue {
 }
 
 impl TransactionsQueue {
+    pub async fn reload(
+        &mut self,
+        db: &PostgresClient,
+    ) -> Result<(), crate::postgres::PostgresError> {
+        use super::start::{
+            repopulate_competitive_transaction_queue, repopulate_transaction_queue,
+        };
+        let map_error = |e: super::start::RepopulateTransactionsQueueError| {
+            crate::postgres::PostgresError::Handoff(e.to_string())
+        };
+        *self.pending_transactions.get_mut() =
+            repopulate_transaction_queue(db, &self.relayer.id, &TransactionStatus::PENDING)
+                .await
+                .map_err(map_error)?;
+        *self.inmempool_transactions.get_mut() =
+            repopulate_competitive_transaction_queue(db, &self.relayer.id)
+                .await
+                .map_err(map_error)?;
+        *self.mined_transactions.get_mut() =
+            repopulate_transaction_queue(db, &self.relayer.id, &TransactionStatus::MINED)
+                .await
+                .map_err(map_error)?
+                .into_iter()
+                .map(|tx| (tx.id, tx))
+                .collect();
+        self.relayer = db
+            .get_relayer(&self.relayer.id)
+            .await?
+            .ok_or_else(|| crate::postgres::PostgresError::Handoff("Relayer removed".into()))?;
+        // All durable admissions reserve their nonce, including unresolved attempts.
+        let row = db.query_one("SELECT COALESCE(MAX(nonce)+1,0) AS next FROM relayer.transaction WHERE chain_id=$1 AND \"from\"=$2 AND (status <> 'FAILED' OR broadcast_attempted)", &[&self.relayer.chain_id, &self.relayer.address]).await?;
+        self.nonce_manager = NonceManager::new(TransactionNonce::new(row.get::<_, i64>(0) as u64));
+        Ok(())
+    }
+
+    pub fn is_isolated_limit_base(&self) -> bool {
+        self.evm_provider.is_isolated_limit_base()
+    }
+
+    pub async fn prepare_fixed_signed_transaction(
+        &self,
+        transaction: &TypedTransaction,
+    ) -> Result<(Vec<u8>, TransactionHash), WalletError> {
+        let (bytes, hash) = self
+            .evm_provider
+            .sign_raw_transaction(&self.relayer, transaction.clone())
+            .await
+            .map_err(|error| WalletError::GenericSignerError(error.to_string()))?;
+        Ok((bytes, hash))
+    }
+
+    async fn gas_price_for_speed(&self, speed: &TransactionSpeed) -> Option<GasPriceResult> {
+        if self.is_isolated_limit_base() {
+            let prices = self.evm_provider.calculate_gas_price().await.ok()?;
+            return Some(match speed {
+                TransactionSpeed::SUPER => prices.super_fast,
+                TransactionSpeed::FAST => prices.fast,
+                TransactionSpeed::MEDIUM => prices.medium,
+                TransactionSpeed::SLOW => prices.slow,
+            });
+        }
+        self.gas_oracle_cache
+            .lock()
+            .await
+            .get_gas_price_for_speed(&self.relayer.chain_id, speed)
+            .await
+    }
+
     pub fn new(
         setup: TransactionsQueueSetup,
         gas_oracle_cache: Arc<Mutex<GasOracleCache>>,
@@ -75,7 +176,6 @@ impl TransactionsQueue {
             pending_transactions: Mutex::new(setup.pending_transactions),
             inmempool_transactions: Mutex::new(setup.inmempool_transactions),
             mined_transactions: Mutex::new(setup.mined_transactions),
-            nonce_used_since: Mutex::new(HashMap::new()),
             evm_provider: setup.evm_provider,
             relayer: setup.relayer,
             nonce_manager: setup.nonce_manager,
@@ -114,12 +214,7 @@ impl TransactionsQueue {
     /// Checks if a transaction has reached the maximum gas price cap and shouldn't be bumped further
     pub async fn is_at_max_gas_price_cap(&self, sent_gas: &GasPriceResult) -> bool {
         // Get SUPER speed gas price for cap calculation
-        let super_gas_price = {
-            let gas_oracle = self.gas_oracle_cache.lock().await;
-            gas_oracle
-                .get_gas_price_for_speed(&self.relayer.chain_id, &TransactionSpeed::SUPER)
-                .await
-        };
+        let super_gas_price = self.gas_price_for_speed(&TransactionSpeed::SUPER).await;
 
         if let Some(super_price) = super_gas_price {
             let max_allowed_max_fee =
@@ -172,6 +267,14 @@ impl TransactionsQueue {
         }
 
         false
+    }
+
+    pub async fn update_pending_transaction(&mut self, transaction: Transaction) {
+        if let Some(item) =
+            self.pending_transactions.lock().await.iter_mut().find(|tx| tx.id == transaction.id)
+        {
+            *item = transaction;
+        }
     }
 
     pub async fn add_pending_transaction(&mut self, transaction: Transaction) {
@@ -280,8 +383,8 @@ impl TransactionsQueue {
                 Err(MovePendingTransactionToInmempoolError::TransactionIdDoesNotMatch(
                     self.relayer.id,
                     self.relayer.address,
-                    transaction_sent.clone(),
-                    transaction.clone(),
+                    Box::new(transaction_sent.clone()),
+                    Box::new(transaction.clone()),
                 ))
             }
         } else {
@@ -290,7 +393,7 @@ impl TransactionsQueue {
             Err(MovePendingTransactionToInmempoolError::TransactionNotFound(
                 self.relayer.id,
                 self.relayer.address,
-                transaction_sent.clone(),
+                Box::new(transaction_sent.clone()),
             ))
         }
     }
@@ -309,6 +412,11 @@ impl TransactionsQueue {
             self.relayer.name,
             transactions.len()
         );
+    }
+
+    /// For a head that was just given the next free nonce.
+    pub async fn move_next_pending_to_back(&mut self) {
+        move_head_to_back(&mut *self.pending_transactions.lock().await);
     }
 
     pub async fn remove_pending_transaction_by_id(
@@ -517,21 +625,27 @@ impl TransactionsQueue {
                         ..comp_tx.original
                     };
 
-                    (winner, comp_tx.competitive.map(|(tx, _)| tx), loser_status)
+                    (
+                        winner,
+                        comp_tx
+                            .competitive
+                            .map(|(tx, _)| Transaction { status: loser_status, ..tx }),
+                        loser_status,
+                    )
                 } else if let Some((competitor, comp_type)) = comp_tx.competitive {
                     let (loser_status, loser_transaction) = match comp_type {
                         CompetitionType::Cancel => {
-                            // When cancel wins, original transaction becomes a cancelled no-op
+                            let status = if comp_tx.original.expires_at <= competitor.queued_at {
+                                TransactionStatus::EXPIRED
+                            } else {
+                                TransactionStatus::CANCELLED
+                            };
                             let cancelled_original = Transaction {
-                                status: TransactionStatus::CANCELLED,
-                                is_noop: true,
-                                to: self.relay_address(),
-                                value: TransactionValue::zero(),
-                                data: TransactionData::empty(),
+                                status,
                                 cancelled_by_transaction_id: Some(competitor.id),
                                 ..comp_tx.original
                             };
-                            (TransactionStatus::CANCELLED, cancelled_original)
+                            (status, cancelled_original)
                         }
                         CompetitionType::Replace => {
                             let replaced_original = Transaction {
@@ -554,7 +668,7 @@ impl TransactionsQueue {
                         self.relayer.id,
                         self.relayer.address,
                         *id,
-                        comp_tx.original,
+                        Box::new(comp_tx.original),
                     ));
                 };
 
@@ -598,7 +712,7 @@ impl TransactionsQueue {
                     self.relayer.id,
                     self.relayer.address,
                     *id,
-                    comp_tx.original,
+                    Box::new(comp_tx.original),
                 ))
             }
         } else {
@@ -753,13 +867,10 @@ impl TransactionsQueue {
             transaction_speed, self.relayer.name
         );
 
-        let mut gas_price = {
-            let gas_oracle = self.gas_oracle_cache.lock().await;
-            gas_oracle
-                .get_gas_price_for_speed(&self.relayer.chain_id, transaction_speed)
-                .await
-                .ok_or(SendTransactionGasPriceError::GasCalculationError)?
-        };
+        let mut gas_price = self
+            .gas_price_for_speed(transaction_speed)
+            .await
+            .ok_or(SendTransactionGasPriceError::GasCalculationError)?;
 
         if let Some(sent_gas) = sent_last_with {
             info!("Adjusting gas price based on previous attempt for relayer: {}. Previous max_fee: {}, max_priority_fee: {}",
@@ -773,12 +884,7 @@ impl TransactionsQueue {
                         self.relayer.name, transaction_speed, next_speed
                     );
                     // Get gas price for the next speed level
-                    if let Some(escalated_gas_price) = {
-                        let gas_oracle = self.gas_oracle_cache.lock().await;
-                        gas_oracle
-                            .get_gas_price_for_speed(&self.relayer.chain_id, &next_speed)
-                            .await
-                    } {
+                    if let Some(escalated_gas_price) = self.gas_price_for_speed(&next_speed).await {
                         gas_price = escalated_gas_price;
                         info!(
                             "Escalated gas price for relayer: {} - max_fee: {}, max_priority_fee: {}",
@@ -838,12 +944,7 @@ impl TransactionsQueue {
             }
 
             // Get SUPER speed gas price for cap calculation
-            let super_gas_price = {
-                let gas_oracle = self.gas_oracle_cache.lock().await;
-                gas_oracle
-                    .get_gas_price_for_speed(&self.relayer.chain_id, &TransactionSpeed::SUPER)
-                    .await
-            };
+            let super_gas_price = self.gas_price_for_speed(&TransactionSpeed::SUPER).await;
 
             if let Some(super_price) = super_gas_price {
                 let max_allowed_max_fee =
@@ -1051,22 +1152,21 @@ impl TransactionsQueue {
             .evm_provider
             .estimate_gas(transaction_request, &self.relayer.address)
             .await
-            .map_err(|e| {
-                if let Some(decoded) = summarize_rpc_error(&e) {
+            .inspect_err(|e| {
+                if let Some(decoded) = summarize_rpc_error(e) {
                     error!(
                         "rrelayer_gas_estimate_failed {} decoded_revert=\"{}\" provider_error=\"{}\"",
                         tx_context,
                         decoded,
-                        compact_rpc_error(&e)
+                        compact_rpc_error(e)
                     );
                 } else {
                     error!(
                         "rrelayer_gas_estimate_failed {} provider_error=\"{}\"",
                         tx_context,
-                        compact_rpc_error(&e)
+                        compact_rpc_error(e)
                     );
                 }
-                e
             })?;
 
         let block_gas_limit = self.evm_provider.block_gas_limit().await?;
@@ -1096,6 +1196,86 @@ impl TransactionsQueue {
         db: &mut PostgresClient,
         transaction: &mut Transaction,
     ) -> Result<TransactionSentWithRelayer, TransactionQueueSendTransactionError> {
+        if transaction.status == TransactionStatus::PENDING {
+            if let Some(attempt) = db.last_attempt(&transaction.id).await? {
+                return self.broadcast_attempt(db, transaction, attempt).await;
+            }
+        }
+        if self.is_isolated_limit_base() {
+            let hash = transaction.known_transaction_hash.ok_or_else(|| {
+                TransactionQueueSendTransactionError::TransactionConversionError(
+                    "Fixed Base transaction has no signed hash".to_string(),
+                )
+            })?;
+            let gas = transaction.sent_with_gas.clone().ok_or_else(|| {
+                TransactionQueueSendTransactionError::TransactionConversionError(
+                    "Fixed Base transaction has no signed gas quote".to_string(),
+                )
+            })?;
+            let bytes = db.get_fixed_signed_envelope(&transaction.id).await?.ok_or_else(|| {
+                TransactionQueueSendTransactionError::TransactionConversionError(
+                    "Fixed Base transaction has no durable signed envelope".to_string(),
+                )
+            })?;
+            if !fixed_envelope_matches_hash(&bytes, hash) {
+                return Err(TransactionQueueSendTransactionError::TransactionConversionError(
+                    "Fixed Base signed envelope hash mismatch".to_string(),
+                ));
+            }
+            let receipt = self
+                .evm_provider
+                .get_receipt(&hash)
+                .await
+                .map_err(TransactionQueueSendTransactionError::TransactionEstimateGasError)?;
+            let known = if receipt.is_some() {
+                true
+            } else {
+                self.evm_provider
+                    .has_transaction_hash(&hash)
+                    .await
+                    .map_err(TransactionQueueSendTransactionError::TransactionEstimateGasError)?
+            };
+            if !known {
+                let latest = self
+                    .evm_provider
+                    .get_latest_nonce_from_address(&self.relayer.address)
+                    .await
+                    .map_err(TransactionQueueSendTransactionError::TransactionEstimateGasError)?;
+                let pending =
+                    self.evm_provider.get_nonce_from_address(&self.relayer.address).await.map_err(
+                        TransactionQueueSendTransactionError::TransactionEstimateGasError,
+                    )?;
+                if !fixed_nonce_available(latest, pending, transaction.nonce) {
+                    return Err(TransactionQueueSendTransactionError::TransactionConversionError(
+                        "Fixed Base nonce consumed while original hash is absent; holding request"
+                            .to_string(),
+                    ));
+                }
+                db.execute(
+                    "UPDATE relayer.transaction SET broadcast_attempted=TRUE WHERE id=$1",
+                    &[&transaction.id],
+                )
+                .await?;
+                let returned = self
+                    .evm_provider
+                    .send_raw_signed(&bytes, hash)
+                    .await
+                    .map_err(TransactionQueueSendTransactionError::TransactionSendError)?;
+                if returned != hash {
+                    return Err(TransactionQueueSendTransactionError::TransactionConversionError(
+                        "Fixed Base gateway returned a different transaction hash".to_string(),
+                    ));
+                }
+            }
+            let sent = TransactionSentWithRelayer {
+                id: transaction.id,
+                hash,
+                sent_with_gas: gas,
+                sent_with_blob_gas: None,
+            };
+            db.transaction_sent(&sent.id, &sent.hash, &sent.sent_with_gas, None, false).await?;
+            return Ok(sent);
+        }
         info!(
             "rrelayer_send_prepare {} speed={:?}",
             transaction_context(transaction, &self.relayer),
@@ -1337,72 +1517,119 @@ impl TransactionsQueue {
         };
         info!("rrelayer_send_network {}", transaction_context(&working_transaction, &self.relayer));
 
-        let transaction_hash =
-            match self.evm_provider.send_transaction(&self.relayer, transaction_request).await {
-                Ok(hash) => hash,
-                // A first send whose nonce the node reports as used was, in every case seen
-                // (robinhood-pk-0, 37 of 37 over 30 days to 2026-09-30), this payload already
-                // included. Track the broadcast hash and let the receipt check settle it (or fail
-                // it for review if it never lands); re-sending at a new nonce would execute the
-                // payload twice. A gas bump, cancel or
-                // replace getting this answer means an earlier broadcast won, which this hash does
-                // not track, so those keep the error.
-                Err(SendTransactionError::NonceUsed { hash, error })
-                    if transaction.sent_with_gas.is_none() =>
-                {
-                    warn!(
-                        "rrelayer_send_nonce_used_tracking {} hash={} provider_error=\"{}\"",
-                        transaction_context(&working_transaction, &self.relayer),
-                        hash,
-                        error
-                    );
-                    self.mark_nonce_used(&transaction.id).await;
-                    hash
-                }
-                Err(error) => {
-                    return Err(TransactionQueueSendTransactionError::TransactionSendError(error))
-                }
-            };
-
-        let transaction_sent = TransactionSentWithRelayer {
-            id: transaction.id,
-            hash: transaction_hash,
-            sent_with_gas: gas_price,
-            sent_with_blob_gas,
+        let (bytes, hash) =
+            self.evm_provider.sign_raw_transaction(&self.relayer, transaction_request).await?;
+        let attempt = crate::transaction::db::attempt::SignedAttempt {
+            bytes,
+            hash,
+            gas: gas_price,
+            blob_gas: sent_with_blob_gas,
         };
+        db.save_attempt(transaction, &attempt).await?;
+        self.broadcast_attempt(db, transaction, attempt).await
+    }
 
-        info!(
-            "rrelayer_send_ok {} hash={} gas_limit={}",
-            transaction_context(&working_transaction, &self.relayer),
-            transaction_sent.hash,
-            estimated_gas_limit.into_inner()
-        );
-
-        if transaction.sent_with_gas.is_none() || transaction.is_noop {
-            if transaction.sent_with_gas.is_none() {
-                db.transaction_sent(
-                    &transaction_sent.id,
-                    &transaction_sent.hash,
-                    &transaction_sent.sent_with_gas,
-                    transaction_sent.sent_with_blob_gas.as_ref(),
-                    self.is_legacy_transactions(),
-                )
-                .await?;
-            } else if transaction.is_noop {
-                db.update_transaction_noop(&transaction.id, &transaction.to).await?;
-            }
-        } else {
-            info!(
-                "Skipping DB update for gas bump transaction {} on relayer: {}",
-                transaction.id, self.relayer.name
-            );
+    async fn broadcast_attempt(
+        &self,
+        db: &mut PostgresClient,
+        transaction: &Transaction,
+        attempt: crate::transaction::db::attempt::SignedAttempt,
+    ) -> Result<TransactionSentWithRelayer, TransactionQueueSendTransactionError> {
+        use alloy::eips::eip2718::Decodable2718;
+        let mut encoded = attempt.bytes.as_slice();
+        let valid = alloy::consensus::TxEnvelope::decode_2718(&mut encoded)
+            .map(|envelope| {
+                encoded.is_empty() && envelope.tx_hash() == &attempt.hash.into_alloy_hash()
+            })
+            .unwrap_or(false);
+        if !valid {
+            return Err(TransactionQueueSendTransactionError::TransactionConversionError(
+                "Durable envelope hash mismatch".into(),
+            ));
         }
+        // Recheck the fence immediately before the network boundary. It cannot
+        // retract an RPC already in flight; identical nonce/payload recovery does.
+        db.execute(
+            "UPDATE relayer.transaction SET broadcast_attempted=TRUE WHERE id=$1",
+            &[&transaction.id],
+        )
+        .await?;
+        #[cfg(debug_assertions)]
+        crate::sender_handoff::test_barrier("before_broadcast").await;
+        let send = async {
+            if self
+                .evm_provider
+                .get_receipt(&attempt.hash)
+                .await
+                .map_err(TransactionQueueSendTransactionError::TransactionEstimateGasError)?
+                .is_none()
+            {
+                let hash = self.evm_provider.send_raw_signed(&attempt.bytes, attempt.hash).await?;
+                if hash != attempt.hash {
+                    return Err(TransactionQueueSendTransactionError::TransactionConversionError(
+                        "RPC returned a different signed hash".into(),
+                    ));
+                }
+            }
+            Ok::<_, TransactionQueueSendTransactionError>(())
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(3), send).await.map_err(|_| {
+            TransactionQueueSendTransactionError::TransactionConversionError(
+                "Broadcast outcome unknown; recovering persisted attempt".into(),
+            )
+        })??;
+        #[cfg(debug_assertions)]
+        crate::sender_handoff::test_barrier("after_broadcast").await;
+        db.transaction_sent(
+            &transaction.id,
+            &attempt.hash,
+            &attempt.gas,
+            attempt.blob_gas.as_ref(),
+            self.is_legacy_transactions(),
+        )
+        .await?;
+        Ok(TransactionSentWithRelayer {
+            id: transaction.id,
+            hash: attempt.hash,
+            sent_with_gas: attempt.gas,
+            sent_with_blob_gas: attempt.blob_gas,
+        })
+    }
 
-        info!(
-            "Successfully processed transaction {} for relayer: {}",
-            transaction.id, self.relayer.name
-        );
-        Ok(transaction_sent)
+    pub async fn receipt_for_competition(
+        &mut self,
+        db: &PostgresClient,
+        active: &Transaction,
+    ) -> Result<Option<(Transaction, AnyTransactionReceipt)>, RpcError<TransportErrorKind>> {
+        let competition = self.inmempool_transactions.lock().await.front().cloned();
+        if let Some(competition) = competition {
+            if let Some(receipt) = self.receipt_for_transaction(db, &competition.original).await? {
+                return Ok(Some((competition.original, receipt)));
+            }
+        }
+        Ok(self.receipt_for_transaction(db, active).await?.map(|r| (active.clone(), r)))
+    }
+
+    pub async fn receipt_for_transaction(
+        &mut self,
+        db: &PostgresClient,
+        transaction: &Transaction,
+    ) -> Result<Option<AnyTransactionReceipt>, RpcError<TransportErrorKind>> {
+        let mut hashes = db
+            .attempt_hashes(&transaction.id)
+            .await
+            .map_err(|e| RpcError::Transport(TransportErrorKind::Custom(e.to_string().into())))?;
+        if let Some(hash) = transaction.known_transaction_hash {
+            if !hashes.contains(&hash) {
+                hashes.push(hash);
+            }
+        }
+        for hash in hashes {
+            if let Some(receipt) = self.get_receipt(&hash).await? {
+                return Ok(Some(receipt));
+            }
+        }
+        Ok(None)
     }
 
     pub async fn get_receipt(
@@ -1443,96 +1670,40 @@ impl TransactionsQueue {
         self.evm_provider.get_balance(&address).await
     }
 
-    pub async fn get_mined_nonce(&self) -> Result<TransactionNonce, RpcError<TransportErrorKind>> {
-        self.evm_provider.get_mined_nonce_from_address(&self.relay_address()).await
-    }
-
-    /// Records, once, that the node reported `transaction_id`'s nonce as used.
-    pub async fn mark_nonce_used(&self, transaction_id: &TransactionId) {
-        self.nonce_used_since.lock().await.entry(*transaction_id).or_insert_with(Utc::now);
-    }
-
-    pub async fn nonce_used_since(&self, transaction_id: &TransactionId) -> Option<DateTime<Utc>> {
-        self.nonce_used_since.lock().await.get(transaction_id).copied()
-    }
-
-    pub async fn forget_nonce_used(&self, transaction_id: &TransactionId) {
-        self.nonce_used_since.lock().await.remove(transaction_id);
-    }
-
-    /// Removes the in-mempool head if it is `transaction_id` and no cancel or replace competes
-    /// for its nonce. Returns whether it was removed.
-    pub async fn remove_inmempool_head_without_competitor(
+    pub async fn update_pending_transaction_nonce(
         &self,
         transaction_id: &TransactionId,
-    ) -> bool {
-        let mut transactions = self.inmempool_transactions.lock().await;
-        match transactions.front() {
-            Some(head) if head.original.id == *transaction_id && head.competitive.is_none() => {
-                transactions.pop_front();
-                true
-            }
-            _ => false,
+        new_nonce: TransactionNonce,
+    ) {
+        let mut pending = self.pending_transactions.lock().await;
+        if let Some(transaction) = pending.iter_mut().find(|tx| tx.id == *transaction_id) {
+            transaction.nonce = new_nonce;
         }
     }
 
-    /// Re-assigns pending nonces consecutively in queue order and resets the nonce manager after
-    /// the last one. The queue is sent front to back, so nonces must follow queue order: a head
-    /// whose nonce is above a queued one is rejected as "nonce too high" forever.
-    ///
-    /// Pending transactions have never been sent, so they may move, but never onto a nonce that
-    /// could be used: numbering starts above the chain's nonce, every in-flight and
-    /// mined-but-unconfirmed transaction, and `highest_used` (the persisted high-water mark, which
-    /// also covers confirmed transactions). A single lagging RPC read therefore cannot pull the
-    /// queue down onto used nonces.
-    ///
-    /// With `lower_only` (after "nonce too high") nonces can only need to come down. A start above
-    /// the head contradicts the node's rejection, and the head may already have been broadcast, so
-    /// nothing moves.
-    /// Returns the transactions whose nonce changed, for the caller to persist.
-    pub async fn resync_pending_nonces(
+    pub async fn update_inmempool_transaction_nonce(
         &self,
-        highest_used: Option<TransactionNonce>,
-        lower_only: bool,
-    ) -> Result<Vec<(TransactionId, TransactionNonce)>, RpcError<TransportErrorKind>> {
-        let in_flight: Vec<TransactionNonce> =
-            self.inmempool_transactions.lock().await.iter().map(|c| c.original.nonce).collect();
-        let mined: Vec<TransactionNonce> =
-            self.mined_transactions.lock().await.values().map(|t| t.nonce).collect();
-        let mut next = first_free_nonce(
-            self.get_nonce().await?,
-            highest_used.into_iter().chain(in_flight).chain(mined),
-        )
-        .into_inner();
-
-        let mut pending = self.pending_transactions.lock().await;
-        if lower_only && pending.front().is_some_and(|head| next > head.nonce.into_inner()) {
-            return Ok(Vec::new());
-        }
-
-        let mut changed = Vec::new();
-        for transaction in pending.iter_mut() {
-            let nonce = TransactionNonce::new(next);
-            if transaction.nonce != nonce {
-                transaction.nonce = nonce;
-                changed.push((transaction.id, nonce));
+        transaction_id: &TransactionId,
+        new_nonce: TransactionNonce,
+    ) {
+        let mut inmempool = self.inmempool_transactions.lock().await;
+        if let Some(competitive_tx) =
+            inmempool.iter_mut().find(|ctx| ctx.get_transaction_by_id(transaction_id).is_some())
+        {
+            if let Some(transaction) = competitive_tx.get_transaction_by_id_mut(transaction_id) {
+                transaction.nonce = new_nonce;
             }
-            next += 1;
         }
-        self.nonce_manager.set(TransactionNonce::new(next)).await;
-
-        Ok(changed)
     }
 }
 
-/// The first nonce above the chain's nonce and every nonce in `used`.
-pub fn first_free_nonce(
-    onchain: TransactionNonce,
-    used: impl Iterator<Item = TransactionNonce>,
-) -> TransactionNonce {
-    TransactionNonce::new(
-        used.map(|nonce| nonce.into_inner() + 1).fold(onchain.into_inner(), u64::max),
-    )
+// The queue is sent front to back, so nonces have to follow queue order. A head that takes the
+// next free nonce is above every nonce queued behind it: left in front, the node rejects it as
+// "nonce too high" until they are sent, which is never (robinhood-pk-0 froze this way, 2026-09-29).
+fn move_head_to_back(pending: &mut VecDeque<Transaction>) {
+    if let Some(head) = pending.pop_front() {
+        pending.push_back(head);
+    }
 }
 
 // Re-estimate oversized stored limits instead of resending them or blindly lowering them.
@@ -1637,24 +1808,25 @@ mod gas_limit_tests {
 }
 
 #[cfg(test)]
-mod nonce_resync_tests {
+mod pending_order_tests {
     use super::*;
-    use crate::provider::{anvil_relayer, Anvil};
+    use alloy::primitives::Address;
 
-    fn transaction(relayer: &Relayer, nonce: u64) -> Transaction {
+    fn pending(nonce: u64) -> Transaction {
+        let relayer = EvmAddress::new(Address::ZERO);
         Transaction {
             id: TransactionId::new(),
-            relayer_id: relayer.id,
+            relayer_id: RelayerId::new(),
             authorization_list: None,
-            to: relayer.address,
-            from: relayer.address,
+            to: relayer,
+            from: relayer,
             value: TransactionValue::zero(),
             data: TransactionData::empty(),
             nonce: TransactionNonce::new(nonce),
             gas_limit: None,
             status: TransactionStatus::PENDING,
             blobs: None,
-            chain_id: relayer.chain_id,
+            chain_id: ChainId::new(4663),
             known_transaction_hash: None,
             queued_at: Utc::now(),
             expires_at: Utc::now(),
@@ -1673,160 +1845,31 @@ mod nonce_resync_tests {
         }
     }
 
-    /// A queue for anvil's first dev account, which has not sent anything (on-chain nonce 0).
-    async fn queue(
-        pending_nonces: &[u64],
-        in_flight_nonces: &[u64],
-        mined_nonces: &[u64],
-        next_nonce: u64,
-    ) -> (Anvil, TransactionsQueue) {
-        let (anvil, provider, relayer) = anvil_relayer().await;
-        let pending = pending_nonces.iter().map(|n| transaction(&relayer, *n)).collect();
-        let in_flight = in_flight_nonces
-            .iter()
-            .map(|n| CompetitiveTransaction::new(transaction(&relayer, *n)))
-            .collect();
-        let mined = mined_nonces
-            .iter()
-            .map(|n| {
-                let mined = transaction(&relayer, *n);
-                (mined.id, mined)
-            })
-            .collect();
-        let queue = TransactionsQueue::new(
-            TransactionsQueueSetup::new(
-                relayer,
-                provider,
-                NonceManager::new(TransactionNonce::new(next_nonce)),
-                pending,
-                in_flight,
-                mined,
-                Arc::new(SafeProxyManager::new(vec![])),
-                GasBumpBlockConfig::default(),
-                2,
-            ),
-            Arc::new(Mutex::new(GasOracleCache::new())),
-            Arc::new(Mutex::new(BlobGasOracleCache::new())),
-        );
-        (anvil, queue)
-    }
-
-    async fn pending_nonces(queue: &TransactionsQueue) -> Vec<u64> {
-        queue.pending_transactions.lock().await.iter().map(|t| t.nonce.into_inner()).collect()
-    }
-
-    // Run with: cargo test -p rrelayer_core -- --ignored
-    #[tokio::test]
-    #[ignore = "requires anvil on PATH"]
-    async fn a_head_moved_past_the_queue_goes_back_into_order() {
-        // robinhood-pk-0, 2026-09-29: the head was given the next free nonce (4400) while
-        // 4394-4399 waited behind it, so every send of the head was "nonce too high".
-        let (_anvil, queue) = queue(&[6, 0, 1, 2, 3, 4, 5], &[], &[], 7).await;
-
-        let changed = queue.resync_pending_nonces(None, false).await.unwrap();
-
-        assert_eq!(pending_nonces(&queue).await, vec![0, 1, 2, 3, 4, 5, 6]);
-        assert_eq!(changed.len(), 7);
-        assert_eq!(queue.nonce_manager.get_current_nonce().await.into_inner(), 7);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires anvil on PATH"]
-    async fn a_gap_closes_without_reusing_an_in_flight_nonce() {
-        // Nonce 0 is sent but not mined; the pending transaction sits above a gap, as after a
-        // cancelled transaction or a restart that reloaded stale nonces.
-        let (_anvil, queue) = queue(&[5], &[0], &[], 6).await;
-
-        queue.resync_pending_nonces(None, false).await.unwrap();
-
-        assert_eq!(pending_nonces(&queue).await, vec![1]);
-        assert_eq!(queue.nonce_manager.get_current_nonce().await.into_inner(), 2);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires anvil on PATH"]
-    async fn an_ordered_queue_is_left_alone() {
-        let (_anvil, queue) = queue(&[0, 1, 2], &[], &[], 3).await;
-
-        let changed = queue.resync_pending_nonces(None, false).await.unwrap();
-
-        assert!(changed.is_empty());
-        assert_eq!(pending_nonces(&queue).await, vec![0, 1, 2]);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires anvil on PATH"]
-    async fn a_lagging_chain_read_cannot_pull_the_queue_onto_used_nonces() {
-        // anvil reports nonce 0, as a lagging node would, but nonces up to 3 were mined and the
-        // persisted high-water mark says 7 was used.
-        let (_anvil, queue) = queue(&[1, 2], &[], &[3], 3).await;
-
-        queue.resync_pending_nonces(None, false).await.unwrap();
-        assert_eq!(pending_nonces(&queue).await, vec![4, 5]);
-
-        queue.resync_pending_nonces(Some(TransactionNonce::new(7)), false).await.unwrap();
-        assert_eq!(pending_nonces(&queue).await, vec![8, 9]);
-        assert_eq!(queue.nonce_manager.get_current_nonce().await.into_inner(), 10);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires anvil on PATH"]
-    async fn a_nonce_too_high_resync_never_raises_the_head() {
-        // A read showing nonce 6 used contradicts "nonce too high" for a head at 5, and the head
-        // may already have been broadcast at 5.
-        let (_anvil, queue) = queue(&[5, 6], &[], &[6], 7).await;
-
-        let changed = queue.resync_pending_nonces(None, true).await.unwrap();
-
-        assert!(changed.is_empty());
-        assert_eq!(pending_nonces(&queue).await, vec![5, 6]);
-        assert_eq!(queue.nonce_manager.get_current_nonce().await.into_inner(), 7);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires anvil on PATH"]
-    async fn the_used_nonce_clock_starts_when_first_marked() {
-        let (_anvil, queue) = queue(&[], &[0], &[], 1).await;
-        let id = queue.inmempool_transactions.lock().await[0].original.id;
-        assert_eq!(queue.nonce_used_since(&id).await, None);
-
-        queue.mark_nonce_used(&id).await;
-        let first = queue.nonce_used_since(&id).await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        queue.mark_nonce_used(&id).await;
-        assert_eq!(queue.nonce_used_since(&id).await, first);
-
-        queue.forget_nonce_used(&id).await;
-        assert_eq!(queue.nonce_used_since(&id).await, None);
+    fn nonces(queue: &VecDeque<Transaction>) -> Vec<u64> {
+        queue.iter().map(|transaction| transaction.nonce.into_inner()).collect()
     }
 
     #[test]
-    fn new_transactions_are_numbered_after_loaded_rows() {
-        // A restart loads unsent rows at nonces 0-4 while the chain still reports 0; numbering
-        // from the chain would give the next submission a nonce a loaded row is about to use.
-        let loaded = (0..5).map(TransactionNonce::new);
-        assert_eq!(first_free_nonce(TransactionNonce::new(0), loaded).into_inner(), 5);
-        assert_eq!(first_free_nonce(TransactionNonce::new(9), std::iter::empty()).into_inner(), 9);
+    fn a_head_given_the_next_free_nonce_is_sent_after_the_queue() {
+        // robinhood-pk-0, 2026-09-29: the head went from 4393 to 4400 with 4394-4399 behind it.
+        let mut queue: VecDeque<Transaction> =
+            [4400, 4394, 4395, 4396, 4397, 4398, 4399].into_iter().map(pending).collect();
+        let head = queue[0].id;
+
+        move_head_to_back(&mut queue);
+
+        assert_eq!(nonces(&queue), vec![4394, 4395, 4396, 4397, 4398, 4399, 4400]);
+        assert_eq!(queue[6].id, head);
     }
 
-    #[tokio::test]
-    #[ignore = "requires anvil on PATH"]
-    async fn only_an_uncontested_in_flight_head_is_removed() {
-        let (_anvil, queue) = queue(&[], &[0, 1], &[], 2).await;
-        let (head, second) = {
-            let in_flight = queue.inmempool_transactions.lock().await;
-            (in_flight[0].original.id, in_flight[1].original.id)
-        };
+    #[test]
+    fn a_lone_or_missing_head_is_left_alone() {
+        let mut queue: VecDeque<Transaction> = [4400].into_iter().map(pending).collect();
+        move_head_to_back(&mut queue);
+        assert_eq!(nonces(&queue), vec![4400]);
 
-        assert!(!queue.remove_inmempool_head_without_competitor(&second).await);
-        {
-            let mut in_flight = queue.inmempool_transactions.lock().await;
-            let competitor = in_flight[0].original.clone();
-            in_flight[0].competitive = Some((competitor, CompetitionType::Cancel));
-        }
-        assert!(!queue.remove_inmempool_head_without_competitor(&head).await);
-        queue.inmempool_transactions.lock().await[0].competitive = None;
-        assert!(queue.remove_inmempool_head_without_competitor(&head).await);
-        assert_eq!(queue.inmempool_transactions.lock().await[0].original.id, second);
+        let mut empty: VecDeque<Transaction> = VecDeque::new();
+        move_head_to_back(&mut empty);
+        assert!(empty.is_empty());
     }
 }

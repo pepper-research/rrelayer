@@ -347,9 +347,38 @@ impl SigningProvider {
     }
 }
 
+#[cfg(test)]
+mod signing_provider_tests {
+    use super::SigningProvider;
+
+    #[test]
+    fn accepts_one_primary_with_private_keys_but_rejects_two_primaries() {
+        let mixed: SigningProvider = serde_json::from_value(serde_json::json!({
+            "aws_kms": { "region": "us-east-1", "danger_override_alias": "spice-stocks-limits" },
+            "private_keys": [{ "raw": "test-key" }]
+        }))
+        .unwrap();
+        assert!(mixed.validate().is_ok());
+
+        let private_only: SigningProvider = serde_json::from_value(serde_json::json!({
+            "private_keys": [{ "raw": "test-key" }]
+        }))
+        .unwrap();
+        assert!(private_only.validate().is_ok());
+
+        let two_primaries: SigningProvider = serde_json::from_value(serde_json::json!({
+            "aws_kms": { "region": "us-east-1", "danger_override_alias": "spice-stocks-limits" },
+            "raw": { "mnemonic": "test-mnemonic" },
+            "private_keys": [{ "raw": "test-key" }]
+        }))
+        .unwrap();
+        assert!(two_primaries.validate().is_err());
+    }
+}
+
 impl SigningProvider {
     pub fn validate(&self) -> Result<(), String> {
-        let configured_methods = [
+        let primary_methods = [
             self.raw.is_some(),
             self.aws_secret_manager.is_some(),
             self.gcp_secret_manager.is_some(),
@@ -358,16 +387,15 @@ impl SigningProvider {
             self.turnkey.is_some(),
             self.pkcs11.is_some(),
             self.fireblocks.is_some(),
-            self.private_keys.is_some(),
         ]
         .iter()
         .filter(|&&x| x)
         .count();
 
-        match configured_methods {
-            0 => Err("Signing key is not set".to_string()),
-            1 => Ok(()),
-            _ => Err("Only one signing key method can be configured at a time".to_string()),
+        match (primary_methods, self.private_keys.is_some()) {
+            (0, false) => Err("Signing key is not set".to_string()),
+            (0..=1, _) => Ok(()),
+            _ => Err("Only one primary signing key method can be configured at a time".to_string()),
         }
     }
 }

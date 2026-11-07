@@ -14,7 +14,7 @@ use crate::{
     gas::{BlobGasOracleCache, GasOracleCache},
     postgres::{PostgresClient, PostgresConnectionError, PostgresError},
     provider::{find_provider_for_chain_id, EvmProvider},
-    relayer::{Relayer, RelayerId},
+    relayer::{Relayer, RelayerId, WalletIndex},
     safe_proxy::SafeProxyManager,
     shared::{
         cache::Cache,
@@ -29,23 +29,40 @@ pub async fn spawn_processing_tasks_for_relayer(
     transaction_queue: Arc<Mutex<TransactionsQueues>>,
     relayer_id: &RelayerId,
 ) {
+    let isolated = {
+        let queues = transaction_queue.lock().await;
+        match queues.get_transactions_queue(relayer_id) {
+            Some(queue) => queue.lock().await.is_isolated_limit_base(),
+            None => false,
+        }
+    };
     let queue_clone_pending = transaction_queue.clone();
     let relayer_id_pending = *relayer_id;
     tokio::spawn(async move {
-        continuously_process_pending_transactions(queue_clone_pending, &relayer_id_pending).await;
+        continuously_process_pending_transactions(
+            queue_clone_pending,
+            &relayer_id_pending,
+            isolated,
+        )
+        .await;
     });
 
     let queue_clone_inmempool = transaction_queue.clone();
     let relayer_id_inmempool = *relayer_id;
     tokio::spawn(async move {
-        continuously_process_inmempool_transactions(queue_clone_inmempool, &relayer_id_inmempool)
-            .await;
+        continuously_process_inmempool_transactions(
+            queue_clone_inmempool,
+            &relayer_id_inmempool,
+            isolated,
+        )
+        .await;
     });
 
     let queue_clone_mined = transaction_queue.clone();
     let relayer_id_mined = *relayer_id;
     tokio::spawn(async move {
-        continuously_process_mined_transactions(queue_clone_mined, &relayer_id_mined).await;
+        continuously_process_mined_transactions(queue_clone_mined, &relayer_id_mined, isolated)
+            .await;
     });
 }
 
@@ -64,6 +81,26 @@ async fn processes_next_break(process_again_after_ms: &u64) {
     sleep_ms(process_again_after_ms).await
 }
 
+fn queue_break_ms(requested_ms: u64, isolated: bool) -> u64 {
+    if isolated {
+        requested_ms.max(1_000)
+    } else {
+        requested_ms
+    }
+}
+
+#[cfg(test)]
+mod gateway_queue_tests {
+    use super::queue_break_ms;
+
+    #[test]
+    fn fixed_lane_has_poll_floor_without_changing_ordinary_queue() {
+        assert_eq!(queue_break_ms(10, true), 1_000);
+        assert_eq!(queue_break_ms(30_000, true), 30_000);
+        assert_eq!(queue_break_ms(10, false), 10);
+    }
+}
+
 /// Continuously processes pending transactions for a specific relayer.
 ///
 /// Runs in an infinite loop, processing one pending transaction at a time
@@ -71,6 +108,7 @@ async fn processes_next_break(process_again_after_ms: &u64) {
 async fn continuously_process_pending_transactions(
     queue: Arc<Mutex<TransactionsQueues>>,
     relayer_id: &RelayerId,
+    isolated: bool,
 ) {
     let mut shutdown_rx = subscribe_to_shutdown();
 
@@ -86,10 +124,11 @@ async fn continuously_process_pending_transactions(
             } => {
                 match result {
                     Ok(result) => {
-                        processes_next_break(&result.process_again_after).await;
+                        processes_next_break(&queue_break_ms(result.process_again_after, isolated)).await;
                     }
                     Err(e) => {
                         match e {
+                            ProcessPendingTransactionError::Handoff(PostgresError::SenderUnavailable) => { sleep_ms(&250).await; }
                             ProcessPendingTransactionError::RelayerTransactionsQueueNotFound(_) => {
                                 // the queue has been deleted so kill out the loop
                                 info!(
@@ -100,6 +139,7 @@ async fn continuously_process_pending_transactions(
                             }
                             _ => {
                                 error!("Relayer id {} - PENDING QUEUE ERROR: {}", relayer_id, e);
+                                sleep_ms(&250).await;
                             }
                         }
                     }
@@ -116,6 +156,7 @@ async fn continuously_process_pending_transactions(
 async fn continuously_process_inmempool_transactions(
     queue: Arc<Mutex<TransactionsQueues>>,
     relayer_id: &RelayerId,
+    isolated: bool,
 ) {
     let mut shutdown_rx = subscribe_to_shutdown();
 
@@ -131,10 +172,11 @@ async fn continuously_process_inmempool_transactions(
             } => {
                 match result {
                     Ok(result) => {
-                        processes_next_break(&result.process_again_after).await;
+                        processes_next_break(&queue_break_ms(result.process_again_after, isolated)).await;
                     }
                     Err(e) => {
                         match e {
+                            ProcessInmempoolTransactionError::Handoff(PostgresError::SenderUnavailable) => { sleep_ms(&250).await; }
                             ProcessInmempoolTransactionError::RelayerTransactionsQueueNotFound(_) => {
                                 // the queue has been deleted so kill out the loop
                                 info!(
@@ -145,6 +187,7 @@ async fn continuously_process_inmempool_transactions(
                             }
                             _ => {
                                 error!("Relayer id {} - INMEMPOOL QUEUE ERROR: {}", relayer_id, e);
+                                sleep_ms(&250).await;
                             }
                         }
                     }
@@ -161,6 +204,7 @@ async fn continuously_process_inmempool_transactions(
 async fn continuously_process_mined_transactions(
     queue: Arc<Mutex<TransactionsQueues>>,
     relayer_id: &RelayerId,
+    isolated: bool,
 ) {
     let mut shutdown_rx = subscribe_to_shutdown();
 
@@ -176,10 +220,11 @@ async fn continuously_process_mined_transactions(
             } => {
                 match result {
                     Ok(result) => {
-                        processes_next_break(&result.process_again_after).await;
+                        processes_next_break(&queue_break_ms(result.process_again_after, isolated)).await;
                     }
                     Err(e) => {
                         match e {
+                            ProcessMinedTransactionError::Handoff(PostgresError::SenderUnavailable) => { sleep_ms(&250).await; }
                             ProcessMinedTransactionError::RelayerTransactionsQueueNotFound(_) => {
                                 // the queue has been deleted so kill out the loop
                                 info!(
@@ -190,6 +235,7 @@ async fn continuously_process_mined_transactions(
                             }
                             _ => {
                                 error!("Relayer id {} - MINED QUEUE ERROR: {}", relayer_id, e);
+                                sleep_ms(&250).await;
                             }
                         }
                     }
@@ -209,7 +255,7 @@ pub enum RepopulateTransactionsQueueError {
 ///
 /// Loads all transactions with the given status for a relayer from the database,
 /// maintaining their nonce order in the queue.
-async fn repopulate_transaction_queue(
+pub(super) async fn repopulate_transaction_queue(
     db: &PostgresClient,
     relayer_id: &RelayerId,
     status: &TransactionStatus,
@@ -253,7 +299,7 @@ async fn repopulate_transaction_queue(
 /// 2. Identifying competitions via cancelled_by_transaction_id linkage
 /// 3. Determining competition type based on transaction content
 /// 4. Building proper CompetitiveTransaction objects
-async fn repopulate_competitive_transaction_queue(
+pub(super) async fn repopulate_competitive_transaction_queue(
     db: &PostgresClient,
     relayer_id: &RelayerId,
 ) -> Result<VecDeque<CompetitiveTransaction>, RepopulateTransactionsQueueError> {
@@ -274,17 +320,22 @@ async fn repopulate_competitive_transaction_queue(
         if let Some(cancel_tx_id) = &transaction.cancelled_by_transaction_id {
             // This is an original transaction with a competitor
             // Find the competitor transaction
-            if let Some(competitor) =
-                inmempool_transactions.iter().find(|tx| tx.id == *cancel_tx_id)
-            {
-                // Determine competition type based on transaction content
-                let is_empty_data = competitor.data.clone().into_inner().is_empty();
-                let competition_type =
-                    if competitor.is_noop || (competitor.value.is_zero() && is_empty_data) {
-                        CompetitionType::Cancel
-                    } else {
-                        CompetitionType::Replace
-                    };
+            let competitor = db.get_transaction(cancel_tx_id).await.map_err(|e| {
+                RepopulateTransactionsQueueError::CouldNotGetTransactionsByStatusFromDatabase(
+                    TransactionStatus::INMEMPOOL,
+                    *relayer_id,
+                    e,
+                )
+            })?;
+            if let Some(competitor) = competitor.filter(|tx| {
+                matches!(tx.status, TransactionStatus::PENDING | TransactionStatus::INMEMPOOL)
+            }) {
+                let kind = db.query_one("SELECT competition_kind FROM relayer.transaction WHERE id=$1", &[&transaction.id]).await.map_err(|e| RepopulateTransactionsQueueError::CouldNotGetTransactionsByStatusFromDatabase(TransactionStatus::INMEMPOOL, *relayer_id, e))?.get::<_,Option<String>>(0);
+                let competition_type = if kind.as_deref() == Some("cancel") {
+                    CompetitionType::Cancel
+                } else {
+                    CompetitionType::Replace
+                };
 
                 // Create competitive transaction with original and competitor
                 let mut comp_tx = CompetitiveTransaction::new(transaction.clone());
@@ -296,7 +347,7 @@ async fn repopulate_competitive_transaction_queue(
                 processed_transaction_ids.insert(transaction.id);
                 processed_transaction_ids.insert(competitor.id);
 
-                info!("Reconstructed competitive transaction: original {} with competitor {} (type: {:?})",
+                tracing::debug!("Reconstructed competitive transaction: original {} with competitor {} (type: {:?})",
                     transaction.id, competitor.id, competition_type);
             } else {
                 warn!("Transaction {} has cancelled_by_transaction_id {} but competitor not found in INMEMPOOL",
@@ -321,7 +372,7 @@ async fn repopulate_competitive_transaction_queue(
         }
     }
 
-    info!(
+    tracing::debug!(
         "Reconstructed {} competitive transactions for relayer {}",
         competitive_queue.len(),
         relayer_id
@@ -399,7 +450,10 @@ async fn import_private_keys_as_relayers(
                 // Use negative wallet indexes for private keys to avoid conflicts with mnemonic wallets
                 // Private key index 0 becomes wallet_index -1, index 1 becomes -2, etc.
                 let private_key_wallet_index = -((index + 1) as i32);
-                match provider.get_address(index as u32).await {
+                match provider
+                    .get_address(WalletIndex::PrivateKey(private_key_wallet_index).index())
+                    .await
+                {
                     Ok(address) => {
                         // Check if a relayer with this address already exists on this chain
                         if let Ok(Some(existing_relayer)) =
@@ -518,7 +572,14 @@ pub async fn startup_transactions_queues(
                 continue;
             }
             Some(provider) => {
-                let evm_provider = provider.clone();
+                let evm_provider = match provider.for_relayer(&relayer) {
+                    Ok(Some(provider)) => provider,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        warn!("Could not start fixed Base relayer {}: {}", relayer.id, error);
+                        continue;
+                    }
+                };
 
                 let relayer_id = relayer.id;
 

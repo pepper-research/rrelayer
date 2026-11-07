@@ -1,0 +1,165 @@
+{
+  "recipientBalanceWei": 424242,
+  "rows": {
+    "7b1100df-10c7-4f3a-a046-67835b3af714": {
+      "id": "7b1100df-10c7-4f3a-a046-67835b3af714",
+      "nonce": 0,
+      "status": "MINED",
+      "hash": "0x63d1be5b8952a38351d265874777d299b92790c14237e728684a0e7d452d353a",
+      "value": 424242,
+      "failed_reason": null
+    }
+  },
+  "chain": [
+    {
+      "block": 7,
+      "hash": "0x63d1be5b8952a38351d265874777d299b92790c14237e728684a0e7d452d353a",
+      "nonce": 0,
+      "to": "0x000000000000000000000000000000000000dead",
+      "value": 424242,
+      "status": 1
+    }
+  ],
+  "pass": true,
+  "scope": "Actual API journal/client/refund guard; native payout, not full rollup settlement/indexer",
+  "checks": [
+    {
+      "elapsedSeconds": 5.01,
+      "unresolved": true,
+      "cancelled": false,
+      "status": {
+        "outcome": "running",
+        "journal": [
+          {
+            "id": "send_f7a5c0b24ad17bb9d767130d92ba1b88",
+            "resource": "step:handoff:0",
+            "fence": "1",
+            "purpose": "step_send",
+            "ref_id": "handoff:0",
+            "chain_id": "1",
+            "via": "relayer",
+            "sender": null,
+            "nonce": null,
+            "raw_tx": null,
+            "tx_hash": "0x63d1be5b8952a38351d265874777d299b92790c14237e728684a0e7d452d353a",
+            "relayer_tx_id": "7b1100df-10c7-4f3a-a046-67835b3af714",
+            "to_addr": "0x000000000000000000000000000000000000dead",
+            "data_hash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+            "value": "424242",
+            "outcome": "sent",
+            "lookup_errors": 0,
+            "detail": {
+              "kind": "handoff",
+              "actor": "solver",
+              "request": {
+                "to": "0x000000000000000000000000000000000000dead",
+                "data": "0x",
+                "value": "424242"
+              }
+            },
+            "created_at": "2026-10-07T13:48:33.742Z",
+            "updated_at": "2026-10-07T13:48:33.809Z"
+          }
+        ],
+        "escrow": [
+          {
+            "status": "blocked",
+            "spicenet_cancel_tx_hash": null
+          }
+        ]
+      }
+    },
+    {
+      "elapsedSeconds": 125.01,
+      "unresolved": true,
+      "cancelled": false,
+      "status": {
+        "outcome": "RelayerError: Transaction 7b1100df-10c7-4f3a-a046-67835b3af714 timed out after 120000ms",
+        "journal": [
+          {
+            "id": "send_f7a5c0b24ad17bb9d767130d92ba1b88",
+            "resource": "step:handoff:0",
+            "fence": "1",
+            "purpose": "step_send",
+            "ref_id": "handoff:0",
+            "chain_id": "1",
+            "via": "relayer",
+            "sender": null,
+            "nonce": null,
+            "raw_tx": null,
+            "tx_hash": "0x63d1be5b8952a38351d265874777d299b92790c14237e728684a0e7d452d353a",
+            "relayer_tx_id": "7b1100df-10c7-4f3a-a046-67835b3af714",
+            "to_addr": "0x000000000000000000000000000000000000dead",
+            "data_hash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+            "value": "424242",
+            "outcome": "sent",
+            "lookup_errors": 0,
+            "detail": {
+              "kind": "handoff",
+              "actor": "solver",
+              "request": {
+                "to": "0x000000000000000000000000000000000000dead",
+                "data": "0x",
+                "value": "424242"
+              }
+            },
+            "created_at": "2026-10-07T13:48:33.742Z",
+            "updated_at": "2026-10-07T13:48:33.809Z"
+          }
+        ],
+        "escrow": [
+          {
+            "status": "blocked",
+            "spicenet_cancel_tx_hash": null
+          }
+        ]
+      }
+    }
+  ],
+  "apiStatus": {
+    "outcome": "RelayerError: Transaction 7b1100df-10c7-4f3a-a046-67835b3af714 timed out after 120000ms",
+    "journal": [
+      {
+        "id": "send_f7a5c0b24ad17bb9d767130d92ba1b88",
+        "resource": "step:handoff:0",
+        "fence": "1",
+        "purpose": "step_send",
+        "ref_id": "handoff:0",
+        "chain_id": "1",
+        "via": "relayer",
+        "sender": null,
+        "nonce": null,
+        "raw_tx": null,
+        "tx_hash": "0x63d1be5b8952a38351d265874777d299b92790c14237e728684a0e7d452d353a",
+        "relayer_tx_id": "7b1100df-10c7-4f3a-a046-67835b3af714",
+        "to_addr": "0x000000000000000000000000000000000000dead",
+        "data_hash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+        "value": "424242",
+        "outcome": "mined",
+        "lookup_errors": 0,
+        "detail": {
+          "kind": "handoff",
+          "actor": "solver",
+          "request": {
+            "to": "0x000000000000000000000000000000000000dead",
+            "data": "0x",
+            "value": "424242"
+          }
+        },
+        "created_at": "2026-10-07T13:48:33.742Z",
+        "updated_at": "2026-10-07T13:50:49.288Z"
+      }
+    ],
+    "escrow": [
+      {
+        "status": "blocked",
+        "spicenet_cancel_tx_hash": null
+      }
+    ]
+  },
+  "repeat": {
+    "hash": "0x63d1be5b8952a38351d265874777d299b92790c14237e728684a0e7d452d353a"
+  },
+  "elapsedSeconds": 135.64,
+  "binarySha256": "4294fc360861bbae1fed82d33c2d91e92ffde91820224bf31603887fa2acd3da"
+}

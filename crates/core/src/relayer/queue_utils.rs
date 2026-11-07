@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tracing::warn;
 
 use crate::{
     app_state::AppState,
@@ -18,7 +19,25 @@ pub async fn start_relayer_queue(
     provider: &EvmProvider,
     chain_id: &ChainId,
 ) -> Result<(), HttpError> {
-    let current_nonce = provider.get_nonce(&relayer).await?;
+    let provider = provider.for_relayer(&relayer).map_err(|_| {
+        crate::shared::internal_server_error(Some(
+            "Fixed Base gateway configuration invalid".to_string(),
+        ))
+    })?;
+    let Some(provider) = provider else {
+        return Ok(());
+    };
+    let current_nonce = match provider.get_nonce(&relayer).await {
+        Ok(nonce) => nonce,
+        Err(error) if provider.is_isolated_limit_base() => {
+            warn!(
+                "Fixed Base gateway nonce unavailable for relayer {}; leaving queue offline: {}",
+                relayer.id, error
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     let network_config = state.network_configs.iter().find(|config| &config.chain_id == chain_id);
 
