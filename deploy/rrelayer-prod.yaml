@@ -100,3 +100,10 @@ networks:
     block_explorer_url: https://explorer.testnet.chain.robinhood.com/
     enable_sending_blobs: true
     allowed_random_relayers: "*"
+
+  - name: elysium-mainnet
+    chain_id: 99901
+    provider_urls:
+      - "https://elysium-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
+    allowed_random_relayers:
+      - "0x279B834717C32a6cbCe841F05434736c53457A21"
