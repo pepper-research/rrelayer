@@ -852,7 +852,7 @@ impl TransactionsQueues {
                                         ProcessInmempoolStatus::StillInmempool,
                                         self.relayer_block_times_ms
                                             .get(relayer_id)
-                                            .map(|&block_time| block_time / 10)
+                                            .map(|&block_time| (block_time / 10).max(250))
                                             .as_ref(),
                                     ));
                                 }
@@ -903,7 +903,7 @@ impl TransactionsQueues {
                                 ProcessInmempoolStatus::StillInmempool,
                                 self.relayer_block_times_ms
                                     .get(relayer_id)
-                                    .map(|&block_time| block_time / 10)
+                                    .map(|&block_time| (block_time / 10).max(250))
                                     .as_ref(),
                             ))
                         }
@@ -1049,5 +1049,208 @@ impl TransactionsQueues {
         } else {
             Err(ProcessMinedTransactionError::RelayerTransactionsQueueNotFound(*relayer_id))
         }
+    }
+}
+
+#[cfg(test)]
+mod receipt_poll_tests {
+    use super::super::transactions_queue::elysium_tests::Fixture;
+    use super::*;
+    use crate::transaction::types::TransactionHash;
+    use alloy::primitives::keccak256;
+    use serde_json::{json, Value};
+
+    async fn receipt_requests(requests: &Arc<Mutex<Vec<Value>>>) -> Vec<Value> {
+        requests
+            .lock()
+            .await
+            .iter()
+            .filter(|request| request["method"] == "eth_getTransactionReceipt")
+            .map(|request| request["params"][0].clone())
+            .collect()
+    }
+
+    fn receipt(hash: TransactionHash, address: crate::common_types::EvmAddress) -> Value {
+        json!({
+            "transactionHash": hash, "transactionIndex": "0x0",
+            "blockHash": format!("0x{}", "11".repeat(32)), "blockNumber": "0x1",
+            "from": address, "to": address, "contractAddress": null,
+            "cumulativeGasUsed": "0x5208", "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x64", "logs": [],
+            "logsBloom": format!("0x{}", "00".repeat(256)), "status": "0x1", "type": "0x4"
+        })
+    }
+
+    #[tokio::test]
+    async fn receipt_polling_deduplicates_original_preserves_competition_and_bounds_fast_chain_waits(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(url) =
+            std::env::var("RRELAYER_TEST_DATABASE_URL").ok().filter(|url| !url.is_empty())
+        else {
+            return Ok(());
+        };
+        // Isolate from the existing database concurrency test and its schema setup.
+        let mut isolated_url = reqwest::Url::parse(&url)?;
+        assert!(matches!(isolated_url.host_str(), Some("127.0.0.1" | "localhost" | "::1")));
+        let admin = PostgresClient::for_test_url(&url).await?;
+        let database = format!("receipt_poll_{}", uuid::Uuid::new_v4().simple());
+        admin.batch_execute(&format!("CREATE DATABASE \"{database}\"")).await?;
+        isolated_url.set_path(&format!("/{database}"));
+        let mut db = PostgresClient::for_test_url(isolated_url.as_str()).await?;
+        crate::schema::apply_schema(&db).await?;
+        let mut failures = Vec::new();
+
+        for (chain_id, block_time, expected_wait, capped) in [
+            (99901, 250, 250, false),
+            (1, 12_000, 1_200, false),
+            (99901, 250, 250, true),
+            (1, 12_000, 1_200, true),
+        ] {
+            db.batch_execute("UPDATE relayer.sender_deployment SET enabled=FALSE").await?;
+            let fixture = Fixture::new(chain_id, json!(null), 0).await;
+            if capped {
+                fixture.cache_gas_prices().await;
+            }
+            let requests = fixture.requests.clone();
+            let budget = fixture.budget.clone();
+            let queue = Arc::new(Mutex::new(fixture.queue));
+            let mut original = queue.lock().await.get_next_inmempool_transaction().await.unwrap();
+            if capped {
+                let sent_gas = GasPriceResult {
+                    max_fee: crate::gas::MaxFee::new(10),
+                    max_priority_fee: crate::gas::MaxPriorityFee::new(10),
+                    min_wait_time_estimate: None,
+                    max_wait_time_estimate: None,
+                };
+                assert!(queue.lock().await.is_at_max_gas_price_cap(&sent_gas).await);
+                original.sent_with_gas = Some(sent_gas);
+            }
+            let relayer_id = original.relayer_id;
+            db.execute("INSERT INTO relayer.record(id,name,chain_id,address,wallet_index) VALUES($1,'receipt-fixture',$2,$3,0)",
+                &[&relayer_id, &original.chain_id, &original.from]).await?;
+            db.save_transaction(&relayer_id, &original).await?;
+            if capped {
+                db.execute(
+                    "UPDATE relayer.transaction SET sent_at=NOW() WHERE id=$1",
+                    &[&original.id],
+                )
+                .await?;
+            }
+            let original_hash = original.known_transaction_hash.unwrap();
+            db.execute("INSERT INTO relayer.transaction_attempt(transaction_id,hash,signed_envelope,gas) VALUES($1,$2,''::bytea,'{}'::jsonb)",
+                &[&original.id, &original_hash]).await?;
+
+            assert!(queue.lock().await.receipt_for_competition(&db, &original).await?.is_none());
+            if receipt_requests(&requests).await != [json!(original_hash)] {
+                failures.push(format!(
+                    "single-hash lookup duplicated: chain={chain_id} capped={capped}"
+                ));
+            }
+
+            if chain_id == 99901 && !capped {
+                // An active snapshot's newer known hash must not be lost by deduplication.
+                requests.lock().await.clear();
+                let mut active = original.clone();
+                let newer_hash =
+                    TransactionHash::from_alloy_hash(&keccak256(b"newer receipt fixture"));
+                active.known_transaction_hash = Some(newer_hash);
+                assert!(queue.lock().await.receipt_for_competition(&db, &active).await?.is_none());
+                if receipt_requests(&requests).await != [json!(original_hash), json!(newer_hash)] {
+                    failures.push("active snapshot did not check each known hash once".to_string());
+                }
+
+                let mut competitor = original.clone();
+                competitor.id = TransactionId::new();
+                let competitor_hash =
+                    TransactionHash::from_alloy_hash(&keccak256(b"competitor receipt fixture"));
+                competitor.known_transaction_hash = Some(competitor_hash);
+                db.save_competitor(&original.id, &competitor).await?;
+                queue
+                    .lock()
+                    .await
+                    .add_competitor_to_inmempool_transaction(
+                        &original.id,
+                        competitor.clone(),
+                        super::super::types::CompetitionType::Replace,
+                    )
+                    .await?;
+
+                requests.lock().await.clear();
+                budget
+                    .lock()
+                    .await
+                    .receipts
+                    .insert(original_hash.hex(), receipt(original_hash, original.from));
+                let (winner, _) =
+                    queue.lock().await.receipt_for_competition(&db, &competitor).await?.unwrap();
+                assert_eq!(winner.id, original.id);
+                assert_eq!(receipt_requests(&requests).await, [json!(original_hash)]);
+
+                requests.lock().await.clear();
+                budget.lock().await.receipts.clear();
+                budget
+                    .lock()
+                    .await
+                    .receipts
+                    .insert(competitor_hash.hex(), receipt(competitor_hash, competitor.from));
+                let (winner, _) =
+                    queue.lock().await.receipt_for_competition(&db, &competitor).await?.unwrap();
+                assert_eq!(winner.id, competitor.id);
+                assert_eq!(
+                    receipt_requests(&requests).await,
+                    [json!(original_hash), json!(competitor_hash)]
+                );
+                budget.lock().await.receipts.clear();
+            }
+
+            requests.lock().await.clear();
+            let release = crate::sender_handoff::release_id();
+            db.execute(
+                "UPDATE relayer.sender_deployment SET enabled=TRUE,active_release=$1",
+                &[&release],
+            )
+            .await?;
+            let mut queues = TransactionsQueues {
+                queues: HashMap::from([(relayer_id, queue)]),
+                relayer_block_times_ms: HashMap::from([(relayer_id, block_time)]),
+                gas_oracle_cache: Arc::new(Mutex::new(GasOracleCache::new())),
+                blob_gas_oracle_cache: Arc::new(Mutex::new(BlobGasOracleCache::new())),
+                db,
+                cache: Arc::new(Cache::new().await),
+                webhook_manager: None,
+                safe_proxy_manager: Arc::new(SafeProxyManager::new(vec![])),
+            };
+            let result = queues.process_single_inmempool(&relayer_id).await?;
+            assert_eq!(result.status, ProcessInmempoolStatus::StillInmempool);
+            if result.process_again_after != expected_wait {
+                failures.push(format!("receipt wait: chain={chain_id} capped={capped} actual={} expected={expected_wait}", result.process_again_after));
+            }
+            assert!(!requests
+                .lock()
+                .await
+                .iter()
+                .any(|request| request["method"] == "eth_sendRawTransaction"));
+            db = queues.db;
+        }
+        drop(db);
+        // Owned pools and sender guards close normally; never terminate database clients.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let clients: i64 = admin
+                .query_one("SELECT COUNT(*) FROM pg_stat_activity WHERE datname=$1", &[&database])
+                .await?
+                .get(0);
+            if clients == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "receipt fixture database still has owned clients"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        admin.batch_execute(&format!("DROP DATABASE \"{database}\"")).await?;
+        assert!(failures.is_empty(), "receipt regressions: {failures:?}");
+        Ok(())
     }
 }

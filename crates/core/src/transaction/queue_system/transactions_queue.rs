@@ -1171,6 +1171,16 @@ impl TransactionsQueue {
 
         let block_gas_limit = self.evm_provider.block_gas_limit().await?;
         let estimated_gas = bounded_gas_estimate(estimated_gas_result, block_gas_limit, is_noop)?;
+        self.evm_provider
+            .validate_estimated_gas(transaction_request, &self.relayer.address, estimated_gas)
+            .await
+            .inspect_err(|error| {
+                error!(
+                    "rrelayer_final_gas_validation_failed {} provider_error={}",
+                    tx_context,
+                    compact_rpc_error(error)
+                );
+            })?;
         if !is_noop {
             info!(
                 "rrelayer_gas_estimate_ok {} base_gas={} final_gas={} max_buffer_pct=20 block_gas_limit={}",
@@ -1515,6 +1525,16 @@ impl TransactionsQueue {
                 })?;
             (tx_request, None)
         };
+        // Cached gas may be reused with fresh fee prices. Validate the envelope
+        // that is about to be signed; durable-attempt recovery returns above.
+        self.evm_provider
+            .validate_estimated_gas(
+                &transaction_request,
+                &self.relayer.address,
+                estimated_gas_limit,
+            )
+            .await
+            .map_err(TransactionQueueSendTransactionError::TransactionEstimateGasError)?;
         info!("rrelayer_send_network {}", transaction_context(&working_transaction, &self.relayer));
 
         let (bytes, hash) =
@@ -1602,7 +1622,7 @@ impl TransactionsQueue {
         active: &Transaction,
     ) -> Result<Option<(Transaction, AnyTransactionReceipt)>, RpcError<TransportErrorKind>> {
         let competition = self.inmempool_transactions.lock().await.front().cloned();
-        if let Some(competition) = competition {
+        if let Some(competition) = competition.filter(|item| item.original.id != active.id) {
             if let Some(receipt) = self.receipt_for_transaction(db, &competition.original).await? {
                 return Ok(Some((competition.original, receipt)));
             }
@@ -1873,3 +1893,7 @@ mod pending_order_tests {
         assert!(empty.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "elysium_tests.rs"]
+pub(super) mod elysium_tests;
