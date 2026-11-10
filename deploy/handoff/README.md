@@ -48,6 +48,20 @@ API's durable send journal performs lookup before recovery instead of repeating
 an ambiguous POST. Deploying this relayer alone does not fix older API timeout
 or refund behavior.
 
+`GET /transactions/:id/prebroadcast-failure` returns either `null` or
+`{ "kind": "terminal_prebroadcast_v1", "transaction": <original transaction> }`.
+It requires enabled sender fencing, a UUID-keyed request originally persisted
+as FAILED before signing/queueing, no signed attempt or attempted audit history,
+no competing external-ID row, and unchanged payload. It bypasses the status
+cache. The existing keyed endpoint cannot restart such a rejection, including
+after refill/restart. FAILED or an absent hash alone does not establish this
+proof. Deploy this endpoint before the API's accelerated reservation recovery;
+the API still owns exact request binding, stopped execution, payout checks and
+the native signed cancellation window. No rollup/contract policy changes.
+
+`scripts/test-idempotent-submission.mjs` covers the proof using real local
+PostgreSQL/Anvil, including auth, refill/restart and attempted-history refusal.
+
 Automatic top-up configurations are rejected at startup before database or
 background work. Their current periodic producers create independent requests
 per process and are not safe under overlap. The checked production/dev YAML
@@ -234,3 +248,87 @@ Run as an unprivileged user; all listeners are loopback. This is a dev-host
 rehearsal using a controlled local chain, **not** ECS/ALB, the shared live dev
 stack, or full downstream settlement acceptance. It cannot satisfy those
 production-promotion checks.
+
+
+## Isolated restricted Base qualification
+
+The restricted lane remains Base 8453, normal wallet index 0 (not private-key
+mode). By default its signer and gateway are the existing production values;
+`RRELAYER_LIMIT_RPC_GATEWAY_ENABLED=true` is still required to start its queue.
+The configuration is validated and frozen when providers load; changing it
+requires a process restart.
+
+For an isolated deployment set **both**:
+
+- `RRELAYER_LIMIT_RPC_SIGNER_ADDRESS`: the controlled normal wallet 0 address.
+- `RRELAYER_LIMIT_RPC_GATEWAY_URL`: the isolated API endpoint ending in
+  `/internal/orders/base-rpc`.
+
+A partial pair, production signer in an override, production gateway host in an
+override, zero/invalid address, URL credentials/query/fragment or wrong path
+fails startup. The URL must use HTTPS, except literal loopback IPs may use HTTP
+for local process tests. Gateway requests do not follow redirects. This does not
+replace network/custody isolation: operators must use a separate database,
+controlled signer and dedicated credentials, and verify the actual endpoint and
+signer's ownership. Do not redirect production DNS or copy production secrets.
+
+Set the isolated API's existing `LIMIT_ORDER_BASE_RELAYER_ADDRESS` to the same
+address and its relayer ID/chain settings to that actual relayer and 8453.
+The existing relayer `RRELAYER_AUTH_USERNAME`/`RRELAYER_AUTH_PASSWORD` must match
+the isolated API's `RELAYER_USER`/`RELAYER_PASS`. Use its supported pinned dev
+`LIMIT_ORDER_BASE_RPC_URL` for real Base acceptance. Existing gateway envelope,
+signer, budget and transaction-debit checks remain unchanged. Release spending
+policy does not override gateway product policy.
+
+The provider and cancel/replace/random-send checks share the configured signer.
+A relayer record with a different address remains offline; ordinary Base RPC is
+never a fallback for this lane. Use the explicit relayer-ID `/send` route, not
+random or chain-scoped `/send-idempotent`, which intentionally exclude it.
+
+### Local fault rehearsal
+
+Use a frozen tx-submission-api source snapshot with its installed dependencies,
+not another session's mutable source tree. Record the API commit and source
+hashes. No package installation or live credentials are required when reusing
+an existing matching dependency tree. With PostgreSQL 16, Anvil, cast and Bun:
+
+```sh
+cargo build --locked -p rrelayer_cli
+cargo test --locked -p rrelayer_core provider:: --lib
+python3 scripts/handoff/test_restricted_base.py \
+  --binary "$PWD/target/debug/rrelayer_cli" \
+  --api-snapshot /absolute/frozen-api-snapshot \
+  --out /absolute/disposable-test-directory
+```
+
+The fixture runs a local 8453 chain and PostgreSQL with a public test mnemonic,
+imports the real API gateway/guard/forwarder/meter, and prevents non-loopback
+HTTP in that gateway process. Its budget reservation store is deterministic
+fault injection, **not** acceptance of SQL budget accounting or the approved
+Alchemy transport. It tests signer/auth/envelope rejection, queue readiness,
+wrong signer isolation, route restrictions, no direct-provider fallback,
+pre-forward rejection, restart recovery, uncertain forwarding with hidden
+receipts, original signed bytes, exactly-once on-chain effects and redirects.
+It stops its child processes and removes its temporary database on exit. Never
+fund the public test mnemonic on a real chain.
+
+Run the ordinary handoff restart-gap and failed-attempt-nonce-reservation cases
+as well; those are a separate lane and must not be replaced by this rehearsal.
+
+### Release and rollback integration
+
+This is a runtime change on PR17's existing line. Publish the complete candidate
+through that PR, then qualify the exact resulting immutable image. The prior
+391025a checks are historical evidence, not acceptance of the new runtime.
+PR7 may use a newly qualified protocol 1 artifact as its rollback; the old b6
+artifact remains invalid for restart-gap recovery. PR9 must accept its actual
+combined deployment tree, which inherits this lane from its target.
+
+The existing release owner still owes exact-image ECS handoff/failure/rollback,
+restricted Base live transport, supported blob/EIP7702 and downstream
+settlement/latest-client checks. Keep production configuration at its defaults
+and verify override variables are absent before promotion. Never roll back an
+active protocol 1 deployment to protocol 0 or overlap senders. API167 requires
+verified PR17 activation; API115/UI224 require verified nonce-safe activation.
+A passing local fixture removes the configuration limitation on the new source;
+it does not mark any dependency shipped or waive these acceptance obligations.

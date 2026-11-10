@@ -7,6 +7,33 @@ use crate::{
 };
 
 impl PostgresClient {
+    pub async fn get_prebroadcast_failure(
+        &self,
+        id: &TransactionId,
+    ) -> Result<Option<Transaction>, PostgresError> {
+        let row = self.query_one_or_none(
+            "SELECT t.* FROM relayer.transaction t
+             WHERE t.id=$1 AND t.external_id=t.id::text AND t.status='FAILED'
+               AND NOT t.broadcast_attempted AND t.hash IS NULL
+               AND t.gas_limit IS NULL AND t.signed_envelope IS NULL
+               AND t.sent_at IS NULL AND t.mined_at IS NULL AND t.confirmed_at IS NULL
+               AND t.cancelled_by_transaction_id IS NULL AND t.competition_kind IS NULL
+               AND EXISTS (SELECT 1 FROM relayer.sender_deployment WHERE singleton AND enabled)
+               AND NOT EXISTS (SELECT 1 FROM relayer.transaction_attempt a WHERE a.transaction_id=t.id)
+               AND NOT EXISTS (SELECT 1 FROM relayer.transaction other WHERE other.external_id=t.external_id AND other.id<>t.id)
+               AND EXISTS (SELECT 1 FROM relayer.transaction_audit_log a WHERE a.id=t.id)
+               AND NOT EXISTS (SELECT 1 FROM relayer.transaction_audit_log a WHERE a.id=t.id AND (
+                   a.status<>'FAILED' OR a.broadcast_attempted OR a.hash IS NOT NULL
+                   OR a.gas_limit IS NOT NULL OR a.signed_envelope IS NOT NULL
+                   OR a.sent_at IS NOT NULL OR a.mined_at IS NOT NULL OR a.confirmed_at IS NOT NULL
+                   OR a.external_id IS DISTINCT FROM t.external_id OR a.chain_id<>t.chain_id
+                   OR a.\"from\"<>t.\"from\" OR a.\"to\"<>t.\"to\" OR a.value<>t.value
+                   OR a.data IS DISTINCT FROM t.data OR a.authorization_list IS DISTINCT FROM t.authorization_list))",
+            &[id],
+        ).await?;
+        Ok(row.map(|row| build_transaction_from_transaction_view(&row)))
+    }
+
     pub async fn get_fixed_signed_envelope(
         &self,
         id: &TransactionId,

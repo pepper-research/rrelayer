@@ -9,6 +9,7 @@ use crate::app_state::AppState;
 
 mod cancel_transaction;
 pub use cancel_transaction::CancelTransactionResponse;
+mod get_prebroadcast_failure;
 mod get_relayer_transactions;
 mod get_transaction_by_external_id;
 mod get_transaction_by_id;
@@ -34,6 +35,7 @@ pub fn create_transactions_routes() -> Router<Arc<AppState>> {
             get(get_transaction_by_external_id::get_transaction_by_external_id_api),
         )
         .route("/:id", get(get_transaction_by_id::get_transaction_by_id_api))
+        .route("/:id/prebroadcast-failure", get(get_prebroadcast_failure::get_prebroadcast_failure))
         .route("/status/:id", get(get_transaction_status::get_transaction_status))
         .route("/relayers/:relayer_id/send", post(send_transaction::handle_send_transaction))
         .route(

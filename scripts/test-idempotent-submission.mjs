@@ -227,13 +227,36 @@ try {
   const replay = await request(endpoint, transfer);
   assert.equal(replay.status, 200);
   assert.equal(replay.body.id, id);
+  assert.equal((await request(`/transactions/${id}/prebroadcast-failure`)).body, null);
+  await rpc("anvil_setBalance", ["0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266", "0x0"]);
+  const rejected = { ...transfer, externalId: randomUUID() };
+  assert.equal((await request(endpoint, rejected)).status, 500);
+  const failurePath = `/transactions/${rejected.externalId}/prebroadcast-failure`;
+  assert.equal((await request(failurePath, undefined, false)).status, 401);
+  const proof = await request(failurePath);
+  assert.equal(proof.status, 200, JSON.stringify(proof));
+  assert.equal(proof.body.kind, "terminal_prebroadcast_v1");
+  assert.equal(proof.body.transaction.id, rejected.externalId);
+  assert.equal(proof.body.transaction.status, "FAILED");
+  assert.equal(proof.body.transaction.txHash, undefined);
+  // Refilling the sender cannot revive the same rejected key, even after restart.
+  await rpc("anvil_setBalance", ["0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266", "0x100000000000000000000000000000000000000000000"]);
+  await stop(server);
+  server = await start(binary, ["start", "--path", fixture], env);
+  await until(async () => (await request("/health")).status === 200);
+  assert.equal((await request(endpoint, rejected)).status, 400);
+  assert.deepEqual((await request(failurePath)).body, proof.body);
+  // The immutable history, not just today's missing hash, controls the proof.
+  execFileSync(process.env.PSQL_BIN ?? "psql", [database, "-v", "ON_ERROR_STOP=1", "-c",
+    `UPDATE relayer.transaction_audit_log SET broadcast_attempted=TRUE WHERE id='${rejected.externalId}'`]);
+  assert.equal((await request(failurePath)).body, null);
   await sleep(1500);
   assert.equal(
     BigInt(await rpc("eth_getBalance", [destination, "latest"])) - before,
     1000000n,
   );
   console.log(
-    "PASS: 12 concurrent submissions across two server processes, repeated acceptance, process restart, payload mismatch, auth; one native transfer",
+    "PASS: concurrent keyed submissions, restart, mismatch, auth, terminal prebroadcast proof, refill cannot revive rejection, attempted history refuses proof; one native transfer",
   );
 } catch (error) {
   // Only task-owned processes and public local fixture identities reach these logs.

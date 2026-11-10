@@ -107,3 +107,27 @@ before build/publication because `rrelayer-dev-gha` trusts only the
 trust policy was changed and no branch was merged to bypass it. The API109 full
 parent gate also retains five original non-7702 failures. Those limitations
 remain separate prerequisites; local-chain results do not waive them.
+
+
+## Restricted Base configuration — local verification, 2026-11-07
+
+Prepared on PR17 base `391025a7335f67e9cae4a6f6611f93009433ed46`.
+Debug CLI (locked dependencies, debug symbols disabled) SHA256:
+`d927619ce038032e5bb240380a7502ffde35d893865751f0d4b9cf3dad3fcb1e`.
+API gateway snapshot: `c431293343acc6a46d38ef3b75ff079e05d9dd7a`.
+
+Passed: 33 core tests including the normally ignored Anvil resend case;
+20 existing handoff scenarios including restart-gap and attempted-nonce
+reservation; 12 deployment-controller tests; the idempotent submission and
+terminal-prebroadcast proof process regression; strict Clippy and rustfmt.
+The new restricted Base process rehearsal passed signer/auth/envelope rejection,
+configured queue activation, mismatch isolation, route restrictions, pre-forward
+rejection with no ordinary-RPC fallback, original-envelope restart, lost-response
+reconciliation without duplicates and redirect refusal. Two local zero-value
+transactions mined at nonces 0 and 1 through the real API gateway code.
+
+The gateway's SQL budget store and approved remote transport were not exercised:
+the local fixture uses deterministic budget reservations and Anvil8453.
+No funded action, deployment, production signer access or release acceptance
+occurred. Runtime defaults and original gateway policies remain; see the
+isolated qualification instructions and outstanding promotion checks in README.
