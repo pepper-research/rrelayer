@@ -104,8 +104,25 @@ requests remain durable while processing is unavailable.
 
 Both dev and production build workflows only build and export an immutable candidate. Each tag is
 SHA/run-specific; the rendered definition pins the image digest and
-`RRELAYER_RELEASE_ID`. It does not update ECS. Register the reviewed task
-definition through the release process and supply its ARN to the controller:
+`RRELAYER_RELEASE_ID`. It does not update ECS.
+
+For a pre-merge production image build, keep the workflow on its trusted branch
+and select the reviewed source commit explicitly:
+
+```sh
+gh workflow run deploy-prod.yml --repo pepper-research/rrelayer \
+  --ref feature/7702-support \
+  -f source_revision=FULL_40_CHARACTER_LOWERCASE_SHA
+```
+
+The workflow ref supplies the workflow and its existing OIDC identity. The
+optional source revision selects the checkout; the verified checkout SHA identifies
+the image, release ID and candidate artifacts. Without that input, the workflow
+uses its own commit. This only builds and exports a candidate with `accepted:false`;
+it does not register a task definition, start a task or activate a sender.
+
+Register the reviewed task definition through the release process and supply its ARN
+to the controller:
 
 ```sh
 python3 deploy/handoff/promote.py \
