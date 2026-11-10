@@ -368,6 +368,87 @@ SCENARIOS={'authorization_handoff':authorization_handoff,'inmem_replacement':inm
 
 LEGACY={'legacy_control':legacy_control,'legacy_bootstrap':legacy_bootstrap}
 
+def restart_gap_below_loaded_row_no_gap_rejection(ctx):
+    startup(ctx)
+    ctx.kill_rr('old')
+    ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
+    # The standby admits without broadcasting. Model three terminal prebroadcast
+    # failures followed by a durable request at nonce 3, using the real fence.
+    admitted = [send(ctx, 'new', 201000 + i) for i in range(4)]
+    ctx.stop_rr('new')
+    failed_ids = ','.join("'" + tx['id'] + "'" for tx in admitted[:3])
+    ctx.pg.psql(ctx.dbname, f"""
+        BEGIN;
+        SELECT set_config('rrelayer.sender_token', token, true)
+        FROM relayer.sender_owner WHERE chain_id={lab.CHAIN_ID}
+          AND signer=decode('{ctx.relayer[2:]}','hex');
+        UPDATE relayer.transaction SET status='FAILED', failed_reason='fixture: prebroadcast failure'
+        WHERE id IN ({failed_ids}) AND NOT broadcast_attempted;
+        COMMIT;
+    """)
+    assert all(ctx.rows()[tx['id']]['status'] == 'FAILED' for tx in admitted[:3])
+    # Let Anvil queue future nonces, as Base/geth do, instead of rejecting gaps.
+    ctx.lab('/lab/sender', {'address': None})
+    ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
+    activate(ctx, 'new', 'old')
+    held = admitted[3]
+    assert lab.wait_until(lambda: ctx.rows()[held['id']]['status'] == 'INMEMPOOL', 15)
+    original = ctx.rows()[held['id']].copy()
+    assert original['nonce'] == 3 and ctx.onchain_nonce() == 0, ctx.rows()
+    attempts_sql = f"SELECT encode(hash,'hex') FROM relayer.transaction_attempt WHERE transaction_id='{held['id']}'"
+    original_attempts = set(ctx.pg.psql(ctx.dbname, attempts_sql, tuples_only=True).splitlines())
+    assert original_attempts
+    ctx.kill_rr('new')
+    ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
+    fillers = [send(ctx, 'new', 202000 + i) for i in range(3)]
+    rows = ctx.rows()
+    assert [rows[tx['id']]['nonce'] for tx in fillers] == [0, 1, 2], rows
+    done(ctx, [held, *fillers])
+    rows = ctx.rows()
+    assert rows[held['id']]['nonce'] == original['nonce'], rows
+    # A previously persisted fee bump may lose to the earlier attempt. Preserve
+    # all attempts and report the actual mined hash, not whichever was last sent.
+    attempts = set(ctx.pg.psql(ctx.dbname, attempts_sql, tuples_only=True).splitlines())
+    assert original_attempts <= attempts
+    assert rows[held['id']]['hash'][2:] in attempts, rows
+    assert all(rows[tx['id']]['status'] == 'FAILED' for tx in admitted[:3]), rows
+    tail = send(ctx, 'new', 202003)
+    assert ctx.rows()[tail['id']]['nonce'] == 4, ctx.rows()
+    done(ctx, [tail])
+    return check_money(ctx, [held, *fillers, tail])
+
+
+def failed_attempt_keeps_nonce_reserved(ctx):
+    startup(ctx)
+    ctx.kill_rr('old')
+    ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
+    admitted = [send(ctx, 'new', 203000 + i) for i in range(4)]
+    ctx.stop_rr('new')
+    failed_ids = ','.join("'" + tx['id'] + "'" for tx in admitted[:3])
+    # A FAILED status alone is not proof that its nonce is reusable. Nonce 1
+    # represents an unresolved historical broadcast; only 0 and 2 are free.
+    ctx.pg.psql(ctx.dbname, f"""
+        BEGIN;
+        SELECT set_config('rrelayer.sender_token', token, true)
+        FROM relayer.sender_owner WHERE chain_id={lab.CHAIN_ID}
+          AND signer=decode('{ctx.relayer[2:]}','hex');
+        UPDATE relayer.transaction SET status='FAILED',
+          broadcast_attempted=(id='{admitted[1]['id']}')
+        WHERE id IN ({failed_ids});
+        COMMIT;
+    """)
+    ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
+    fillers = [send(ctx, 'new', 204000 + i) for i in range(3)]
+    rows = ctx.rows()
+    assert [rows[tx['id']]['nonce'] for tx in fillers] == [0, 2, 4], rows
+    assert [rows[tx['id']]['nonce'] for tx in admitted] == [0, 1, 2, 3], rows
+    assert not ctx.chain_scan(), 'Standby must not broadcast fixture transactions'
+    return {'rows': rows, 'reservedAttemptNonce': 1}
+
+
+SCENARIOS['restart_gap_below_loaded_row_no_gap_rejection'] = restart_gap_below_loaded_row_no_gap_rejection
+SCENARIOS['failed_attempt_keeps_nonce_reserved'] = failed_attempt_keeps_nonce_reserved
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--binary',required=True);p.add_argument('--baseline');p.add_argument('--out',required=True);p.add_argument('--scenarios',default=','.join(SCENARIOS));args=p.parse_args();SCENARIOS.update(LEGACY)
     out=Path(args.out).resolve();out.mkdir(parents=True,exist_ok=True)

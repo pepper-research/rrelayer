@@ -13,7 +13,9 @@ try:
  snapshot=Path(a.api_snapshot).resolve();dbname='api_boundary';pg.createdb(dbname)
  pg.psql(dbname,(snapshot/'test/pg/fixtures/base-schema.sql').read_text())
  env=dict(os.environ,DATABASE_URL=f'postgres://postgres@127.0.0.1:{lab.PORTS["pg"]}/{dbname}',HANDOFF_API_SNAPSHOT=str(snapshot),HANDOFF_API_PORT=os.environ.get('HANDOFF_API_PORT','13002'),RELAYER_URL=ctx.rr['new']['api'],RELAYER_USER=lab.AUTH_USER,RELAYER_PASS=lab.AUTH_PASS,SOLVER_PRIVATE_KEY=lab.cast('wallet','private-key','--mnemonic',lab.MNEMONIC,'--mnemonic-index','0'),NODE_ENV='production')
- for chain in [97,4114,5115,8453,1,10143,4663,56,137,143,42161,43113,80002,84532,421614,688688,688689,46630,11155111,11155420,123420001114]:env[f'RPC_URL_{chain}']=ctx.anvil_url
+ # The API now observes receipts independently of relayer status. Its reads
+ # must cross the same lost-response boundary as the sender's receipt reads.
+ for chain in [97,4114,5115,8453,1,10143,4663,56,137,143,42161,43113,80002,84532,421614,688688,688689,46630,11155111,11155420,123420001114]:env[f'RPC_URL_{chain}']=ctx.proxy_url
  here=Path(__file__).resolve().parent
  worker=lab.spawn('api-boundary',['node','--import',str(here/'egress-guard.mjs'),'--import',str(snapshot/'node_modules/tsx/dist/loader.mjs'),str(here/'api-boundary-worker.mjs')],str(out/'api-worker.log'),env=env,cwd=str(snapshot))
  url='http://127.0.0.1:'+env['HANDOFF_API_PORT']

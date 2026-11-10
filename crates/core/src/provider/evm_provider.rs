@@ -1,3 +1,4 @@
+use super::limit_base::limit_base_config;
 use crate::gas::{FallbackGasFeeEstimator, BLOB_GAS_PER_BLOB};
 use crate::provider::layer_extensions::RpcLoggingLayer;
 use crate::relayer::Relayer;
@@ -51,21 +52,20 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 pub type RelayerProvider = Box<dyn Provider<AnyNetwork> + Send + Sync>;
-const LIMIT_BASE_RPC_GATEWAY: &str =
-    "https://tx-submission-api.spicenet.io/internal/orders/base-rpc";
-const LIMIT_BASE_WALLET: &str = "0x43558ebdCfEb6EeD08f636fa515e221a4755e0d4";
-
 pub fn is_limit_base_relayer(relayer: &Relayer) -> bool {
     relayer.chain_id.u64() == 8453 && relayer.wallet_index == 0 && !relayer.is_private_key
 }
 
 pub fn is_limit_base_address(chain_id: &ChainId, address: &EvmAddress) -> bool {
-    chain_id.u64() == 8453 && address.to_string().eq_ignore_ascii_case(LIMIT_BASE_WALLET)
+    // Invalid configuration cannot expose a restricted address through a public route.
+    chain_id.u64() == 8453
+        && limit_base_config().map_or(true, |config| config.matches(chain_id, address))
 }
 
 #[cfg(test)]
 mod gateway_selection_tests {
-    use super::{is_limit_base_address, is_limit_base_relayer, LIMIT_BASE_WALLET};
+    use super::is_limit_base_relayer;
+    use crate::provider::limit_base::PRODUCTION_WALLET;
     use crate::{
         network::ChainId,
         relayer::{Relayer, RelayerId},
@@ -74,7 +74,7 @@ mod gateway_selection_tests {
 
     #[test]
     fn selects_only_fixed_base_normal_wallet_zero() {
-        let address: EvmAddress = LIMIT_BASE_WALLET.parse().unwrap();
+        let address: EvmAddress = PRODUCTION_WALLET.parse().unwrap();
         let mut relayer = Relayer {
             id: RelayerId::new(),
             name: "fixed".to_string(),
@@ -89,7 +89,6 @@ mod gateway_selection_tests {
             is_private_key: false,
         };
         assert!(is_limit_base_relayer(&relayer));
-        assert!(is_limit_base_address(&relayer.chain_id, &relayer.address));
         relayer.is_private_key = true;
         assert!(!is_limit_base_relayer(&relayer));
         relayer.wallet_index = -1;
@@ -100,7 +99,6 @@ mod gateway_selection_tests {
         relayer.wallet_index = 0;
         relayer.chain_id = ChainId::new(1);
         assert!(!is_limit_base_relayer(&relayer));
-        assert!(!is_limit_base_address(&relayer.chain_id, &relayer.address));
     }
 }
 
@@ -188,7 +186,7 @@ pub async fn create_retry_client(rpc_url: &str) -> Result<Arc<RelayerProvider>, 
     Ok(Arc::new(Box::new(provider)))
 }
 
-fn create_limit_base_gateway_client() -> Result<Arc<RelayerProvider>, RetryClientError> {
+fn create_limit_base_gateway_client(url: Url) -> Result<Arc<RelayerProvider>, RetryClientError> {
     let username = std::env::var("RRELAYER_AUTH_USERNAME")
         .map_err(|_| RetryClientError::GatewayConfiguration)?;
     let password = std::env::var("RRELAYER_AUTH_PASSWORD")
@@ -202,10 +200,11 @@ fn create_limit_base_gateway_client() -> Result<Arc<RelayerProvider>, RetryClien
         HeaderValue::from_str(&auth).map_err(|_| RetryClientError::GatewayConfiguration)?;
     authorization.set_sensitive(true);
     headers.insert(AUTHORIZATION, authorization);
-    let client =
-        Client::builder().default_headers(headers).timeout(Duration::from_secs(15)).build()?;
-    let url =
-        Url::parse(LIMIT_BASE_RPC_GATEWAY).map_err(|_| RetryClientError::GatewayConfiguration)?;
+    let client = Client::builder()
+        .default_headers(headers)
+        .redirect(alloy::transports::http::reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+        .build()?;
     let http = Http::with_client(client, url);
     // This lane has one physical attempt per call. The gateway owns budget and
     // the queue applies its own bounded cooldown without changing ordinary RPC.
@@ -375,17 +374,18 @@ impl EvmProvider {
         if !is_limit_base_relayer(relayer) {
             return Ok(Some(self.clone()));
         }
-        if !relayer.address.to_string().eq_ignore_ascii_case(LIMIT_BASE_WALLET) {
+        let config = limit_base_config().map_err(|_| RetryClientError::GatewayConfiguration)?;
+        if !config.matches(&relayer.chain_id, &relayer.address) {
             return Err(RetryClientError::GatewayConfiguration);
         }
-        if std::env::var("RRELAYER_LIMIT_RPC_GATEWAY_ENABLED").as_deref() != Ok("true") {
+        if !config.enabled {
             return Ok(None);
         }
-        let client = create_limit_base_gateway_client()?;
+        let client = create_limit_base_gateway_client(config.gateway.clone())?;
         let mut isolated = self.clone();
         isolated.rpc_clients = vec![client.clone()];
         isolated.gas_estimator = Arc::new(FallbackGasFeeEstimator::new(client));
-        isolated.provider_urls = vec![LIMIT_BASE_RPC_GATEWAY.to_string()];
+        isolated.provider_urls = vec![config.gateway.to_string()];
         isolated.blocks_every = isolated.blocks_every.max(1_000);
         isolated.isolated_limit_base = true;
         Ok(Some(isolated))

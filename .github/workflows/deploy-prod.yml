@@ -2,6 +2,11 @@ name: Build rrelayer production candidate
 
 on:
   workflow_dispatch:
+    inputs:
+      source_revision:
+        description: Optional full lowercase source commit SHA
+        required: false
+        type: string
   push:
     branches:
       - feature/7702-support
@@ -26,8 +31,39 @@ jobs:
     timeout-minutes: 90
 
     steps:
+      - name: Resolve image source
+        id: requested-source
+        env:
+          REQUESTED_SOURCE_REVISION: ${{ inputs.source_revision }}
+          WORKFLOW_SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          python3 - <<'PYTHON'
+          import os, re
+          source = os.environ.get('REQUESTED_SOURCE_REVISION', '') or os.environ['WORKFLOW_SOURCE_REVISION']
+          if not re.fullmatch(r'[0-9a-f]{40}', source):
+              raise SystemExit('Source revision must be a full lowercase commit SHA')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'sha={source}\n')
+          PYTHON
+
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.requested-source.outputs.sha }}
+
+      - name: Verify checked out source
+        id: checked-source
+        env:
+          EXPECTED_SOURCE_REVISION: ${{ steps.requested-source.outputs.sha }}
+        run: |
+          python3 - <<'PYTHON'
+          import os, re, subprocess
+          source = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          if not re.fullmatch(r'[0-9a-f]{40}', source) or source != os.environ['EXPECTED_SOURCE_REVISION']:
+              raise SystemExit('Checked out source does not match the requested commit')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'sha={source}\n')
+          PYTHON
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -52,9 +88,9 @@ jobs:
           push: true
           build-args: |
             RRELAYER_CONFIG=deploy/rrelayer-prod.yaml
-            SOURCE_REVISION=${{ github.sha }}
+            SOURCE_REVISION=${{ steps.checked-source.outputs.sha }}
           tags: |
-            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}-${{ github.run_id }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.checked-source.outputs.sha }}-${{ github.run_id }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -66,13 +102,13 @@ jobs:
           container-name: ${{ env.ECS_CONTAINER_NAME }}
           image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}@${{ steps.build-image.outputs.digest }}
           environment-variables: |
-            RRELAYER_RELEASE_ID=${{ github.sha }}
+            RRELAYER_RELEASE_ID=${{ steps.checked-source.outputs.sha }}
 
       # Deployment consumes the same digest after dev acceptance. Merging source
       # must never start a second, unverified sender or bypass legacy bootstrap.
       - name: Save promotion identity
         env:
-          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ steps.checked-source.outputs.sha }}
           IMAGE_DIGEST: ${{ steps.build-image.outputs.digest }}
           TASK_FILE: ${{ steps.render-task.outputs.task-definition }}
         run: |
@@ -84,7 +120,7 @@ jobs:
           PYTHON
       - uses: actions/upload-artifact@v4
         with:
-          name: rrelayer-candidate-${{ github.sha }}
+          name: rrelayer-candidate-${{ steps.checked-source.outputs.sha }}
           path: |
             candidate.json
             candidate-task-definition.json
