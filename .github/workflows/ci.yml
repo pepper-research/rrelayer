@@ -18,6 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Validate image source selection
+        run: python3 -m unittest discover -s deploy -p 'test_image_source.py'
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Toolchain file bug workaround: https://github.com/dtolnay/rust-toolchain/issues/153
