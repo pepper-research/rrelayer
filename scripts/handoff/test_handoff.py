@@ -438,14 +438,96 @@ def failed_attempt_keeps_nonce_reserved(ctx):
         COMMIT;
     """)
     ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
-    fillers = [send(ctx, 'new', 204000 + i) for i in range(3)]
+    filler = send(ctx, 'new', 204000)
+    # The original uncertain nonce remains reserved, but we must not sign above
+    # that terminal-only gap. The earlier free nonce is still usable.
+    key = str(uuid.uuid4())
+    code, result = lab.http('POST', ctx.rr['new']['api']+f'/transactions/relayers/{lab.CHAIN_ID}/send-idempotent',
+        {'to':lab.SINK,'value':hex(204001),'data':'0x','externalId':key}, auth=True)
+    assert code == 503 and 'terminal history' in str(result), (code, result)
     rows = ctx.rows()
-    assert [rows[tx['id']]['nonce'] for tx in fillers] == [0, 2, 4], rows
+    assert rows[filler['id']]['nonce'] == 0 and key not in rows, rows
     assert [rows[tx['id']]['nonce'] for tx in admitted] == [0, 1, 2, 3], rows
     assert not ctx.chain_scan(), 'Standby must not broadcast fixture transactions'
     return {'rows': rows, 'reservedAttemptNonce': 1}
 
 
+def legacy_nonce_gap_recovery(ctx, delegated=False):
+    startup(ctx)
+    if delegated:
+        delegate = "0x000000000000000000000000000000000000beef"
+        lab.rpc(ctx.anvil_url, "anvil_setCode", [delegate, "0x00"])
+        lab.rpc(ctx.anvil_url, "anvil_setCode", [ctx.relayer, "0xef0100"+delegate[2:]])
+    ctx.kill_rr('old')
+    ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
+    legacy = send(ctx, 'new', 205000)
+    held = send(ctx, 'new', 205001)
+    ctx.stop_rr('new')
+    # Exact legacy shape: FAILED, conservatively attempted, no known hash or
+    # persisted envelope. This never certifies that an old payout is impossible.
+    ctx.pg.psql(ctx.dbname, f"""
+        BEGIN;
+        SELECT set_config('rrelayer.sender_token', token, true)
+        FROM relayer.sender_owner WHERE chain_id={lab.CHAIN_ID}
+          AND signer=decode('{ctx.relayer[2:]}','hex');
+        UPDATE relayer.transaction SET status='FAILED', broadcast_attempted=TRUE,
+          hash=NULL, failed_reason='fixture: legacy gas estimation failure'
+        WHERE id='{legacy['id']}';
+        COMMIT;
+    """)
+    ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
+    key = str(uuid.uuid4())
+    code, result = lab.http('POST', ctx.rr['new']['api']+f'/transactions/relayers/{lab.CHAIN_ID}/send-idempotent',
+        {'to':lab.SINK,'value':hex(205002),'data':'0x','externalId':key}, auth=True)
+    assert code == 503 and 'terminal history' in str(result), (code, result)
+    assert key not in ctx.rows()
+    # Reproduce the existing higher-nonce signed attempt, rejected by the same
+    # gap-enforcing RPC. Recovery must retain those bytes and its original nonce.
+    activate(ctx, 'new', 'old')
+    assert lab.wait_until(lambda: ctx.lab('/lab/state')['gap_rejections'] > 0, 15)
+    attempts_sql = f"SELECT encode(hash,'hex') FROM relayer.transaction_attempt WHERE transaction_id='{held['id']}'"
+    before = set(ctx.pg.psql(ctx.dbname, attempts_sql, tuples_only=True).splitlines())
+    assert before and ctx.onchain_nonce() == 0
+    endpoint = ctx.rr['new']['api']+'/transactions/cancel-legacy-nonce/'+legacy['id']+'/0'
+    code, _ = lab.http('PUT', endpoint, auth=False)
+    assert code == 401, code
+    code, _ = lab.http('PUT', endpoint, auth=True)
+    assert code != 200, 'Legacy cancellation must be explicitly staged while paused'
+    code, _ = lab.http('PUT', ctx.rr['new']['api']+'/relayers/'+ctx.relayer_id+'/pause', auth=True)
+    assert code == 204, code
+    code, _ = lab.http('PUT', endpoint[:-1]+'1', auth=True)
+    assert code != 200, 'Wrong original nonce accepted'
+    code, cancelled = lab.http('PUT', endpoint, auth=True)
+    assert code == 200 and cancelled['cancelTransactionId'], (code, cancelled)
+    cancel = cancelled['cancelTransactionId']
+    # Response-loss retry across restart creates no second competitor.
+    ctx.kill_rr('new'); ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
+    code, repeat = lab.http('PUT', endpoint, auth=True)
+    assert code == 200 and repeat['cancelTransactionId'] == cancel, (code, repeat)
+    rows = ctx.rows()
+    assert rows[cancel]['nonce'] == 0 and rows[held['id']]['nonce'] == 1, rows
+    assert rows[legacy['id']]['status'] == 'INMEMPOOL', rows
+    assert not ctx.chain_scan(), 'Paused recovery must not broadcast'
+    code, _ = lab.http('PUT', ctx.rr['new']['api']+'/relayers/'+ctx.relayer_id+'/unpause', auth=True)
+    assert code == 204, code
+    done(ctx, [held, {'id': cancel}])
+    assert lab.wait_until(lambda: ctx.rows()[legacy['id']]['status']=='CANCELLED', 15), ctx.rows()
+    after = set(ctx.pg.psql(ctx.dbname, attempts_sql, tuples_only=True).splitlines())
+    assert before <= after
+    assert ctx.rows()[held['id']]['nonce'] == 1
+    assert ctx.rows()[held['id']]['hash'][2:] in after
+    code, repeat = lab.http('PUT', endpoint, auth=True)
+    assert code == 200 and repeat['cancelTransactionId'] == cancel, (code, repeat)
+    tail = send(ctx, 'new', 205002); done(ctx, [tail])
+    assert ctx.rows()[tail['id']]['nonce'] == 2
+    result = check_money(ctx, [held, tail])
+    assert ctx.pg.psql(ctx.dbname, f"SELECT broadcast_attempted FROM relayer.transaction WHERE id='{legacy['id']}'", tuples_only=True).strip() == 't'
+    result['legacyNonceCancellation'] = cancel
+    return result
+
+
+SCENARIOS['legacy_nonce_gap_recovery'] = legacy_nonce_gap_recovery
+SCENARIOS['delegated_legacy_nonce_gap_recovery'] = lambda ctx: legacy_nonce_gap_recovery(ctx, delegated=True)
 SCENARIOS['restart_gap_below_loaded_row_no_gap_rejection'] = restart_gap_below_loaded_row_no_gap_rejection
 SCENARIOS['failed_attempt_keeps_nonce_reserved'] = failed_attempt_keeps_nonce_reserved
 

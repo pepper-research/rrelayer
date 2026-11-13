@@ -500,10 +500,11 @@ impl TransactionsQueues {
             let reserved = self
                 .db
                 .query(
-                    "SELECT DISTINCT nonce FROM relayer.transaction
+                    "SELECT nonce, bool_or(status IN ('PENDING','INMEMPOOL','MINED')) AS recoverable
+                 FROM relayer.transaction
                  WHERE chain_id=$1 AND \"from\"=$2 AND nonce >= $3
                    AND (status <> 'FAILED' OR broadcast_attempted)
-                 ORDER BY nonce",
+                 GROUP BY nonce ORDER BY nonce",
                     &[&transaction.chain_id, &transaction.from, &current_onchain_nonce],
                 )
                 .await
@@ -513,6 +514,13 @@ impl TransactionsQueues {
                 let occupied: TransactionNonce = row.get("nonce");
                 if occupied != next {
                     break;
+                }
+                if !row.get::<_, bool>("recoverable") {
+                    return Err(AddTransactionError::CouldNotSaveTransactionDb(
+                        crate::postgres::PostgresError::Handoff(format!(
+                            "Nonce {} is reserved by terminal history; reconcile the original nonce before admitting higher sends", next.into_inner()
+                        )),
+                    ));
                 }
                 next = next + 1;
             }
@@ -581,6 +589,7 @@ impl TransactionsQueues {
         &mut self,
         original: &Transaction,
         replace: Option<&RelayTransactionRequest>,
+        legacy_nonce: bool,
     ) -> Result<Transaction, crate::postgres::PostgresError> {
         if let Some(id) = original.cancelled_by_transaction_id {
             return Err(crate::postgres::PostgresError::Handoff(format!(
@@ -608,10 +617,12 @@ impl TransactionsQueues {
             competitor.authorization_list = None;
             competitor.blobs = None;
             competitor.is_noop = true;
-            competitor.gas_limit = Some(GasLimit::new(21_000));
+            // A migrated sender may have EIP-7702 delegated code. Estimate the
+            // explicit recovery cancellation instead of assuming EOA gas.
+            competitor.gas_limit = if legacy_nonce { None } else { Some(GasLimit::new(21_000)) };
             competitor.external_id = Some(format!("cancel_{}", original.id));
         }
-        self.db.save_competitor(&original.id, &competitor).await?;
+        self.db.save_competitor(&original.id, &competitor, legacy_nonce).await?;
         self.invalidate_transaction_cache(&original.id).await;
         Ok(competitor)
     }
@@ -620,29 +631,53 @@ impl TransactionsQueues {
         &mut self,
         transaction: &Transaction,
     ) -> Result<CancelTransactionResult, CancelTransactionError> {
+        self.cancel_transaction_inner(transaction, None).await
+    }
+
+    pub async fn cancel_legacy_nonce(
+        &mut self,
+        transaction: &Transaction,
+        expected_nonce: TransactionNonce,
+    ) -> Result<CancelTransactionResult, CancelTransactionError> {
+        self.cancel_transaction_inner(transaction, Some(expected_nonce)).await
+    }
+
+    async fn cancel_transaction_inner(
+        &mut self,
+        transaction: &Transaction,
+        legacy_nonce: Option<TransactionNonce>,
+    ) -> Result<CancelTransactionResult, CancelTransactionError> {
         let _sender = self
             .db
             .acquire_sender(&transaction.relayer_id, false)
             .await
             .map_err(CancelTransactionError::Handoff)?;
-        if self
+        let paused = self
             .db
             .get_relayer(&transaction.relayer_id)
             .await
             .map_err(CancelTransactionError::Handoff)?
             .map(|r| r.paused)
-            .unwrap_or(true)
-        {
-            return Err(CancelTransactionError::RelayerIsPaused(transaction.relayer_id));
-        }
+            .unwrap_or(true);
         let original = self
             .db
             .get_transaction(&transaction.id)
             .await
             .map_err(CancelTransactionError::Handoff)?
             .ok_or(CancelTransactionError::RelayerNotFound(transaction.relayer_id))?;
-        if !matches!(original.status, TransactionStatus::PENDING | TransactionStatus::INMEMPOOL) {
-            return Ok(CancelTransactionResult::failed());
+        if legacy_nonce.is_some_and(|expected| expected != original.nonce) {
+            return Err(CancelTransactionError::Handoff(crate::postgres::PostgresError::Handoff(
+                "Legacy cancellation nonce does not match the original".into(),
+            )));
+        }
+        if legacy_nonce.is_none() {
+            if paused {
+                return Err(CancelTransactionError::RelayerIsPaused(original.relayer_id));
+            }
+            if !matches!(original.status, TransactionStatus::PENDING | TransactionStatus::INMEMPOOL)
+            {
+                return Ok(CancelTransactionResult::failed());
+            }
         }
         if let Some(id) = original.cancelled_by_transaction_id {
             let competitor = self
@@ -655,8 +690,58 @@ impl TransactionsQueues {
                 return Ok(CancelTransactionResult::success(id));
             }
         }
+        if let Some(expected) = legacy_nonce {
+            // This explicit administrative cancellation does not certify a legacy
+            // failure as unbroadcast. Only its same-nonce receipt can retire it.
+            if expected != original.nonce || !paused {
+                return Err(CancelTransactionError::Handoff(crate::postgres::PostgresError::Handoff(
+                    "Legacy nonce cancellation requires a paused sender and the exact original nonce".into())));
+            }
+            let eligible: bool = self.db.query_one(
+                "SELECT status='FAILED' AND broadcast_attempted AND hash IS NULL
+                   AND signed_envelope IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM relayer.transaction_attempt WHERE transaction_id=$1)
+                   AND NOT EXISTS (SELECT 1 FROM relayer.transaction other
+                     WHERE other.chain_id=t.chain_id AND other.\"from\"=t.\"from\"
+                       AND other.nonce=t.nonce AND other.status IN ('PENDING','INMEMPOOL','MINED'))
+                 FROM relayer.transaction t WHERE id=$1", &[&original.id]).await
+                .map_err(CancelTransactionError::Handoff)?.get(0);
+            if !eligible {
+                return Err(CancelTransactionError::Handoff(
+                    crate::postgres::PostgresError::Handoff(
+                        "Original legacy nonce is not eligible for explicit cancellation".into(),
+                    ),
+                ));
+            }
+            let queue = self
+                .get_transactions_queue(&original.relayer_id)
+                .ok_or(CancelTransactionError::RelayerNotFound(original.relayer_id))?;
+            let queue = queue.lock().await;
+            let pending = queue.get_nonce().await.map_err(|e| {
+                CancelTransactionError::Handoff(crate::postgres::PostgresError::Handoff(
+                    e.to_string(),
+                ))
+            })?;
+            let latest = queue.get_latest_nonce().await.map_err(|e| {
+                CancelTransactionError::Handoff(crate::postgres::PostgresError::Handoff(
+                    e.to_string(),
+                ))
+            })?;
+            if latest != expected || pending != expected {
+                return Err(CancelTransactionError::Handoff(crate::postgres::PostgresError::Handoff(
+                    "Original nonce is consumed or pending on chain; reconcile it without a new cancellation".into())));
+            }
+        } else {
+            if paused {
+                return Err(CancelTransactionError::RelayerIsPaused(original.relayer_id));
+            }
+            if !matches!(original.status, TransactionStatus::PENDING | TransactionStatus::INMEMPOOL)
+            {
+                return Ok(CancelTransactionResult::failed());
+            }
+        }
         let competitor = self
-            .queue_competitor(&original, None)
+            .queue_competitor(&original, None, legacy_nonce.is_some())
             .await
             .map_err(CancelTransactionError::Handoff)?;
         Ok(CancelTransactionResult::success(competitor.id))
@@ -703,7 +788,7 @@ impl TransactionsQueues {
                 replace_transaction_hash: None,
             });
         }
-        let competitor = self.queue_competitor(&original, Some(replace_with)).await?;
+        let competitor = self.queue_competitor(&original, Some(replace_with), false).await?;
         Ok(ReplaceTransactionResult {
             success: true,
             replace_transaction_id: Some(competitor.id),
@@ -745,7 +830,7 @@ impl TransactionsQueues {
                     .map_err(ProcessPendingTransactionError::Handoff)?
                     .get(0);
                 if !attempted && !queue.is_isolated_limit_base() {
-                    self.queue_competitor(&transaction, None)
+                    self.queue_competitor(&transaction, None, false)
                         .await
                         .map_err(ProcessPendingTransactionError::Handoff)?;
                     return Ok(ProcessResult::success());
@@ -874,7 +959,7 @@ impl TransactionsQueues {
                                         ProcessInmempoolStatus::StillInmempool,
                                         self.relayer_block_times_ms
                                             .get(relayer_id)
-                                            .map(|&block_time| block_time / 10)
+                                            .map(|&block_time| (block_time / 10).max(250))
                                             .as_ref(),
                                     ));
                                 }
@@ -925,7 +1010,7 @@ impl TransactionsQueues {
                                 ProcessInmempoolStatus::StillInmempool,
                                 self.relayer_block_times_ms
                                     .get(relayer_id)
-                                    .map(|&block_time| block_time / 10)
+                                    .map(|&block_time| (block_time / 10).max(250))
                                     .as_ref(),
                             ))
                         }
@@ -1071,5 +1156,208 @@ impl TransactionsQueues {
         } else {
             Err(ProcessMinedTransactionError::RelayerTransactionsQueueNotFound(*relayer_id))
         }
+    }
+}
+
+#[cfg(test)]
+mod receipt_poll_tests {
+    use super::super::transactions_queue::elysium_tests::Fixture;
+    use super::*;
+    use crate::transaction::types::TransactionHash;
+    use alloy::primitives::keccak256;
+    use serde_json::{json, Value};
+
+    async fn receipt_requests(requests: &Arc<Mutex<Vec<Value>>>) -> Vec<Value> {
+        requests
+            .lock()
+            .await
+            .iter()
+            .filter(|request| request["method"] == "eth_getTransactionReceipt")
+            .map(|request| request["params"][0].clone())
+            .collect()
+    }
+
+    fn receipt(hash: TransactionHash, address: crate::common_types::EvmAddress) -> Value {
+        json!({
+            "transactionHash": hash, "transactionIndex": "0x0",
+            "blockHash": format!("0x{}", "11".repeat(32)), "blockNumber": "0x1",
+            "from": address, "to": address, "contractAddress": null,
+            "cumulativeGasUsed": "0x5208", "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x64", "logs": [],
+            "logsBloom": format!("0x{}", "00".repeat(256)), "status": "0x1", "type": "0x4"
+        })
+    }
+
+    #[tokio::test]
+    async fn receipt_polling_deduplicates_original_preserves_competition_and_bounds_fast_chain_waits(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(url) =
+            std::env::var("RRELAYER_TEST_DATABASE_URL").ok().filter(|url| !url.is_empty())
+        else {
+            return Ok(());
+        };
+        // Isolate from the existing database concurrency test and its schema setup.
+        let mut isolated_url = reqwest::Url::parse(&url)?;
+        assert!(matches!(isolated_url.host_str(), Some("127.0.0.1" | "localhost" | "::1")));
+        let admin = PostgresClient::for_test_url(&url).await?;
+        let database = format!("receipt_poll_{}", uuid::Uuid::new_v4().simple());
+        admin.batch_execute(&format!("CREATE DATABASE \"{database}\"")).await?;
+        isolated_url.set_path(&format!("/{database}"));
+        let mut db = PostgresClient::for_test_url(isolated_url.as_str()).await?;
+        crate::schema::apply_schema(&db).await?;
+        let mut failures = Vec::new();
+
+        for (chain_id, block_time, expected_wait, capped) in [
+            (99901, 250, 250, false),
+            (1, 12_000, 1_200, false),
+            (99901, 250, 250, true),
+            (1, 12_000, 1_200, true),
+        ] {
+            db.batch_execute("UPDATE relayer.sender_deployment SET enabled=FALSE").await?;
+            let fixture = Fixture::new(chain_id, json!(null), 0).await;
+            if capped {
+                fixture.cache_gas_prices().await;
+            }
+            let requests = fixture.requests.clone();
+            let budget = fixture.budget.clone();
+            let queue = Arc::new(Mutex::new(fixture.queue));
+            let mut original = queue.lock().await.get_next_inmempool_transaction().await.unwrap();
+            if capped {
+                let sent_gas = GasPriceResult {
+                    max_fee: crate::gas::MaxFee::new(10),
+                    max_priority_fee: crate::gas::MaxPriorityFee::new(10),
+                    min_wait_time_estimate: None,
+                    max_wait_time_estimate: None,
+                };
+                assert!(queue.lock().await.is_at_max_gas_price_cap(&sent_gas).await);
+                original.sent_with_gas = Some(sent_gas);
+            }
+            let relayer_id = original.relayer_id;
+            db.execute("INSERT INTO relayer.record(id,name,chain_id,address,wallet_index) VALUES($1,'receipt-fixture',$2,$3,0)",
+                &[&relayer_id, &original.chain_id, &original.from]).await?;
+            db.save_transaction(&relayer_id, &original).await?;
+            if capped {
+                db.execute(
+                    "UPDATE relayer.transaction SET sent_at=NOW() WHERE id=$1",
+                    &[&original.id],
+                )
+                .await?;
+            }
+            let original_hash = original.known_transaction_hash.unwrap();
+            db.execute("INSERT INTO relayer.transaction_attempt(transaction_id,hash,signed_envelope,gas) VALUES($1,$2,''::bytea,'{}'::jsonb)",
+                &[&original.id, &original_hash]).await?;
+
+            assert!(queue.lock().await.receipt_for_competition(&db, &original).await?.is_none());
+            if receipt_requests(&requests).await != [json!(original_hash)] {
+                failures.push(format!(
+                    "single-hash lookup duplicated: chain={chain_id} capped={capped}"
+                ));
+            }
+
+            if chain_id == 99901 && !capped {
+                // An active snapshot's newer known hash must not be lost by deduplication.
+                requests.lock().await.clear();
+                let mut active = original.clone();
+                let newer_hash =
+                    TransactionHash::from_alloy_hash(&keccak256(b"newer receipt fixture"));
+                active.known_transaction_hash = Some(newer_hash);
+                assert!(queue.lock().await.receipt_for_competition(&db, &active).await?.is_none());
+                if receipt_requests(&requests).await != [json!(original_hash), json!(newer_hash)] {
+                    failures.push("active snapshot did not check each known hash once".to_string());
+                }
+
+                let mut competitor = original.clone();
+                competitor.id = TransactionId::new();
+                let competitor_hash =
+                    TransactionHash::from_alloy_hash(&keccak256(b"competitor receipt fixture"));
+                competitor.known_transaction_hash = Some(competitor_hash);
+                db.save_competitor(&original.id, &competitor, false).await?;
+                queue
+                    .lock()
+                    .await
+                    .add_competitor_to_inmempool_transaction(
+                        &original.id,
+                        competitor.clone(),
+                        super::super::types::CompetitionType::Replace,
+                    )
+                    .await?;
+
+                requests.lock().await.clear();
+                budget
+                    .lock()
+                    .await
+                    .receipts
+                    .insert(original_hash.hex(), receipt(original_hash, original.from));
+                let (winner, _) =
+                    queue.lock().await.receipt_for_competition(&db, &competitor).await?.unwrap();
+                assert_eq!(winner.id, original.id);
+                assert_eq!(receipt_requests(&requests).await, [json!(original_hash)]);
+
+                requests.lock().await.clear();
+                budget.lock().await.receipts.clear();
+                budget
+                    .lock()
+                    .await
+                    .receipts
+                    .insert(competitor_hash.hex(), receipt(competitor_hash, competitor.from));
+                let (winner, _) =
+                    queue.lock().await.receipt_for_competition(&db, &competitor).await?.unwrap();
+                assert_eq!(winner.id, competitor.id);
+                assert_eq!(
+                    receipt_requests(&requests).await,
+                    [json!(original_hash), json!(competitor_hash)]
+                );
+                budget.lock().await.receipts.clear();
+            }
+
+            requests.lock().await.clear();
+            let release = crate::sender_handoff::release_id();
+            db.execute(
+                "UPDATE relayer.sender_deployment SET enabled=TRUE,active_release=$1",
+                &[&release],
+            )
+            .await?;
+            let mut queues = TransactionsQueues {
+                queues: HashMap::from([(relayer_id, queue)]),
+                relayer_block_times_ms: HashMap::from([(relayer_id, block_time)]),
+                gas_oracle_cache: Arc::new(Mutex::new(GasOracleCache::new())),
+                blob_gas_oracle_cache: Arc::new(Mutex::new(BlobGasOracleCache::new())),
+                db,
+                cache: Arc::new(Cache::new().await),
+                webhook_manager: None,
+                safe_proxy_manager: Arc::new(SafeProxyManager::new(vec![])),
+            };
+            let result = queues.process_single_inmempool(&relayer_id).await?;
+            assert_eq!(result.status, ProcessInmempoolStatus::StillInmempool);
+            if result.process_again_after != expected_wait {
+                failures.push(format!("receipt wait: chain={chain_id} capped={capped} actual={} expected={expected_wait}", result.process_again_after));
+            }
+            assert!(!requests
+                .lock()
+                .await
+                .iter()
+                .any(|request| request["method"] == "eth_sendRawTransaction"));
+            db = queues.db;
+        }
+        drop(db);
+        // Owned pools and sender guards close normally; never terminate database clients.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let clients: i64 = admin
+                .query_one("SELECT COUNT(*) FROM pg_stat_activity WHERE datname=$1", &[&database])
+                .await?
+                .get(0);
+            if clients == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "receipt fixture database still has owned clients"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        admin.batch_execute(&format!("DROP DATABASE \"{database}\"")).await?;
+        assert!(failures.is_empty(), "receipt regressions: {failures:?}");
+        Ok(())
     }
 }

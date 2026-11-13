@@ -621,6 +621,10 @@ impl EvmProvider {
         transaction: &TypedTransaction,
         from: &EvmAddress,
     ) -> Result<GasLimit, RpcError<TransportErrorKind>> {
+        if self.chain_id.u64() == 99901 {
+            return self.simulate_elysium(transaction, from, None).await;
+        }
+
         let mut request: TransactionRequest = transaction.clone().into();
         // need from here else it will fail gas estimating
         request.from = Some(from.into_address());
@@ -630,6 +634,137 @@ impl EvmProvider {
         let result = self.rpc_client().estimate_gas(request_with_other).await?;
 
         Ok(GasLimit::new(result as u128))
+    }
+
+    /// Validate the queue's final gas budget with the fee envelope that will be signed.
+    pub(crate) async fn validate_estimated_gas(
+        &self,
+        transaction: &TypedTransaction,
+        from: &EvmAddress,
+        gas: GasLimit,
+    ) -> Result<(), RpcError<TransportErrorKind>> {
+        if self.chain_id.u64() != 99901 {
+            return Ok(());
+        }
+        self.simulate_elysium(transaction, from, Some(gas)).await.map(|_| ())
+    }
+
+    async fn simulate_elysium(
+        &self,
+        transaction: &TypedTransaction,
+        from: &EvmAddress,
+        final_gas: Option<GasLimit>,
+    ) -> Result<GasLimit, RpcError<TransportErrorKind>> {
+        let mut request: TransactionRequest = transaction.clone().into();
+        request.from = Some(from.into_address());
+        let invalid = |message: &str| {
+            RpcError::Transport(TransportErrorKind::Custom(message.to_string().into()))
+        };
+        let client = self.rpc_client();
+        let block = client
+            .get_block(BlockId::Number(BlockNumberOrTag::Latest))
+            .await?
+            .ok_or_else(|| invalid("Latest Elysium block is unavailable"))?;
+        let block_number = format!("0x{:x}", block.header.number);
+        let gas_cap = block.header.gas_limit.min(50_000_000);
+        if gas_cap == 0 || request.chain_id.is_some_and(|id| id != 99901) {
+            return Err(invalid("Invalid Elysium simulation chain or gas limit"));
+        }
+
+        // Nitro's simulator reports compute gas. Reject a pricing change
+        // before treating that result as the complete transaction estimate.
+        let prices: String = client
+            .client()
+            .request(
+                "eth_call",
+                (
+                    serde_json::json!({
+                        "to": "0x000000000000000000000000000000000000006c",
+                        "data": "0x41b247a8" // ArbGasInfo.getPricesInWei()
+                    }),
+                    &block_number,
+                ),
+            )
+            .await?;
+        if prices.len() != 386
+            || !prices.starts_with("0x")
+            || !prices[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+            || prices[2..130].bytes().any(|byte| byte != b'0')
+        {
+            return Err(invalid("Elysium parent fee prices are enabled or invalid"));
+        }
+
+        let validation_limit = final_gas.map(|gas| gas.into_inner());
+        let call_gas = match validation_limit {
+            Some(gas) if gas > 0 && gas <= gas_cap as u128 => gas as u64,
+            Some(_) => return Err(invalid("Final Elysium gas exceeds the simulation budget")),
+            None => gas_cap,
+        };
+        let mut block_call = serde_json::json!({});
+        if validation_limit.is_some() {
+            let base_fee = block
+                .header
+                .base_fee_per_gas
+                .ok_or_else(|| invalid("Latest Elysium base fee is unavailable"))?;
+            // Non-validation simulations otherwise default BASEFEE/GASPRICE to zero.
+            block_call["blockOverrides"] = serde_json::json!({
+                "baseFeePerGas": format!("0x{base_fee:x}")
+            });
+        } else {
+            // Measure without reserving the full cap's fee from native principal.
+            // The queue validates the real fees after choosing its final gas limit.
+            request.gas_price = request.gas_price.map(|_| 0);
+            request.max_fee_per_gas = request.max_fee_per_gas.map(|_| 0);
+            request.max_priority_fee_per_gas = request.max_priority_fee_per_gas.map(|_| 0);
+        }
+        request.gas = Some(call_gas);
+        block_call["calls"] = serde_json::json!([request]);
+        // Future sender nonces remain queue-owned. Both passes use actual
+        // native balances and authorizations without state overrides.
+        let result: serde_json::Value = client
+            .client()
+            .request(
+                "eth_simulateV1",
+                (
+                    serde_json::json!({
+                        "blockStateCalls": [block_call],
+                        "validation": false
+                    }),
+                    &block_number,
+                ),
+            )
+            .await?;
+        let Some([simulated_block]) = result.as_array().map(Vec::as_slice) else {
+            return Err(invalid("Invalid Elysium simulation block result"));
+        };
+        let Some([call]) =
+            simulated_block.get("calls").and_then(serde_json::Value::as_array).map(Vec::as_slice)
+        else {
+            return Err(invalid("Invalid Elysium simulation call result"));
+        };
+        if call.get("error").is_some_and(|error| !error.is_null())
+            || call.get("status").and_then(serde_json::Value::as_str) != Some("0x1")
+        {
+            return Err(invalid(&format!("Elysium simulation failed: {}", call["error"])));
+        }
+        let quantity = |field: &str| {
+            call.get(field)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|hex| hex.strip_prefix("0x"))
+                .filter(|hex| {
+                    !hex.is_empty()
+                        && (hex.len() == 1 || !hex.starts_with('0'))
+                        && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        };
+        let (Some(used), Some(maximum)) = (quantity("gasUsed"), quantity("maxUsedGas")) else {
+            return Err(invalid("Elysium simulator omitted successful execution gas"));
+        };
+        if used == 0 || maximum < used || maximum > call_gas {
+            return Err(invalid("Elysium simulator returned inconsistent execution gas"));
+        }
+        Ok(GasLimit::new(maximum as u128))
     }
 
     pub async fn calculate_gas_price(&self) -> Result<GasEstimatorResult, GasEstimatorError> {

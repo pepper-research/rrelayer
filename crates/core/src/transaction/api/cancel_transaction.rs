@@ -3,7 +3,10 @@ use crate::rate_limiting::{RateLimitOperation, RateLimiter};
 use crate::shared::{not_found, unauthorized, HttpError};
 use crate::{
     app_state::AppState,
-    transaction::{get_transaction_by_id, types::TransactionId},
+    transaction::{
+        get_transaction_by_id,
+        types::{TransactionId, TransactionNonce},
+    },
 };
 use axum::http::HeaderMap;
 use axum::{
@@ -26,6 +29,26 @@ pub async fn cancel_transaction(
     State(state): State<Arc<AppState>>,
     Path(transaction_id): Path<TransactionId>,
     headers: HeaderMap,
+) -> Result<Json<CancelTransactionResponse>, HttpError> {
+    cancel_transaction_inner(state, transaction_id, headers, None).await
+}
+
+/// Explicitly retire a migrated FAILED nonce through the existing cancellation
+/// journal. Ordinary cancellation and prebroadcast proof semantics are unchanged.
+pub async fn cancel_legacy_nonce(
+    State(state): State<Arc<AppState>>,
+    Path((transaction_id, expected_nonce)): Path<(TransactionId, TransactionNonce)>,
+    headers: HeaderMap,
+) -> Result<Json<CancelTransactionResponse>, HttpError> {
+    state.validate_basic_auth_valid(&headers)?;
+    cancel_transaction_inner(state, transaction_id, headers, Some(expected_nonce)).await
+}
+
+async fn cancel_transaction_inner(
+    state: Arc<AppState>,
+    transaction_id: TransactionId,
+    headers: HeaderMap,
+    legacy_nonce: Option<TransactionNonce>,
 ) -> Result<Json<CancelTransactionResponse>, HttpError> {
     state.validate_allowed_passed_basic_auth(&headers)?;
 
@@ -59,8 +82,12 @@ pub async fn cancel_transaction(
     )
     .await?;
 
-    let cancel_result =
-        state.transactions_queues.lock().await.cancel_transaction(&transaction).await?;
+    let mut queues = state.transactions_queues.lock().await;
+    let cancel_result = if let Some(expected_nonce) = legacy_nonce {
+        queues.cancel_legacy_nonce(&transaction, expected_nonce).await?
+    } else {
+        queues.cancel_transaction(&transaction).await?
+    };
 
     if let Some(reservation) = rate_limit_reservation {
         reservation.commit();
