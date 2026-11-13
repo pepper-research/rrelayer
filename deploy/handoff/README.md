@@ -96,6 +96,32 @@ with a legacy binary; the legacy binary can broadcast before its fenced DB
 write fails. Never roll back to a pre-protocol image after activation, and never
 turn fencing off to force a rollback. Preserve ambiguous rows and reconcile.
 
+## Legacy terminal nonce recovery
+
+Admission stops before allocating above a nonce reserved only by terminal
+history. A migrated FAILED row with `broadcast_attempted=true` remains uncertain;
+its missing hash is not evidence that its payout never broadcast. Earlier free
+nonces remain available, and signed requests retain their original nonce/bytes.
+
+For a reconciled legacy gap, an operator may pause the sender and call
+`PUT /transactions/cancel-legacy-nonce/:transaction_id/:expected_nonce` with
+administrator Basic authentication. Creation requires a FAILED attempted row
+without a hash, stored envelope or signed attempt, no active request at that
+nonce, and matching latest/pending chain nonces. It journals the existing
+zero-value cancellation competitor under the sender fence, estimating gas for
+potentially delegated senders. It never rewrites the original payload or clears
+its attempted history. Resume only after checking the original higher-nonce
+requests and the exact recovery intent. The cancellation receipt resolves the
+nonce competition; reconcile economic effects separately. Retries return the
+same competitor, including across restart and after completion.
+
+This endpoint is not automatic recovery and cannot establish that an unknown
+legacy payout failed. If the chain nonce has advanced or a signed attempt exists,
+reconcile that original attempt instead. Keep all old records and receipts.
+`legacy_nonce_gap_recovery` and `delegated_legacy_nonce_gap_recovery` exercise the
+admission refusal, authentication, pause/nonce checks, response-loss retry,
+restart, original signed attempt retention and exactly-once settlement locally.
+
 ## Subsequent deployments and compatible rollback
 
 The controller starts a temporary Fargate task with the existing network and

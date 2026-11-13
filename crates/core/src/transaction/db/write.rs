@@ -32,16 +32,23 @@ impl PostgresClient {
         transaction: &Transaction,
         signed_envelope: Option<&[u8]>,
     ) -> Result<(), PostgresError> {
-        self.save_transaction_and_link(relayer_id, transaction, signed_envelope, None).await
+        self.save_transaction_and_link(relayer_id, transaction, signed_envelope, None, false).await
     }
 
     pub async fn save_competitor(
         &mut self,
         original: &TransactionId,
         transaction: &Transaction,
+        legacy_nonce: bool,
     ) -> Result<(), PostgresError> {
-        self.save_transaction_and_link(&transaction.relayer_id, transaction, None, Some(original))
-            .await
+        self.save_transaction_and_link(
+            &transaction.relayer_id,
+            transaction,
+            None,
+            Some(original),
+            legacy_nonce,
+        )
+        .await
     }
 
     async fn save_transaction_and_link(
@@ -50,6 +57,7 @@ impl PostgresClient {
         transaction: &Transaction,
         signed_envelope: Option<&[u8]>,
         original: Option<&TransactionId>,
+        legacy_nonce: bool,
     ) -> Result<(), PostgresError> {
         let mut conn = self.pool.get().await?;
         let trans = conn.transaction().await.map_err(PostgresError::PgError)?;
@@ -119,7 +127,7 @@ impl PostgresClient {
         }
 
         if let Some(original) = original {
-            trans.query_one("UPDATE relayer.transaction SET cancelled_by_transaction_id=$2, status='INMEMPOOL', competition_kind=$3 WHERE id=$1 AND cancelled_by_transaction_id IS NULL AND status IN ('PENDING','INMEMPOOL') RETURNING id", &[original, &transaction.id, &if transaction.is_noop { "cancel" } else { "replace" }]).await?;
+            trans.query_one("UPDATE relayer.transaction SET cancelled_by_transaction_id=$2, status='INMEMPOOL', competition_kind=$3 WHERE id=$1 AND cancelled_by_transaction_id IS NULL AND (status IN ('PENDING','INMEMPOOL') OR ($4 AND status='FAILED' AND broadcast_attempted AND hash IS NULL AND signed_envelope IS NULL AND NOT EXISTS (SELECT 1 FROM relayer.transaction_attempt WHERE transaction_id=$1))) RETURNING id", &[original, &transaction.id, &if transaction.is_noop { "cancel" } else { "replace" }, &legacy_nonce]).await?;
         }
         trans.commit().await?;
 

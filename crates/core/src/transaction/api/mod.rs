@@ -48,6 +48,10 @@ pub fn create_transactions_routes() -> Router<Arc<AppState>> {
         )
         .route("/replace/:transaction_id", put(replace_transaction::replace_transaction))
         .route("/cancel/:transaction_id", put(cancel_transaction::cancel_transaction))
+        .route(
+            "/cancel-legacy-nonce/:transaction_id/:expected_nonce",
+            put(cancel_transaction::cancel_legacy_nonce),
+        )
         .route("/relayers/:relayer_id", get(get_relayer_transactions::get_relayer_transactions))
         .route(
             "/relayers/:relayer_id/pending/count",

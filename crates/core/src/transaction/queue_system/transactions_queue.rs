@@ -1683,6 +1683,10 @@ impl TransactionsQueue {
         Ok(nonce)
     }
 
+    pub async fn get_latest_nonce(&self) -> Result<TransactionNonce, RpcError<TransportErrorKind>> {
+        self.evm_provider.get_latest_nonce_from_address(&self.relay_address()).await
+    }
+
     pub async fn get_balance(
         &self,
     ) -> Result<alloy::primitives::U256, RpcError<TransportErrorKind>> {

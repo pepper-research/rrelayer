@@ -500,10 +500,11 @@ impl TransactionsQueues {
             let reserved = self
                 .db
                 .query(
-                    "SELECT DISTINCT nonce FROM relayer.transaction
+                    "SELECT nonce, bool_or(status IN ('PENDING','INMEMPOOL','MINED')) AS recoverable
+                 FROM relayer.transaction
                  WHERE chain_id=$1 AND \"from\"=$2 AND nonce >= $3
                    AND (status <> 'FAILED' OR broadcast_attempted)
-                 ORDER BY nonce",
+                 GROUP BY nonce ORDER BY nonce",
                     &[&transaction.chain_id, &transaction.from, &current_onchain_nonce],
                 )
                 .await
@@ -513,6 +514,13 @@ impl TransactionsQueues {
                 let occupied: TransactionNonce = row.get("nonce");
                 if occupied != next {
                     break;
+                }
+                if !row.get::<_, bool>("recoverable") {
+                    return Err(AddTransactionError::CouldNotSaveTransactionDb(
+                        crate::postgres::PostgresError::Handoff(format!(
+                            "Nonce {} is reserved by terminal history; reconcile the original nonce before admitting higher sends", next.into_inner()
+                        )),
+                    ));
                 }
                 next = next + 1;
             }
@@ -581,6 +589,7 @@ impl TransactionsQueues {
         &mut self,
         original: &Transaction,
         replace: Option<&RelayTransactionRequest>,
+        legacy_nonce: bool,
     ) -> Result<Transaction, crate::postgres::PostgresError> {
         if let Some(id) = original.cancelled_by_transaction_id {
             return Err(crate::postgres::PostgresError::Handoff(format!(
@@ -608,10 +617,12 @@ impl TransactionsQueues {
             competitor.authorization_list = None;
             competitor.blobs = None;
             competitor.is_noop = true;
-            competitor.gas_limit = Some(GasLimit::new(21_000));
+            // A migrated sender may have EIP-7702 delegated code. Estimate the
+            // explicit recovery cancellation instead of assuming EOA gas.
+            competitor.gas_limit = if legacy_nonce { None } else { Some(GasLimit::new(21_000)) };
             competitor.external_id = Some(format!("cancel_{}", original.id));
         }
-        self.db.save_competitor(&original.id, &competitor).await?;
+        self.db.save_competitor(&original.id, &competitor, legacy_nonce).await?;
         self.invalidate_transaction_cache(&original.id).await;
         Ok(competitor)
     }
@@ -620,29 +631,53 @@ impl TransactionsQueues {
         &mut self,
         transaction: &Transaction,
     ) -> Result<CancelTransactionResult, CancelTransactionError> {
+        self.cancel_transaction_inner(transaction, None).await
+    }
+
+    pub async fn cancel_legacy_nonce(
+        &mut self,
+        transaction: &Transaction,
+        expected_nonce: TransactionNonce,
+    ) -> Result<CancelTransactionResult, CancelTransactionError> {
+        self.cancel_transaction_inner(transaction, Some(expected_nonce)).await
+    }
+
+    async fn cancel_transaction_inner(
+        &mut self,
+        transaction: &Transaction,
+        legacy_nonce: Option<TransactionNonce>,
+    ) -> Result<CancelTransactionResult, CancelTransactionError> {
         let _sender = self
             .db
             .acquire_sender(&transaction.relayer_id, false)
             .await
             .map_err(CancelTransactionError::Handoff)?;
-        if self
+        let paused = self
             .db
             .get_relayer(&transaction.relayer_id)
             .await
             .map_err(CancelTransactionError::Handoff)?
             .map(|r| r.paused)
-            .unwrap_or(true)
-        {
-            return Err(CancelTransactionError::RelayerIsPaused(transaction.relayer_id));
-        }
+            .unwrap_or(true);
         let original = self
             .db
             .get_transaction(&transaction.id)
             .await
             .map_err(CancelTransactionError::Handoff)?
             .ok_or(CancelTransactionError::RelayerNotFound(transaction.relayer_id))?;
-        if !matches!(original.status, TransactionStatus::PENDING | TransactionStatus::INMEMPOOL) {
-            return Ok(CancelTransactionResult::failed());
+        if legacy_nonce.is_some_and(|expected| expected != original.nonce) {
+            return Err(CancelTransactionError::Handoff(crate::postgres::PostgresError::Handoff(
+                "Legacy cancellation nonce does not match the original".into(),
+            )));
+        }
+        if legacy_nonce.is_none() {
+            if paused {
+                return Err(CancelTransactionError::RelayerIsPaused(original.relayer_id));
+            }
+            if !matches!(original.status, TransactionStatus::PENDING | TransactionStatus::INMEMPOOL)
+            {
+                return Ok(CancelTransactionResult::failed());
+            }
         }
         if let Some(id) = original.cancelled_by_transaction_id {
             let competitor = self
@@ -655,8 +690,58 @@ impl TransactionsQueues {
                 return Ok(CancelTransactionResult::success(id));
             }
         }
+        if let Some(expected) = legacy_nonce {
+            // This explicit administrative cancellation does not certify a legacy
+            // failure as unbroadcast. Only its same-nonce receipt can retire it.
+            if expected != original.nonce || !paused {
+                return Err(CancelTransactionError::Handoff(crate::postgres::PostgresError::Handoff(
+                    "Legacy nonce cancellation requires a paused sender and the exact original nonce".into())));
+            }
+            let eligible: bool = self.db.query_one(
+                "SELECT status='FAILED' AND broadcast_attempted AND hash IS NULL
+                   AND signed_envelope IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM relayer.transaction_attempt WHERE transaction_id=$1)
+                   AND NOT EXISTS (SELECT 1 FROM relayer.transaction other
+                     WHERE other.chain_id=t.chain_id AND other.\"from\"=t.\"from\"
+                       AND other.nonce=t.nonce AND other.status IN ('PENDING','INMEMPOOL','MINED'))
+                 FROM relayer.transaction t WHERE id=$1", &[&original.id]).await
+                .map_err(CancelTransactionError::Handoff)?.get(0);
+            if !eligible {
+                return Err(CancelTransactionError::Handoff(
+                    crate::postgres::PostgresError::Handoff(
+                        "Original legacy nonce is not eligible for explicit cancellation".into(),
+                    ),
+                ));
+            }
+            let queue = self
+                .get_transactions_queue(&original.relayer_id)
+                .ok_or(CancelTransactionError::RelayerNotFound(original.relayer_id))?;
+            let queue = queue.lock().await;
+            let pending = queue.get_nonce().await.map_err(|e| {
+                CancelTransactionError::Handoff(crate::postgres::PostgresError::Handoff(
+                    e.to_string(),
+                ))
+            })?;
+            let latest = queue.get_latest_nonce().await.map_err(|e| {
+                CancelTransactionError::Handoff(crate::postgres::PostgresError::Handoff(
+                    e.to_string(),
+                ))
+            })?;
+            if latest != expected || pending != expected {
+                return Err(CancelTransactionError::Handoff(crate::postgres::PostgresError::Handoff(
+                    "Original nonce is consumed or pending on chain; reconcile it without a new cancellation".into())));
+            }
+        } else {
+            if paused {
+                return Err(CancelTransactionError::RelayerIsPaused(original.relayer_id));
+            }
+            if !matches!(original.status, TransactionStatus::PENDING | TransactionStatus::INMEMPOOL)
+            {
+                return Ok(CancelTransactionResult::failed());
+            }
+        }
         let competitor = self
-            .queue_competitor(&original, None)
+            .queue_competitor(&original, None, legacy_nonce.is_some())
             .await
             .map_err(CancelTransactionError::Handoff)?;
         Ok(CancelTransactionResult::success(competitor.id))
@@ -703,7 +788,7 @@ impl TransactionsQueues {
                 replace_transaction_hash: None,
             });
         }
-        let competitor = self.queue_competitor(&original, Some(replace_with)).await?;
+        let competitor = self.queue_competitor(&original, Some(replace_with), false).await?;
         Ok(ReplaceTransactionResult {
             success: true,
             replace_transaction_id: Some(competitor.id),
@@ -745,7 +830,7 @@ impl TransactionsQueues {
                     .map_err(ProcessPendingTransactionError::Handoff)?
                     .get(0);
                 if !attempted && !queue.is_isolated_limit_base() {
-                    self.queue_competitor(&transaction, None)
+                    self.queue_competitor(&transaction, None, false)
                         .await
                         .map_err(ProcessPendingTransactionError::Handoff)?;
                     return Ok(ProcessResult::success());
@@ -1186,7 +1271,7 @@ mod receipt_poll_tests {
                 let competitor_hash =
                     TransactionHash::from_alloy_hash(&keccak256(b"competitor receipt fixture"));
                 competitor.known_transaction_hash = Some(competitor_hash);
-                db.save_competitor(&original.id, &competitor).await?;
+                db.save_competitor(&original.id, &competitor, false).await?;
                 queue
                     .lock()
                     .await
