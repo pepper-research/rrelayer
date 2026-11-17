@@ -52,6 +52,20 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 pub type RelayerProvider = Box<dyn Provider<AnyNetwork> + Send + Sync>;
+
+fn gas_estimation_request(
+    chain_id: &ChainId,
+    transaction: &TypedTransaction,
+    from: &EvmAddress,
+) -> (TransactionRequest, Option<u64>) {
+    let mut request: TransactionRequest = transaction.clone().into();
+    request.from = Some(from.into_address());
+    // Monad checks explicit gas against the payer's balance before estimating.
+    // Let it find an affordable estimate and enforce the original ceiling separately.
+    let ceiling = if chain_id.u64() == 143 { request.gas.take() } else { None };
+    (request, ceiling)
+}
+
 pub fn is_limit_base_relayer(relayer: &Relayer) -> bool {
     relayer.chain_id.u64() == 8453 && relayer.wallet_index == 0 && !relayer.is_private_key
 }
@@ -625,13 +639,15 @@ impl EvmProvider {
             return self.simulate_elysium(transaction, from, None).await;
         }
 
-        let mut request: TransactionRequest = transaction.clone().into();
-        // need from here else it will fail gas estimating
-        request.from = Some(from.into_address());
-
+        let (request, ceiling) = gas_estimation_request(&self.chain_id, transaction, from);
         let request_with_other = WithOtherFields::new(request);
 
         let result = self.rpc_client().estimate_gas(request_with_other).await?;
+        if ceiling.is_some_and(|limit| result > limit) {
+            return Err(RpcError::Transport(TransportErrorKind::Custom(
+                "Monad gas estimate exceeds the requested limit".to_string().into(),
+            )));
+        }
 
         Ok(GasLimit::new(result as u128))
     }
@@ -835,8 +851,9 @@ mod tests {
     use super::*;
     use crate::gas::CustomGasFeeEstimator;
     use crate::relayer::RelayerId;
-    use alloy::consensus::TxEip1559;
-    use alloy::primitives::{address, TxKind, U256};
+    use alloy::consensus::{TxEip1559, TxEip7702};
+    use alloy::eips::eip7702::{Authorization, SignedAuthorization};
+    use alloy::primitives::{address, Bytes, TxKind, U256};
     use std::process::{Child, Command};
 
     struct Anvil(Child);
@@ -845,6 +862,48 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.0.kill();
         }
+    }
+
+    #[test]
+    fn monad_gas_estimate_omits_only_the_temporary_limit() {
+        let payer = address!("1111111111111111111111111111111111111111");
+        let transaction = |chain_id| {
+            TypedTransaction::Eip7702(TxEip7702 {
+                chain_id,
+                nonce: 4,
+                gas_limit: 10_000_000,
+                max_fee_per_gas: 122_000_000_000,
+                max_priority_fee_per_gas: 2_000_000_000,
+                to: payer,
+                value: U256::from(7),
+                input: Bytes::from_static(&[0x12, 0x34]),
+                authorization_list: vec![SignedAuthorization::new_unchecked(
+                    Authorization {
+                        chain_id: U256::from(chain_id),
+                        address: address!("2222222222222222222222222222222222222222"),
+                        nonce: 1,
+                    },
+                    0,
+                    U256::from(1),
+                    U256::from(2),
+                )],
+                ..Default::default()
+            })
+        };
+        let from = EvmAddress::from(payer);
+        let (base, ceiling) =
+            gas_estimation_request(&ChainId::new(8453), &transaction(8453), &from);
+        assert_eq!(base.gas, Some(10_000_000));
+        assert_eq!(ceiling, None);
+
+        let monad = transaction(143);
+        let mut expected: TransactionRequest = monad.clone().into();
+        expected.from = Some(payer);
+        let mut expected = serde_json::to_value(expected).unwrap();
+        assert_eq!(expected.as_object_mut().unwrap().remove("gas").unwrap(), "0x989680");
+        let (actual, ceiling) = gas_estimation_request(&ChainId::new(143), &monad, &from);
+        assert_eq!(ceiling, Some(10_000_000));
+        assert_eq!(serde_json::to_value(actual).unwrap(), expected);
     }
 
     // Run with: cargo test -p rrelayer_core -- --ignored
