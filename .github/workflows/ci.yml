@@ -77,6 +77,11 @@ jobs:
             target: x86_64-pc-windows-msvc
             platform: win32
             arch: amd64
+        # Pull requests build and test on Linux only (production ships the Linux
+        # Docker image); macOS and Windows still run on push and workflow_dispatch.
+        exclude:
+          - platform: ${{ github.event_name == 'pull_request' && 'darwin' || 'none' }}
+          - platform: ${{ github.event_name == 'pull_request' && 'win32' || 'none' }}
 
     env:
       BUILD_TYPE: release
