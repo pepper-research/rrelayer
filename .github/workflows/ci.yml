@@ -60,28 +60,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            platform: linux
-            arch: amd64
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-            platform: darwin
-            arch: amd64
-          - runner: macos-15
-            target: aarch64-apple-darwin
-            platform: darwin
-            arch: arm64
-          - runner: windows-latest
-            target: x86_64-pc-windows-msvc
-            platform: win32
-            arch: amd64
         # Pull requests build and test on Linux only (production ships the Linux
         # Docker image); macOS and Windows still run on push and workflow_dispatch.
-        exclude:
-          - platform: ${{ github.event_name == 'pull_request' && 'darwin' || 'none' }}
-          - platform: ${{ github.event_name == 'pull_request' && 'win32' || 'none' }}
+        include: ${{ fromJSON(github.event_name == 'pull_request'
+          && '[{"runner":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","platform":"linux","arch":"amd64"}]'
+          || '[{"runner":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","platform":"linux","arch":"amd64"},{"runner":"macos-15-intel","target":"x86_64-apple-darwin","platform":"darwin","arch":"amd64"},{"runner":"macos-15","target":"aarch64-apple-darwin","platform":"darwin","arch":"arm64"},{"runner":"windows-latest","target":"x86_64-pc-windows-msvc","platform":"win32","arch":"amd64"}]') }}
 
     env:
       BUILD_TYPE: release
