@@ -17,16 +17,28 @@ pub struct SenderGuard {
     connection: Option<Connection>,
     key: i64,
 }
+impl SenderGuard {
+    async fn unlock(mut conn: Connection, key: i64) {
+        // Cancellation or an unlock error must destroy the connection rather
+        // than return a live advisory lock to the pool.
+        conn.discard = true;
+        if let Ok(row) = conn.query_one("SELECT pg_advisory_unlock($1)", &[&key]).await {
+            if row.get::<_, bool>(0) {
+                conn.discard = false;
+            }
+        }
+    }
+
+    pub async fn release(mut self) {
+        if let Some(conn) = self.connection.take() {
+            Self::unlock(conn, self.key).await;
+        }
+    }
+}
 impl Drop for SenderGuard {
     fn drop(&mut self) {
-        if let Some(mut conn) = self.connection.take() {
-            let key = self.key;
-            tokio::spawn(async move {
-                // Never return a live advisory lock to the pool.
-                if conn.query_one("SELECT pg_advisory_unlock($1)", &[&key]).await.is_err() {
-                    conn.discard = true;
-                }
-            });
+        if let Some(conn) = self.connection.take() {
+            tokio::spawn(Self::unlock(conn, self.key));
         }
     }
 }

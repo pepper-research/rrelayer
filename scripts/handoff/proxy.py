@@ -135,6 +135,20 @@ def handle_call(call):
     with LOCK:
         STATE["calls"] += 1
 
+    # Controlled admission benchmark: delay only the armed transaction's
+    # estimate, never unrelated RPCs or another sender's request.
+    if method == "eth_estimateGas" and params:
+        with LOCK:
+            delay = STATE.get("admission_delay")
+            if delay and int(params[0].get("value", "0x0"), 16) == delay["value"]:
+                STATE["admission_delay"] = None
+                STATE["admission_started"] = time.time()
+            else:
+                delay = None
+        if delay:
+            log({"ev": "admission_delay", "value": delay["value"], "seconds": delay["seconds"]})
+            time.sleep(delay["seconds"])
+
     if method in ("eth_getTransactionByHash", "eth_getTransactionReceipt") and params:
         with LOCK:
             fault = STATE["fault"]
@@ -261,6 +275,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(n) or b"null")
+        if self.path == "/lab/admission_delay":
+            with LOCK:
+                STATE["admission_delay"] = body
+                STATE["admission_started"] = None
+            return self._reply({"ok": True})
         if self.path == "/lab/sender":
             with LOCK:
                 STATE["sender"] = body["address"]
