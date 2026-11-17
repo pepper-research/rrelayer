@@ -144,12 +144,12 @@ pub(super) async fn send_transaction_with_id(
         transaction_to_send.id = id;
     }
 
-    let transaction = state
-        .transactions_queues
-        .lock()
-        .await
-        .add_transaction(&relayer.id, &transaction_to_send)
-        .await?;
+    let transaction = crate::transaction::queue_system::TransactionsQueues::admit_transaction(
+        &state.transactions_queues,
+        &relayer.id,
+        &transaction_to_send,
+    )
+    .await?;
 
     let result = SendTransactionResult {
         id: transaction.id,

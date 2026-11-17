@@ -29,13 +29,22 @@ pub async fn spawn_processing_tasks_for_relayer(
     transaction_queue: Arc<Mutex<TransactionsQueues>>,
     relayer_id: &RelayerId,
 ) {
-    let isolated = {
+    let (queue, coordination) = {
         let queues = transaction_queue.lock().await;
-        match queues.get_transactions_queue(relayer_id) {
-            Some(queue) => queue.lock().await.is_isolated_limit_base(),
-            None => false,
-        }
+        (queues.get_transactions_queue(relayer_id), queues.coordination.get(relayer_id).cloned())
     };
+    let Some(coordination) = coordination else {
+        return;
+    };
+    let isolated = match queue {
+        Some(queue) => queue.lock().await.is_isolated_limit_base(),
+        None => return,
+    };
+    // Admission and all three workers serialize only this relayer.
+    let processing = coordination.processing.clone();
+    let pending = coordination.pending.clone();
+    let pending_processing = processing.clone();
+    let mempool_processing = processing.clone();
     let queue_clone_pending = transaction_queue.clone();
     let relayer_id_pending = *relayer_id;
     tokio::spawn(async move {
@@ -43,6 +52,8 @@ pub async fn spawn_processing_tasks_for_relayer(
             queue_clone_pending,
             &relayer_id_pending,
             isolated,
+            pending_processing,
+            pending,
         )
         .await;
     });
@@ -54,6 +65,7 @@ pub async fn spawn_processing_tasks_for_relayer(
             queue_clone_inmempool,
             &relayer_id_inmempool,
             isolated,
+            mempool_processing,
         )
         .await;
     });
@@ -61,8 +73,13 @@ pub async fn spawn_processing_tasks_for_relayer(
     let queue_clone_mined = transaction_queue.clone();
     let relayer_id_mined = *relayer_id;
     tokio::spawn(async move {
-        continuously_process_mined_transactions(queue_clone_mined, &relayer_id_mined, isolated)
-            .await;
+        continuously_process_mined_transactions(
+            queue_clone_mined,
+            &relayer_id_mined,
+            isolated,
+            processing,
+        )
+        .await;
     });
 }
 
@@ -101,6 +118,19 @@ mod gateway_queue_tests {
     }
 }
 
+// Do not retain the registry lock while waiting for capacity or doing RPC/DB work.
+// Take the queue snapshot only after admission so waiting workers see removals.
+pub(super) async fn processing_context(
+    queue: &Arc<Mutex<TransactionsQueues>>,
+    relayer_id: &RelayerId,
+) -> (tokio::sync::OwnedSemaphorePermit, TransactionsQueues) {
+    let slots = queue.lock().await.processing_slots.clone();
+    // Sender guards retain a pool connection. Leave capacity for their writes.
+    let slot = slots.acquire_owned().await.expect("processing semaphore stays open");
+    let processing = queue.lock().await.for_processing(relayer_id);
+    (slot, processing)
+}
+
 /// Continuously processes pending transactions for a specific relayer.
 ///
 /// Runs in an infinite loop, processing one pending transaction at a time
@@ -109,6 +139,8 @@ async fn continuously_process_pending_transactions(
     queue: Arc<Mutex<TransactionsQueues>>,
     relayer_id: &RelayerId,
     isolated: bool,
+    processing: Arc<Mutex<()>>,
+    pending: Arc<tokio::sync::Notify>,
 ) {
     let mut shutdown_rx = subscribe_to_shutdown();
 
@@ -119,12 +151,21 @@ async fn continuously_process_pending_transactions(
                 break;
             }
             result = async {
-                let mut tq = queue.lock().await;
+                let _processing = processing.lock().await;
+                let (_slot, mut tq) = processing_context(&queue, relayer_id).await;
                 tq.process_single_pending(relayer_id).await
             } => {
                 match result {
                     Ok(result) => {
-                        processes_next_break(&queue_break_ms(result.process_again_after, isolated)).await;
+                        let wait = queue_break_ms(result.process_again_after, isolated);
+                        if isolated {
+                            processes_next_break(&wait).await;
+                        } else {
+                            tokio::select! {
+                                _ = pending.notified() => {},
+                                _ = processes_next_break(&wait) => {},
+                            }
+                        }
                     }
                     Err(e) => {
                         match e {
@@ -157,6 +198,7 @@ async fn continuously_process_inmempool_transactions(
     queue: Arc<Mutex<TransactionsQueues>>,
     relayer_id: &RelayerId,
     isolated: bool,
+    processing: Arc<Mutex<()>>,
 ) {
     let mut shutdown_rx = subscribe_to_shutdown();
 
@@ -167,7 +209,8 @@ async fn continuously_process_inmempool_transactions(
                 break;
             }
             result = async {
-                let mut tq = queue.lock().await;
+                let _processing = processing.lock().await;
+                let (_slot, mut tq) = processing_context(&queue, relayer_id).await;
                 tq.process_single_inmempool(relayer_id).await
             } => {
                 match result {
@@ -205,6 +248,7 @@ async fn continuously_process_mined_transactions(
     queue: Arc<Mutex<TransactionsQueues>>,
     relayer_id: &RelayerId,
     isolated: bool,
+    processing: Arc<Mutex<()>>,
 ) {
     let mut shutdown_rx = subscribe_to_shutdown();
 
@@ -215,7 +259,8 @@ async fn continuously_process_mined_transactions(
                 break;
             }
             result = async {
-                let mut tq = queue.lock().await;
+                let _processing = processing.lock().await;
+                let (_slot, mut tq) = processing_context(&queue, relayer_id).await;
                 tq.process_single_mined(relayer_id).await
             } => {
                 match result {
