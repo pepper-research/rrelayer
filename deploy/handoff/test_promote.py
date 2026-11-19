@@ -96,6 +96,23 @@ class PromotionTests(unittest.TestCase):
   self.args.resume=True
   with self.assertRaisesRegex(ValueError,'existing deployment journal'): Fake(self.args)
   self.assertFalse(Path(self.args.journal).exists())
+ def test_lost_launch_response_recovers_only_the_original_task(self):
+  c=Fake(self.args)
+  c.fail='candidate readiness'
+  with self.assertRaises(RuntimeError): c.run()
+  c.state.pop('warm_task')
+  c.save(stage='launching')
+  self.args.resume=True
+  resumed=Fake(self.args)
+  service_tasks=resumed.tasks
+  extra=dict(resumed.task('warm-task'),group='handoff-'+resumed.state['id'],startedBy=resumed.state['id'])
+  resumed.tasks=lambda service=None: service_tasks(service or 'service') + ([] if service else [extra])
+  extra['group']='unrelated'
+  with self.assertRaisesRegex(ValueError,'Unaccounted'): resumed.run()
+  extra['group']='handoff-'+resumed.state['id']
+  self.assertEqual(resumed.run()['stage'],'complete')
+  self.assertEqual(resumed.state['warm_task'],'warm-task')
+  self.assertFalse(any('run-task' in call for call in resumed.calls))
  def test_failed_prewarm_keeps_old(self):
   c=Fake(self.args);c.fail='candidate readiness'
   with self.assertRaises(RuntimeError):c.run()

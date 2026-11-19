@@ -173,8 +173,19 @@ class Controller:
         running=self.tasks(a.service)
         recovery=json.loads(Path(a.recover_journal).read_text()) if a.recover_journal else None
         allowed={t['taskArn'] for t in running}|{x for x in [self.state.get('warm_task'),recovery and recovery.get('warm_task')] if x}
-        unexpected=[t['taskArn'] for t in self.tasks() if t['taskDefinitionArn'].split('/')[-1].split(':')[0]==current['family'] and t['taskArn'] not in allowed]
-        if unexpected:raise ValueError('Unaccounted relayer tasks; reconcile before deployment')
+        launched = None
+        extras = [task for task in self.tasks() if task['taskArn'] not in allowed
+                  and (task['taskDefinitionArn'].split('/')[-1].split(':')[0] == current['family']
+                       or task['taskDefinitionArn'] == a.task_definition)]
+        if extras:
+            if a.resume and self.state['stage'] == 'launching' and len(extras) == 1:
+                task = extras[0]
+                if (task.get('group') == 'handoff-' + self.state['id']
+                        and task['taskDefinitionArn'] == a.task_definition
+                        and task.get('startedBy', self.state['id']) == self.state['id']):
+                    launched = task['taskArn']
+            if not launched:
+                raise ValueError('Unaccounted relayer tasks; reconcile before deployment')
         if 'previous_definition' not in self.state:
             if len(running)!=1 and not recovery:raise ValueError('Service is not steady; use its recovery journal')
             previous_source,_=source_of(current,a.container)
@@ -191,9 +202,11 @@ class Controller:
             return {'plan':'prewarm → verify → activate → replace service → retire warm task','legacy':self.state['legacy']}
         if self.state['stage'] in ('replacing-service', 'service-ready', 'retiring'):
             return self.finish_replacement(group, recovery)
+        if launched:
+            self.save(warm_task=launched, stage='warming')
         if 'warm_task' not in self.state:
             self.save(stage='launching')
-            result=self.aws('ecs','run-task','--cluster',a.cluster,'--task-definition',a.task_definition,'--launch-type','FARGATE','--enable-execute-command','--network-configuration',json.dumps(service['networkConfiguration']),'--client-token',self.state['id'],'--group','handoff-'+self.state['id'])
+            result=self.aws('ecs','run-task','--cluster',a.cluster,'--task-definition',a.task_definition,'--launch-type','FARGATE','--enable-execute-command','--network-configuration',json.dumps(service['networkConfiguration']),'--client-token',self.state['id'],'--started-by',self.state['id'],'--group','handoff-'+self.state['id'])
             if result.get('failures') or len(result.get('tasks',[]))!=1:raise RuntimeError('Candidate launch failed; existing service unchanged')
             self.save(warm_task=result['tasks'][0]['taskArn'],stage='warming')
         warm=self.state['warm_task'];status=self.wait(lambda:self.ready(warm,a.source,a.digest),'candidate readiness')
