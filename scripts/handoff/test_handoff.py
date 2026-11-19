@@ -486,7 +486,23 @@ def legacy_nonce_gap_recovery(ctx, delegated=False, only_legacy=False):
         code, body = lab.http('PUT', path+'/pause', auth=True)
         assert code == 204, (code, body)
         endpoint = f"{api}/transactions/cancel-legacy-nonce/{legacy['id']}/0"
-        code, response = lab.http('PUT', endpoint, auth=True)
+        code, other = lab.http('POST', f'{api}/relayers/{lab.CHAIN_ID}/new', {'name':'independent'}, auth=True)
+        assert code == 200, (code, other)
+        ctx.lab('/lab/nonce_gate', {'sender':ctx.relayer.lower()})
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            cancelling = pool.submit(lab.http, 'PUT', endpoint, auth=True)
+            try:
+                assert lab.wait_until(lambda: ctx.lab('/lab/state').get('nonce_waiting'), 10)
+                original_id = ctx.relayer_id
+                ctx.relayer_id = other['id']
+                independent = ctx.submit('new')
+                ctx.relayer_id = original_id
+                assert independent['id'], independent
+                done(ctx, [independent], seconds=12)
+                assert not cancelling.done()
+            finally:
+                ctx.lab('/lab/nonce_gate', {})
+            code, response = cancelling.result()
         assert code == 200, (code, response)
         cancel = response['cancelTransactionId']
         code, repeat = lab.http('PUT', endpoint, auth=True)
@@ -497,10 +513,10 @@ def legacy_nonce_gap_recovery(ctx, delegated=False, only_legacy=False):
         rows = ctx.rows()
         assert rows[legacy['id']]['status'] == 'CANCELLED' and rows[cancel]['nonce'] == 0
         assert len(ctx.chain_scan()) == 1 and ctx.onchain_nonce() == 1
-        assert int(lab.rpc(ctx.anvil_url,'eth_getBalance',[lab.SINK,'latest']),16) == 0
+        assert int(lab.rpc(ctx.anvil_url,'eth_getBalance',[lab.SINK,'latest']),16) == independent['value']
         code, body = lab.http('DELETE', path, auth=True)
         assert code == 204, (code, body)
-        return {'legacyNonceCancellation': cancel, 'recipientBalanceWei': 0}
+        return {'legacyNonceCancellation': cancel, 'independentConfirmed': independent['id'], 'recipientBalanceWei': independent['value']}
     key = str(uuid.uuid4())
     code, result = lab.http('POST', ctx.rr['new']['api']+f'/transactions/relayers/{lab.CHAIN_ID}/send-idempotent',
         {'to':lab.SINK,'value':hex(205002),'data':'0x','externalId':key}, auth=True)

@@ -259,20 +259,14 @@ impl TransactionsQueues {
         &self,
         relayer_id: &RelayerId,
     ) -> Result<usize, crate::postgres::PostgresError> {
-        self.db
-            .query_one(
-                "SELECT COUNT(*) FROM relayer.transaction WHERE relayer_id=$1 AND status='PENDING'",
-                &[relayer_id],
-            )
-            .await
-            .map(|r| r.get::<_, i64>(0) as usize)
+        self.db.count_transactions_by_status(relayer_id, TransactionStatus::PENDING).await
     }
 
     pub async fn inmempool_transactions_count(
         &self,
         relayer_id: &RelayerId,
     ) -> Result<usize, crate::postgres::PostgresError> {
-        self.db.query_one("SELECT COUNT(*) FROM relayer.transaction WHERE relayer_id=$1 AND status='INMEMPOOL'", &[relayer_id]).await.map(|r|r.get::<_,i64>(0) as usize)
+        self.db.count_transactions_by_status(relayer_id, TransactionStatus::INMEMPOOL).await
     }
 
     /// Adds a new relayer and its transaction queue to the system.
@@ -420,26 +414,29 @@ impl TransactionsQueues {
         Ok(estimated_gas_limit)
     }
 
-    /// Admission shares the local sender gate with workers, but never retains
-    /// the global registry lock across database or network work.
+    pub(crate) async fn sender_operation(
+        registry: &Arc<Mutex<Self>>,
+        relayer_id: &RelayerId,
+    ) -> Option<(tokio::sync::OwnedMutexGuard<()>, tokio::sync::OwnedSemaphorePermit, Self)> {
+        let coordination = registry.lock().await.coordination.get(relayer_id).cloned()?;
+        let processing = coordination.processing.clone().lock_owned().await;
+        let (slot, queues) = super::start::processing_context(registry, relayer_id).await;
+        queues.queues.contains_key(relayer_id).then_some((processing, slot, queues))
+    }
+
     pub async fn admit_transaction(
         registry: &Arc<Mutex<Self>>,
         relayer_id: &RelayerId,
         transaction: &TransactionToSend,
     ) -> Result<Transaction, AddTransactionError> {
-        let coordination = registry
-            .lock()
-            .await
-            .coordination
-            .get(relayer_id)
-            .cloned()
-            .ok_or(AddTransactionError::RelayerNotFound(*relayer_id))?;
-        let _processing = coordination.processing.lock().await;
-        let (_slot, mut queues) = super::start::processing_context(registry, relayer_id).await;
+        let (_processing, _slot, mut queues) =
+            Self::sender_operation(registry, relayer_id)
+                .await
+                .ok_or(AddTransactionError::RelayerNotFound(*relayer_id))?;
         let admitted = queues.add_transaction(relayer_id, transaction).await?;
-        // Persist first. The worker also retains periodic polling for standby
-        // admissions, process restarts and missed local notifications.
-        coordination.pending.notify_one();
+        if let Some(coordination) = queues.coordination.get(relayer_id) {
+            coordination.pending.notify_one();
+        }
         Ok(admitted)
     }
 

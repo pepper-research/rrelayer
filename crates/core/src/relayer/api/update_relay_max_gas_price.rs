@@ -23,9 +23,8 @@ pub async fn update_relay_max_gas_price(
     if exists {
         state.db.update_relayer_max_gas_price(&relayer_id, max_gas_price).await?;
         invalidate_relayer_cache(&state.cache, &relayer_id).await;
-        if let Ok(queue) =
-            state.transactions_queues.lock().await.get_transactions_queue_unsafe(&relayer_id)
-        {
+        let queue = state.transactions_queues.lock().await.get_transactions_queue(&relayer_id);
+        if let Some(queue) = queue {
             queue.lock().await.set_max_gas_price(max_gas_price);
         }
 

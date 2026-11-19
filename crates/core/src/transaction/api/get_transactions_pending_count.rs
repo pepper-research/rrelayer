@@ -20,8 +20,13 @@ pub async fn get_transactions_pending_count(
 
     state.validate_auth_basic_or_api_key(&headers, &relayer.address, &relayer.chain_id)?;
 
-    let count =
-        state.transactions_queues.lock().await.pending_transactions_count(&relayer_id).await?;
+    let count = state
+        .db
+        .count_transactions_by_status(
+            &relayer_id,
+            crate::transaction::types::TransactionStatus::PENDING,
+        )
+        .await?;
 
     Ok(Json(count))
 }

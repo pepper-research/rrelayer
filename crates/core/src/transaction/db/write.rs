@@ -773,7 +773,9 @@ mod fixed_base_admission_postgres_tests {
             relayer_id,
             authorization_list: None,
             to: EvmAddress::zero(),
-            from: EvmAddress::zero(),
+            from: EvmAddress::new(alloy::primitives::Address::from_slice(
+                &alloy::primitives::keccak256(relayer_id.to_string())[12..],
+            )),
             value: TransactionValue::zero(),
             data: TransactionData::empty(),
             nonce: TransactionNonce::new(nonce),

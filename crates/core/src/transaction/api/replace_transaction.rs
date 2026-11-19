@@ -68,12 +68,14 @@ pub async fn replace_transaction(
     )
     .await?;
 
-    let result = state
-        .transactions_queues
-        .lock()
+    let (_processing, _slot, mut queues) =
+        crate::transaction::queue_system::TransactionsQueues::sender_operation(
+            &state.transactions_queues,
+            &transaction.relayer_id,
+        )
         .await
-        .replace_transaction(&transaction, &replace_with)
-        .await?;
+        .ok_or_else(|| not_found("Relayer queue does not exist".to_string()))?;
+    let result = queues.replace_transaction(&transaction, &replace_with).await?;
 
     if let Some(reservation) = rate_limit_reservation {
         reservation.commit();

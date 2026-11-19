@@ -52,6 +52,7 @@ STATE = {
     "hidden_lookups": 0,
     "calls": 0,
 }
+NONCE_RELEASE = threading.Event()
 ARGS = None
 
 
@@ -137,6 +138,15 @@ def handle_call(call):
 
     # Controlled admission benchmark: delay only the armed transaction's
     # estimate, never unrelated RPCs or another sender's request.
+    if method == "eth_getTransactionCount" and params:
+        with LOCK:
+            held = STATE.get("nonce_sender") == params[0].lower()
+            if held:
+                STATE["nonce_sender"] = None
+                STATE["nonce_waiting"] = True
+        if held:
+            NONCE_RELEASE.wait(20)
+
     if method == "eth_estimateGas" and params:
         with LOCK:
             delay = STATE.get("admission_delay")
@@ -275,6 +285,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(n) or b"null")
+        if self.path == "/lab/nonce_gate":
+            with LOCK:
+                STATE["nonce_sender"] = body.get("sender")
+                STATE["nonce_waiting"] = False
+                if STATE["nonce_sender"]:
+                    NONCE_RELEASE.clear()
+                else:
+                    NONCE_RELEASE.set()
+            return self._reply({"ok": True})
         if self.path == "/lab/admission_delay":
             with LOCK:
                 STATE["admission_delay"] = body
