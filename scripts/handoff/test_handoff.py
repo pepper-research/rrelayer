@@ -51,8 +51,8 @@ def check_money(ctx, txs):
     return {'recipientBalanceWei':balance,'rows':ctx.rows(),'chain':chain}
 
 
-def startup(ctx, legacy=False):
-    binary = ctx.old_bin if legacy else ctx.new_bin
+def startup(ctx, legacy=False, binary=None):
+    binary = binary or (ctx.old_bin if legacy else ctx.new_bin)
     ctx.start_rr('old',binary,lab.PORTS['api'])
     # Production has pre-existing relayers. Seed that state, then restart to load it.
     # Current production's dynamic-create path recursively locks TransactionsQueues;
@@ -67,7 +67,7 @@ def startup(ctx, legacy=False):
 
 
 def warm_handoff(ctx):
-    startup(ctx)
+    startup(ctx, binary=ctx.old_bin)
     ctx.lab('/lab/hide_receipts',{'seconds':4})
     txs = [send(ctx,'old',11001)]
     ctx.lab('/lab/hold',{'on':True})
