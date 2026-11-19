@@ -234,7 +234,10 @@ impl PostgresClient {
                   OR (t.status='FAILED' AND t.broadcast_attempted
                     AND NOT EXISTS (SELECT 1 FROM relayer.transaction settled
                       WHERE settled.chain_id=t.chain_id AND settled."from"=t."from"
-                        AND settled.nonce>=t.nonce AND settled.status='CONFIRMED'))))"#,
+                        AND settled.nonce=t.nonce
+                        AND settled.hash IS NOT NULL AND settled.mined_at IS NOT NULL
+                        AND settled.block_hash IS NOT NULL AND settled.block_number IS NOT NULL
+                        AND settled.status IN ('CONFIRMED','FAILED')))))"#,
                 &[relayer_id],
             )
             .await?

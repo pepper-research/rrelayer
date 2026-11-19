@@ -860,6 +860,18 @@ mod fixed_base_admission_postgres_tests {
             Err(PostgresError::RelayerDeleted)
         ));
 
+        let legacy_id = RelayerId::new();
+        record_relayer(&first, legacy_id).await?;
+        let failed = pending(legacy_id, 0);
+        let later = pending(legacy_id, 1);
+        first.save_transaction(&legacy_id, &failed).await?;
+        first.save_transaction(&legacy_id, &later).await?;
+        first.execute("UPDATE relayer.transaction SET status='FAILED', broadcast_attempted=TRUE WHERE id=$1", &[&failed.id]).await?;
+        first.execute("UPDATE relayer.transaction SET status='CONFIRMED', hash=$2, block_hash=$2, block_number=2, mined_at=NOW() WHERE id=$1", &[&later.id, &vec![0x11u8; 32]]).await?;
+        assert!(!second.delete_relayer(&legacy_id).await?);
+        first.execute("UPDATE relayer.transaction SET hash=$2, block_hash=$2, block_number=1, mined_at=NOW() WHERE id=$1", &[&failed.id, &vec![0x22u8; 32]]).await?;
+        assert!(second.delete_relayer(&legacy_id).await?);
+
         let fixed_id = RelayerId::new();
         record_relayer(&first, fixed_id).await?;
         let one = pending(fixed_id, 0);
