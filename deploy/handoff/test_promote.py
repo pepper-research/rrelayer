@@ -61,6 +61,22 @@ class PromotionTests(unittest.TestCase):
   c=Fake(self.args);self.assertEqual(c.run()['stage'],'complete');self.assertTrue(c.warmStopped)
   pre=c.calls.index(('wait','prewarmed target health'));activate=c.calls.index(('api','warm-task','/handoff/activate'));self.assertLess(pre,activate)
   changes=[v for v in c.calls if '--deployment-configuration' in v];self.assertFalse(json.loads(changes[0][-1])['deploymentCircuitBreaker']['rollback'])
+ def test_resume_after_warm_task_stopped(self):
+  controller=Fake(self.args)
+  save=controller.save
+  def interrupt(**fields):
+   if fields.get('stage')=='complete': raise InterruptedError()
+   save(**fields)
+  controller.save=interrupt
+  with self.assertRaises(InterruptedError): controller.run()
+  self.assertEqual(controller.state['stage'],'service-ready')
+  self.args.resume=True
+  resumed=Fake(self.args)
+  resumed.active,resumed.replaced,resumed.warmStopped,resumed.oldStopped=SHA,True,True,True
+  self.assertEqual(resumed.run()['stage'],'complete')
+  self.assertIn(('api','service-new','/ready'),resumed.calls)
+  self.assertNotIn(('api','warm-task','/ready'),resumed.calls)
+  self.assertFalse(any('update-service' in call or 'stop-task' in call for call in resumed.calls))
  def test_failed_prewarm_keeps_old(self):
   c=Fake(self.args);c.fail='candidate readiness'
   with self.assertRaises(RuntimeError):c.run()

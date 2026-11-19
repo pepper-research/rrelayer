@@ -187,6 +187,8 @@ class Controller:
         if self.state['stage']=='complete':return {'stage':'complete','source':a.source,'digest':a.digest}
         if not a.execute:
             return {'plan':'prewarm → verify → activate → replace service → retire warm task','legacy':self.state['legacy']}
+        if self.state['stage'] in ('replacing-service', 'service-ready'):
+            return self.finish_replacement(group, recovery)
         if 'warm_task' not in self.state:
             self.save(stage='launching')
             result=self.aws('ecs','run-task','--cluster',a.cluster,'--task-definition',a.task_definition,'--launch-type','FARGATE','--enable-execute-command','--network-configuration',json.dumps(service['networkConfiguration']),'--client-token',self.state['id'],'--group','handoff-'+self.state['id'])
@@ -222,6 +224,11 @@ class Controller:
         self.wait(lambda:self.healthy(target,group),'active warm target health')
         self.aws('ecs','update-service','--cluster',a.cluster,'--service',a.service,'--task-definition',a.task_definition,'--desired-count','1','--enable-execute-command')
         self.save(stage='replacing-service')
+        return self.finish_replacement(group, recovery)
+
+    def finish_replacement(self, group, recovery):
+        a = self.a
+        warm = self.state["warm_task"]
         def service_ready():
             tasks=self.tasks(a.service)
             if len(tasks)!=1 or tasks[0]['taskDefinitionArn']!=a.task_definition:return False
