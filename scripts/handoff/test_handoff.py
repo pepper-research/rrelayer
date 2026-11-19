@@ -452,7 +452,7 @@ def failed_attempt_keeps_nonce_reserved(ctx):
     return {'rows': rows, 'reservedAttemptNonce': 1}
 
 
-def legacy_nonce_gap_recovery(ctx, delegated=False):
+def legacy_nonce_gap_recovery(ctx, delegated=False, only_legacy=False):
     startup(ctx)
     if delegated:
         delegate = "0x000000000000000000000000000000000000beef"
@@ -461,7 +461,7 @@ def legacy_nonce_gap_recovery(ctx, delegated=False):
     ctx.kill_rr('old')
     ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
     legacy = send(ctx, 'new', 205000)
-    held = send(ctx, 'new', 205001)
+    held = None if only_legacy else send(ctx, 'new', 205001)
     ctx.stop_rr('new')
     # Exact legacy shape: FAILED, conservatively attempted, no known hash or
     # persisted envelope. This never certifies that an old payout is impossible.
@@ -476,6 +476,31 @@ def legacy_nonce_gap_recovery(ctx, delegated=False):
         COMMIT;
     """)
     ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
+    if only_legacy:
+        api = ctx.rr['new']['api']
+        path = f'{api}/relayers/{ctx.relayer_id}'
+        assert len(ctx.rows()) == 1
+        code, body = lab.http('DELETE', path, auth=True)
+        assert code == 409, (code, body)
+        activate(ctx, 'new', 'old')
+        code, body = lab.http('PUT', path+'/pause', auth=True)
+        assert code == 204, (code, body)
+        endpoint = f"{api}/transactions/cancel-legacy-nonce/{legacy['id']}/0"
+        code, response = lab.http('PUT', endpoint, auth=True)
+        assert code == 200, (code, response)
+        cancel = response['cancelTransactionId']
+        code, repeat = lab.http('PUT', endpoint, auth=True)
+        assert code == 200 and repeat['cancelTransactionId'] == cancel
+        assert lab.http('DELETE', path, auth=True)[0] == 409
+        assert lab.http('PUT', path+'/unpause', auth=True)[0] == 204
+        assert lab.wait_until(lambda: ctx.rows()[cancel]['status'] == 'CONFIRMED', 45)
+        rows = ctx.rows()
+        assert rows[legacy['id']]['status'] == 'CANCELLED' and rows[cancel]['nonce'] == 0
+        assert len(ctx.chain_scan()) == 1 and ctx.onchain_nonce() == 1
+        assert int(lab.rpc(ctx.anvil_url,'eth_getBalance',[lab.SINK,'latest']),16) == 0
+        code, body = lab.http('DELETE', path, auth=True)
+        assert code == 204, (code, body)
+        return {'legacyNonceCancellation': cancel, 'recipientBalanceWei': 0}
     key = str(uuid.uuid4())
     code, result = lab.http('POST', ctx.rr['new']['api']+f'/transactions/relayers/{lab.CHAIN_ID}/send-idempotent',
         {'to':lab.SINK,'value':hex(205002),'data':'0x','externalId':key}, auth=True)
@@ -573,6 +598,7 @@ def delete_after_settlement(ctx):
 
 SCENARIOS['delete_after_settlement'] = delete_after_settlement
 SCENARIOS['dynamic_registration'] = dynamic_registration
+SCENARIOS['delete_after_legacy_recovery'] = lambda ctx: legacy_nonce_gap_recovery(ctx, only_legacy=True)
 SCENARIOS['legacy_nonce_gap_recovery'] = legacy_nonce_gap_recovery
 SCENARIOS['delegated_legacy_nonce_gap_recovery'] = lambda ctx: legacy_nonce_gap_recovery(ctx, delegated=True)
 SCENARIOS['restart_gap_below_loaded_row_no_gap_rejection'] = restart_gap_below_loaded_row_no_gap_rejection

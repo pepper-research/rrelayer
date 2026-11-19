@@ -226,10 +226,20 @@ impl PostgresClient {
         let tx = conn.transaction().await?;
         tx.query_opt("SELECT id FROM relayer.record WHERE id=$1 FOR UPDATE", &[relayer_id]).await?;
         // This separate statement sees admissions committed while obtaining the row lock.
-        if tx.query_one(
-            "SELECT EXISTS(SELECT 1 FROM relayer.transaction WHERE relayer_id=$1 AND status IN ('PENDING','INMEMPOOL','MINED'))",
-            &[relayer_id],
-        ).await?.get::<_, bool>(0) {
+        if tx
+            .query_one(
+                r#"SELECT EXISTS(
+                SELECT 1 FROM relayer.transaction t WHERE t.relayer_id=$1
+                AND (t.status IN ('PENDING','INMEMPOOL','MINED')
+                  OR (t.status='FAILED' AND t.broadcast_attempted
+                    AND NOT EXISTS (SELECT 1 FROM relayer.transaction settled
+                      WHERE settled.chain_id=t.chain_id AND settled."from"=t."from"
+                        AND settled.nonce>=t.nonce AND settled.status='CONFIRMED'))))"#,
+                &[relayer_id],
+            )
+            .await?
+            .get::<_, bool>(0)
+        {
             return Ok(false);
         }
         tx.execute("UPDATE relayer.record SET deleted=TRUE WHERE id=$1", &[relayer_id]).await?;
