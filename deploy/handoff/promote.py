@@ -187,7 +187,7 @@ class Controller:
         if self.state['stage']=='complete':return {'stage':'complete','source':a.source,'digest':a.digest}
         if not a.execute:
             return {'plan':'prewarm → verify → activate → replace service → retire warm task','legacy':self.state['legacy']}
-        if self.state['stage'] in ('replacing-service', 'service-ready'):
+        if self.state['stage'] in ('replacing-service', 'service-ready', 'retiring'):
             return self.finish_replacement(group, recovery)
         if 'warm_task' not in self.state:
             self.save(stage='launching')
@@ -235,10 +235,14 @@ class Controller:
             status=self.ready(tasks[0]['taskArn'],a.source,a.digest)
             return status and status['processing'] and status['durableIntakeReady'] and self.healthy(self.target(tasks[0]['taskArn']),group)
         self.wait(service_ready,'replacement service health',900)
-        self.save(stage='service-ready')
+        self.save(stage='retiring')
         retiring=[warm]+([recovery['warm_task']] if recovery else [])
         for arn in retiring:
-            if self.task(arn)['lastStatus']=='STOPPED':continue
+            task = self.task(arn)
+            if task['lastStatus']=='STOPPED':continue
+            if task.get('desiredStatus')=='STOPPED':
+                self.wait(lambda: self.task(arn)['lastStatus']=='STOPPED', 'task retirement')
+                continue
             target=self.target(arn)
             self.aws('elbv2','deregister-targets','--target-group-arn',group,'--targets',json.dumps([target]))
             def drained():
@@ -246,6 +250,7 @@ class Controller:
                 return not rows or rows[0]['TargetHealth']['State']=='unused'
             self.wait(drained,'target drain')
             self.aws('ecs','stop-task','--cluster',a.cluster,'--task',arn,'--reason','Verified handoff complete')
+            self.wait(lambda: self.task(arn)['lastStatus']=='STOPPED', 'task retirement')
         self.save(stage='complete')
         return {'stage':'complete','source':a.source,'digest':a.digest}
 

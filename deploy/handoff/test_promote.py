@@ -69,7 +69,7 @@ class PromotionTests(unittest.TestCase):
    save(**fields)
   controller.save=interrupt
   with self.assertRaises(InterruptedError): controller.run()
-  self.assertEqual(controller.state['stage'],'service-ready')
+  self.assertEqual(controller.state['stage'],'retiring')
   self.args.resume=True
   resumed=Fake(self.args)
   resumed.active,resumed.replaced,resumed.warmStopped,resumed.oldStopped=SHA,True,True,True
@@ -77,6 +77,21 @@ class PromotionTests(unittest.TestCase):
   self.assertIn(('api','service-new','/ready'),resumed.calls)
   self.assertNotIn(('api','warm-task','/ready'),resumed.calls)
   self.assertFalse(any('update-service' in call or 'stop-task' in call for call in resumed.calls))
+ def test_async_stop_keeps_retirement_pending(self):
+  controller=Fake(self.args)
+  original=controller.task
+  def stopping(arn):
+   task=original(arn)
+   if arn=='warm-task' and controller.warmStopped:
+    task.update(lastStatus='RUNNING',desiredStatus='STOPPED')
+   return task
+  controller.task=stopping
+  with self.assertRaisesRegex(RuntimeError,'task retirement'): controller.run()
+  self.assertEqual(controller.state['stage'],'retiring')
+  with self.assertRaisesRegex(RuntimeError,'task retirement'): controller.run()
+  self.assertEqual(sum('stop-task' in call for call in controller.calls),1)
+  controller.task=original
+  self.assertEqual(controller.run()['stage'],'complete')
  def test_failed_prewarm_keeps_old(self):
   c=Fake(self.args);c.fail='candidate readiness'
   with self.assertRaises(RuntimeError):c.run()
