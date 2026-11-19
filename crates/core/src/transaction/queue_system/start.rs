@@ -153,6 +153,9 @@ async fn continuously_process_pending_transactions(
             result = async {
                 let _processing = processing.lock().await;
                 let (_slot, mut tq) = processing_context(&queue, relayer_id).await;
+                if tq.get_transactions_queue(relayer_id).is_none() {
+                    return Err(ProcessPendingTransactionError::RelayerTransactionsQueueNotFound(*relayer_id));
+                }
                 tq.process_single_pending(relayer_id).await
             } => {
                 match result {
@@ -170,7 +173,8 @@ async fn continuously_process_pending_transactions(
                     Err(e) => {
                         match e {
                             ProcessPendingTransactionError::Handoff(PostgresError::SenderUnavailable) => { sleep_ms(&250).await; }
-                            ProcessPendingTransactionError::RelayerTransactionsQueueNotFound(_) => {
+                            ProcessPendingTransactionError::Handoff(PostgresError::RelayerDeleted) | ProcessPendingTransactionError::RelayerTransactionsQueueNotFound(_) => {
+                                TransactionsQueues::delete_queue(&queue, relayer_id).await;
                                 // the queue has been deleted so kill out the loop
                                 info!(
                                     "Relayer id {} has been deleted stopping the pending queue for it",
@@ -211,6 +215,9 @@ async fn continuously_process_inmempool_transactions(
             result = async {
                 let _processing = processing.lock().await;
                 let (_slot, mut tq) = processing_context(&queue, relayer_id).await;
+                if tq.get_transactions_queue(relayer_id).is_none() {
+                    return Err(ProcessInmempoolTransactionError::RelayerTransactionsQueueNotFound(*relayer_id));
+                }
                 tq.process_single_inmempool(relayer_id).await
             } => {
                 match result {
@@ -220,7 +227,8 @@ async fn continuously_process_inmempool_transactions(
                     Err(e) => {
                         match e {
                             ProcessInmempoolTransactionError::Handoff(PostgresError::SenderUnavailable) => { sleep_ms(&250).await; }
-                            ProcessInmempoolTransactionError::RelayerTransactionsQueueNotFound(_) => {
+                            ProcessInmempoolTransactionError::Handoff(PostgresError::RelayerDeleted) | ProcessInmempoolTransactionError::RelayerTransactionsQueueNotFound(_) => {
+                                TransactionsQueues::delete_queue(&queue, relayer_id).await;
                                 // the queue has been deleted so kill out the loop
                                 info!(
                                     "Relayer id {} has been deleted stopping the inmempool queue for it",
@@ -261,6 +269,9 @@ async fn continuously_process_mined_transactions(
             result = async {
                 let _processing = processing.lock().await;
                 let (_slot, mut tq) = processing_context(&queue, relayer_id).await;
+                if tq.get_transactions_queue(relayer_id).is_none() {
+                    return Err(ProcessMinedTransactionError::RelayerTransactionsQueueNotFound(*relayer_id));
+                }
                 tq.process_single_mined(relayer_id).await
             } => {
                 match result {
@@ -270,7 +281,8 @@ async fn continuously_process_mined_transactions(
                     Err(e) => {
                         match e {
                             ProcessMinedTransactionError::Handoff(PostgresError::SenderUnavailable) => { sleep_ms(&250).await; }
-                            ProcessMinedTransactionError::RelayerTransactionsQueueNotFound(_) => {
+                            ProcessMinedTransactionError::Handoff(PostgresError::RelayerDeleted) | ProcessMinedTransactionError::RelayerTransactionsQueueNotFound(_) => {
+                                TransactionsQueues::delete_queue(&queue, relayer_id).await;
                                 // the queue has been deleted so kill out the loop
                                 info!(
                                     "Relayer id {} has been deleted stopping the mined queue for it",

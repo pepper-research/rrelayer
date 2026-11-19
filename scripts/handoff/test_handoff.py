@@ -612,6 +612,29 @@ def delete_after_settlement(ctx):
     return result
 
 
+def standby_deletion(ctx):
+    startup(ctx)
+    original = ctx.relayer_id
+    ctx.create_relayer(ctx.rr['old']['api'])
+    ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
+    code, body = lab.http('DELETE', ctx.rr['new']['api'] + f'/relayers/{original}', auth=True)
+    assert code == 204, (code, body)
+    for name in ('new', 'old'):
+        log = Path(ctx.sdir) / f'rrelayer-{name}.log'
+        assert lab.wait_until(lambda: all(
+            f'{original} has been deleted stopping the {worker} queue' in log.read_text()
+            for worker in ('pending', 'inmempool', 'mined')), 20), name
+    before = ctx.submit('old')
+    assert before['id'], before
+    done(ctx, [before])
+    activate(ctx, 'new', 'old')
+    after = ctx.submit('new')
+    assert after['id'], after
+    done(ctx, [after])
+    return check_money(ctx, [before, after])
+
+
+SCENARIOS['standby_deletion'] = standby_deletion
 SCENARIOS['delete_after_settlement'] = delete_after_settlement
 SCENARIOS['dynamic_registration'] = dynamic_registration
 SCENARIOS['delete_after_legacy_recovery'] = lambda ctx: legacy_nonce_gap_recovery(ctx, only_legacy=True)

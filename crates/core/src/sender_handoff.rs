@@ -55,11 +55,16 @@ impl PostgresClient {
     ) -> Result<SenderGuard, PostgresError> {
         let conn = self.pool.inner.get_owned().await?;
         conn.batch_execute("SET statement_timeout = '10s'; SET idle_in_transaction_session_timeout = '10s'; SET idle_session_timeout = '15s'").await?;
-        let eligible: bool = conn.query_one("SELECT enabled AND (NOT $1 OR active_release=$2) FROM relayer.sender_deployment WHERE singleton", &[&processing,&release_id()]).await?.get(0);
-        if !eligible {
+        let row = conn.query_opt(
+            "SELECT r.chain_id, r.address, hashtextextended(r.chain_id::text || ':' || encode(r.address, 'hex'), 761832) AS key,
+                d.enabled AND (NOT $1 OR d.active_release=$2) AS eligible
+             FROM relayer.record r CROSS JOIN relayer.sender_deployment d
+             WHERE d.singleton AND r.id=$3 AND NOT r.deleted",
+            &[&processing, &release_id(), relayer],
+        ).await?.ok_or(PostgresError::RelayerDeleted)?;
+        if !row.get::<_, bool>("eligible") {
             return Err(PostgresError::SenderUnavailable);
         }
-        let row = conn.query_one("SELECT chain_id, address, hashtextextended(chain_id::text || ':' || encode(address, 'hex'), 761832) AS key FROM relayer.record WHERE id=$1", &[relayer]).await?;
         let chain: i64 = row.get("chain_id");
         let signer: Vec<u8> = row.get("address");
         let key: i64 = row.get("key");
