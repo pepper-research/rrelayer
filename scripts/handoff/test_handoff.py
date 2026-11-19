@@ -554,6 +554,24 @@ def dynamic_registration(ctx):
     return {'recipientBalanceWei': balance}
 
 
+def delete_after_settlement(ctx):
+    startup(ctx)
+    api = ctx.rr['old']['api']
+    path = f'{api}/relayers/{ctx.relayer_id}'
+    ctx.lab('/lab/hold', {'on': True})
+    tx = send(ctx, 'old', 23001)
+    code, body = lab.http('DELETE', path, auth=True)
+    assert code == 409, (code, body)
+    ctx.lab('/lab/hold', {'on': False})
+    done(ctx, [tx])
+    assert lab.wait_until(lambda: ctx.rows()[tx['id']]['status'] == 'CONFIRMED', 30), ctx.rows()
+    result = check_money(ctx, [tx])
+    code, body = lab.http('DELETE', path, auth=True)
+    assert code == 204, (code, body)
+    return result
+
+
+SCENARIOS['delete_after_settlement'] = delete_after_settlement
 SCENARIOS['dynamic_registration'] = dynamic_registration
 SCENARIOS['legacy_nonce_gap_recovery'] = legacy_nonce_gap_recovery
 SCENARIOS['delegated_legacy_nonce_gap_recovery'] = lambda ctx: legacy_nonce_gap_recovery(ctx, delegated=True)

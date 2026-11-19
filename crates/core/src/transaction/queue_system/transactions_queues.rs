@@ -640,6 +640,9 @@ impl TransactionsQueues {
                     let _ = transactions_queue.nonce_manager.get_and_increment().await;
                 }
             }
+            Err(crate::postgres::PostgresError::RelayerDeleted) => {
+                return Err(AddTransactionError::RelayerNotFound(*relayer_id))
+            }
             Err(crate::postgres::PostgresError::FixedBaseLaneBusy) => {
                 return Err(AddTransactionError::FixedBaseLaneBusy);
             }

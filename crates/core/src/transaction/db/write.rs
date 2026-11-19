@@ -62,6 +62,18 @@ impl PostgresClient {
         let mut conn = self.pool.get().await?;
         let trans = conn.transaction().await.map_err(PostgresError::PgError)?;
 
+        // A successful deletion and an admission must never both commit.
+        if trans
+            .query_opt(
+                "SELECT id FROM relayer.record WHERE id=$1 AND NOT deleted FOR SHARE",
+                &[relayer_id],
+            )
+            .await?
+            .is_none()
+        {
+            return Err(PostgresError::RelayerDeleted);
+        }
+
         if signed_envelope.is_some() {
             // Serialize admissions across overlapping ECS tasks using the durable
             // relayer identity. The lock is released with this DB transaction.
@@ -816,6 +828,37 @@ mod fixed_base_admission_postgres_tests {
         let mut first = PostgresClient::for_test_url(&url).await?;
         let mut second = PostgresClient::for_test_url(&url).await?;
         apply_schema(&first).await?;
+
+        let raced_id = RelayerId::new();
+        record_relayer(&first, raced_id).await?;
+        let entry = pending(raced_id, 0);
+        let (admitted, deleted) = tokio::join!(
+            first.save_transaction(&raced_id, &entry),
+            second.delete_relayer(&raced_id),
+        );
+        if deleted? {
+            assert!(matches!(admitted, Err(PostgresError::RelayerDeleted)));
+        } else {
+            admitted?;
+        }
+        let pending_id = RelayerId::new();
+        record_relayer(&first, pending_id).await?;
+        first.save_transaction(&pending_id, &pending(pending_id, 0)).await?;
+        for status in ["PENDING", "INMEMPOOL", "MINED"] {
+            first.execute("UPDATE relayer.transaction SET status=$2::text::relayer.tx_status WHERE relayer_id=$1", &[&pending_id, &status]).await?;
+            assert!(!second.delete_relayer(&pending_id).await?);
+        }
+        first
+            .execute(
+                "UPDATE relayer.transaction SET status='CONFIRMED' WHERE relayer_id=$1",
+                &[&pending_id],
+            )
+            .await?;
+        assert!(second.delete_relayer(&pending_id).await?);
+        assert!(matches!(
+            first.save_transaction(&pending_id, &pending(pending_id, 1)).await,
+            Err(PostgresError::RelayerDeleted)
+        ));
 
         let fixed_id = RelayerId::new();
         record_relayer(&first, fixed_id).await?;

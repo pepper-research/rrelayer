@@ -221,19 +221,20 @@ impl PostgresClient {
         }
     }
 
-    pub async fn delete_relayer(&self, relayer_id: &RelayerId) -> Result<(), PostgresError> {
-        let _ = self
-            .execute(
-                "
-                UPDATE relayer.record
-                SET deleted = TRUE
-                WHERE id = $1
-                ",
-                &[relayer_id],
-            )
-            .await?;
-
-        Ok(())
+    pub async fn delete_relayer(&self, relayer_id: &RelayerId) -> Result<bool, PostgresError> {
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
+        tx.query_opt("SELECT id FROM relayer.record WHERE id=$1 FOR UPDATE", &[relayer_id]).await?;
+        // This separate statement sees admissions committed while obtaining the row lock.
+        if tx.query_one(
+            "SELECT EXISTS(SELECT 1 FROM relayer.transaction WHERE relayer_id=$1 AND status IN ('PENDING','INMEMPOOL','MINED'))",
+            &[relayer_id],
+        ).await?.get::<_, bool>(0) {
+            return Ok(false);
+        }
+        tx.execute("UPDATE relayer.record SET deleted=TRUE WHERE id=$1", &[relayer_id]).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn pause_relayer(&self, relayer_id: &RelayerId) -> Result<(), PostgresError> {
