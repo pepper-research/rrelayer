@@ -7,7 +7,10 @@ use crate::{
     provider::EvmProvider,
     relayer::{cache::invalidate_relayer_cache, Relayer},
     shared::HttpError,
-    transaction::{queue_system::TransactionsQueueSetup, NonceManager},
+    transaction::{
+        queue_system::{TransactionsQueueSetup, TransactionsQueues},
+        NonceManager,
+    },
 };
 
 /// Starts the transaction queue for a relayer and initializes it with the current nonce.
@@ -49,26 +52,21 @@ pub async fn start_relayer_queue(
 
     let relayer_id = relayer.id;
 
-    // Start the transaction queue for this relayer
-    state
-        .transactions_queues
-        .lock()
-        .await
-        .add_new_relayer(
-            TransactionsQueueSetup::new(
-                relayer,
-                provider.clone(),
-                NonceManager::new(current_nonce),
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                state.safe_proxy_manager.clone(),
-                gas_bump_config,
-                max_gas_price_multiplier,
-            ),
-            state.transactions_queues.clone(),
-        )
-        .await?;
+    TransactionsQueues::add_new_relayer(
+        state.transactions_queues.clone(),
+        TransactionsQueueSetup::new(
+            relayer,
+            provider.clone(),
+            NonceManager::new(current_nonce),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            state.safe_proxy_manager.clone(),
+            gas_bump_config,
+            max_gas_price_multiplier,
+        ),
+    )
+    .await;
 
     invalidate_relayer_cache(&state.cache, &relayer_id).await;
 

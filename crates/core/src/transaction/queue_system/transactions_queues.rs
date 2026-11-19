@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use alloy::{
     consensus::TypedTransaction,
@@ -253,37 +250,19 @@ impl TransactionsQueues {
     }
 
     /// Adds a new relayer and its transaction queue to the system.
-    pub async fn add_new_relayer(
-        &mut self,
-        setup: TransactionsQueueSetup,
-        queues_arc: Arc<Mutex<TransactionsQueues>>,
-    ) -> Result<(), WalletOrProviderError> {
-        let current_nonce = setup.evm_provider.get_nonce(&setup.relayer).await?;
+    pub async fn add_new_relayer(queues: Arc<Mutex<Self>>, setup: TransactionsQueueSetup) {
         let relayer_id = setup.relayer.id;
-
-        self.coordination.insert(relayer_id, Arc::new(QueueCoordination::default()));
-        self.queues.insert(
-            relayer_id,
-            Arc::new(Mutex::new(TransactionsQueue::new(
-                TransactionsQueueSetup::new(
-                    setup.relayer,
-                    setup.evm_provider,
-                    NonceManager::new(current_nonce),
-                    VecDeque::new(),
-                    VecDeque::new(),
-                    HashMap::new(),
-                    self.safe_proxy_manager.clone(),
-                    setup.gas_bump_config,
-                    setup.max_gas_price_multiplier,
-                ),
-                self.gas_oracle_cache.clone(),
-                self.blob_gas_oracle_cache.clone(),
-            ))),
-        );
-
-        spawn_processing_tasks_for_relayer(queues_arc, &relayer_id).await;
-
-        Ok(())
+        {
+            let mut queues = queues.lock().await;
+            let queue = TransactionsQueue::new(
+                setup,
+                queues.gas_oracle_cache.clone(),
+                queues.blob_gas_oracle_cache.clone(),
+            );
+            queues.coordination.insert(relayer_id, Arc::new(QueueCoordination::default()));
+            queues.queues.insert(relayer_id, Arc::new(Mutex::new(queue)));
+        }
+        spawn_processing_tasks_for_relayer(queues, &relayer_id).await;
     }
 
     fn expires_at(&self) -> DateTime<Utc> {

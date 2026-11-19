@@ -526,6 +526,35 @@ def legacy_nonce_gap_recovery(ctx, delegated=False):
     return result
 
 
+def dynamic_registration(ctx):
+    ctx.start_rr('new', ctx.new_bin, lab.PORTS['api'])
+    api = ctx.rr['new']['api']
+    activate(ctx, 'new', bootstrap=True)
+    ctx.create_relayer(api)
+    original = ctx.relayer_id
+    source = str(uuid.uuid4())
+    address = lab.cast('wallet', 'address', '--mnemonic', lab.MNEMONIC, '--mnemonic-index', '1')
+    ctx.pg.psql(ctx.dbname, f"INSERT INTO relayer.record(id,name,chain_id,address,wallet_index) VALUES('{source}','source',{lab.CHAIN_ID + 1},decode('{address[2:]}','hex'),1)")
+    code, cloned = lab.http('POST', f'{api}/relayers/{source}/clone',
+                            {'chainId': lab.CHAIN_ID, 'newRelayerName': 'clone'}, auth=True)
+    assert code == 200, (code, cloned)
+    assert cloned['address'].lower() == address.lower()
+    assert cloned['id'] != original
+    total = 0
+    for relayer_id, sender in ((cloned['id'], address), (original, ctx.relayer)):
+        ctx.relayer_id = relayer_id
+        tx = ctx.submit('new')
+        assert tx['id'], tx
+        done(ctx, [tx])
+        receipt = lab.rpc(ctx.anvil_url, 'eth_getTransactionReceipt', [ctx.rows()[tx['id']]['hash']])
+        assert receipt['from'].lower() == sender.lower() and int(receipt['status'], 16) == 1
+        total += tx['value']
+    balance = int(lab.rpc(ctx.anvil_url, 'eth_getBalance', [lab.SINK, 'latest']), 16)
+    assert balance == total
+    return {'recipientBalanceWei': balance}
+
+
+SCENARIOS['dynamic_registration'] = dynamic_registration
 SCENARIOS['legacy_nonce_gap_recovery'] = legacy_nonce_gap_recovery
 SCENARIOS['delegated_legacy_nonce_gap_recovery'] = lambda ctx: legacy_nonce_gap_recovery(ctx, delegated=True)
 SCENARIOS['restart_gap_below_loaded_row_no_gap_rejection'] = restart_gap_below_loaded_row_no_gap_rejection
