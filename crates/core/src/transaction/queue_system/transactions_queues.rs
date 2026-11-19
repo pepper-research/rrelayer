@@ -61,6 +61,7 @@ pub(super) struct QueueCoordination {
 /// Registry and shared resources for the active sender queues.
 pub struct TransactionsQueues {
     pub queues: HashMap<RelayerId, Arc<Mutex<TransactionsQueue>>>,
+    draining: HashMap<RelayerId, tokio::sync::watch::Receiver<()>>,
     pub(super) processing_slots: Arc<Semaphore>,
     pub(super) coordination: HashMap<RelayerId, Arc<QueueCoordination>>,
     pub relayer_block_times_ms: HashMap<RelayerId, u64>,
@@ -79,6 +80,7 @@ impl TransactionsQueues {
     // let concurrent signers overwrite one another's database authorization.
     pub(super) fn for_processing(&self, relayer_id: &RelayerId) -> Self {
         Self {
+            draining: HashMap::new(),
             processing_slots: self.processing_slots.clone(),
             coordination: self
                 .coordination
@@ -183,6 +185,7 @@ impl TransactionsQueues {
                 .map(|id| (*id, Arc::new(QueueCoordination::default())))
                 .collect(),
             queues,
+            draining: HashMap::new(),
             processing_slots: Arc::new(Semaphore::new(4)),
             relayer_block_times_ms,
             gas_oracle_cache,
@@ -214,13 +217,36 @@ impl TransactionsQueues {
     }
 
     /// Removes a transaction queue for the specified relayer.
-    pub async fn delete_queue(&mut self, relayer_id: &RelayerId) {
-        self.coordination.remove(relayer_id);
-        if let Some(queue) = self.queues.remove(relayer_id) {
-            // Preserve deletion's wait for an already-running operation now
-            // that workers no longer retain the registry lock.
-            let _inflight = queue.lock().await;
-        }
+    pub async fn delete_queue(registry: &Arc<Mutex<Self>>, relayer_id: &RelayerId) {
+        let mut drained = {
+            let mut queues = registry.lock().await;
+            if let Some(drained) = queues.draining.get(relayer_id) {
+                drained.clone()
+            } else if let Some(queue) = queues.queues.remove(relayer_id) {
+                let coordination = queues.coordination.remove(relayer_id);
+                queues.relayer_block_times_ms.remove(relayer_id);
+                let (finished, drained) = tokio::sync::watch::channel(());
+                queues.draining.insert(*relayer_id, drained.clone());
+                let registry = registry.clone();
+                let id = *relayer_id;
+                // Finish draining even if the DELETE client disconnects.
+                tokio::spawn(async move {
+                    {
+                        let _worker = match &coordination {
+                            Some(coordination) => Some(coordination.processing.lock().await),
+                            None => None,
+                        };
+                        let _inflight = queue.lock().await;
+                    }
+                    registry.lock().await.draining.remove(&id);
+                    drop(finished);
+                });
+                drained
+            } else {
+                return;
+            }
+        };
+        let _ = drained.changed().await;
     }
 
     /// Invalidates the cache entry for a specific transaction.
@@ -1371,6 +1397,7 @@ mod receipt_poll_tests {
             .await?;
             let queues = TransactionsQueues {
                 coordination: HashMap::from([(relayer_id, Arc::new(QueueCoordination::default()))]),
+                draining: HashMap::new(),
                 processing_slots: Arc::new(Semaphore::new(4)),
                 queues: HashMap::from([(relayer_id, queue)]),
                 relayer_block_times_ms: HashMap::from([(relayer_id, block_time)]),
@@ -1434,10 +1461,12 @@ mod receipt_poll_tests {
                 .any(|request| request["method"] == "eth_sendRawTransaction"));
             drop(competing);
             let active_queue = processing.get_transactions_queue(&relayer_id).unwrap();
+            let other_queue = Fixture::new(chain_id, json!(null), 0).await.queue;
+            registry.lock().await.queues.insert(other_id, Arc::new(Mutex::new(other_queue)));
             let active = active_queue.lock().await;
             let deleting_registry = registry.clone();
             let mut deletion = tokio::spawn(async move {
-                deleting_registry.lock().await.delete_queue(&relayer_id).await;
+                TransactionsQueues::delete_queue(&deleting_registry, &relayer_id).await;
             });
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(25), &mut deletion)
@@ -1445,8 +1474,42 @@ mod receipt_poll_tests {
                     .is_err(),
                 "deletion returned while an operation was active"
             );
-            drop(active);
-            deletion.await?;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let registry_guard = registry.lock().await;
+                    if registry_guard.get_transactions_queue(&relayer_id).is_none() {
+                        drop(registry_guard);
+                        let (_slot, mut other) =
+                            super::super::start::processing_context(&registry, &other_id).await;
+                        let queue = other.get_transactions_queue(&other_id).unwrap();
+                        assert!(queue
+                            .lock()
+                            .await
+                            .get_next_inmempool_transaction()
+                            .await
+                            .is_some());
+                        let sender = other.db.acquire_sender(&other_id, true).await.unwrap();
+                        sender.release().await;
+                        break;
+                    }
+                    drop(registry_guard);
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("unrelated sender could not progress during deletion");
+            assert!(!deletion.is_finished());
+            deletion.abort();
+            assert!(deletion.await.unwrap_err().is_cancelled());
+            {
+                let retry = TransactionsQueues::delete_queue(&registry, &relayer_id);
+                tokio::pin!(retry);
+                assert!(tokio::time::timeout(std::time::Duration::from_millis(25), &mut retry)
+                    .await
+                    .is_err());
+                drop(active);
+                retry.await;
+            }
             assert!(registry.lock().await.for_processing(&relayer_id).queues.is_empty());
             drop(processing);
             db = Arc::try_unwrap(registry).ok().unwrap().into_inner().db;

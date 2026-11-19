@@ -4,6 +4,7 @@ use crate::shared::HttpError;
 use crate::{
     app_state::AppState,
     relayer::{cache::invalidate_relayer_cache, types::RelayerId},
+    transaction::queue_system::TransactionsQueues,
 };
 use axum::http::HeaderMap;
 use axum::{
@@ -22,6 +23,6 @@ pub async fn delete_relayer(
     state.db.delete_relayer(&relayer_id).await?;
 
     invalidate_relayer_cache(&state.cache, &relayer_id).await;
-    state.transactions_queues.lock().await.delete_queue(&relayer_id).await;
+    TransactionsQueues::delete_queue(&state.transactions_queues, &relayer_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
