@@ -72,3 +72,33 @@ pub async fn start_relayer_queue(
 
     Ok(())
 }
+
+pub(crate) async fn discover_relayer_queues(state: Arc<AppState>) {
+    use futures_util::stream::{self, StreamExt};
+    let chains: Vec<_> = state.network_configs.iter().map(|config| config.chain_id).collect();
+    let mut shutdown = crate::shutdown::subscribe_to_shutdown();
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => break,
+            _ = interval.tick() => {
+                let known: Vec<_> = state.transactions_queues.lock().await.queues.keys().copied().collect();
+                match state.db.missing_queue_relayers(&chains, &known).await {
+                    Ok(missing) => {
+                        stream::iter(missing).for_each_concurrent(4, |relayer| async {
+                            let chain_id = relayer.chain_id;
+                            if let Some(provider) = crate::provider::find_provider_for_chain_id(&state.evm_providers, &chain_id).await {
+                                let id = relayer.id;
+                                if let Err(error) = start_relayer_queue(&state, relayer, provider, &chain_id).await {
+                                    warn!("Could not discover relayer queue {}: {:?}", id, error);
+                                }
+                            }
+                        }).await;
+                    }
+                    Err(error) => warn!("Could not discover relayer queues: {}", error),
+                }
+            }
+        }
+    }
+}

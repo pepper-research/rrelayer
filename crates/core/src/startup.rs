@@ -223,6 +223,8 @@ async fn start_api(
         private_key_only_networks: Arc::new(private_key_only_networks),
     });
 
+    tokio::spawn(crate::relayer::discover_relayer_queues(app_state.clone()));
+
     let cors = CorsLayer::new()
         .allow_origin(
             if api_config.allowed_origins.as_ref().is_none_or(|origins| origins.is_empty()) {

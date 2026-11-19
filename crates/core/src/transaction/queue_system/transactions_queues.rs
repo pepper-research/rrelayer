@@ -274,6 +274,11 @@ impl TransactionsQueues {
         let relayer_id = setup.relayer.id;
         {
             let mut queues = queues.lock().await;
+            if queues.queues.contains_key(&relayer_id) || queues.draining.contains_key(&relayer_id)
+            {
+                return;
+            }
+            queues.relayer_block_times_ms.insert(relayer_id, setup.evm_provider.blocks_every);
             let queue = TransactionsQueue::new(
                 setup,
                 queues.gas_oracle_cache.clone(),

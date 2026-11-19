@@ -634,6 +634,22 @@ def standby_deletion(ctx):
     return check_money(ctx, [before, after])
 
 
+def standby_registration(ctx):
+    startup(ctx)
+    ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
+    ctx.create_relayer(ctx.rr['new']['api'])
+    before = ctx.submit('new')
+    assert before['id'], before
+    done(ctx, [before])
+    assert lab.http('GET', ctx.rr['old']['api'] + '/ready')[1]['queuesReady']
+    activate(ctx, 'new', 'old')
+    after = ctx.submit('old')
+    assert after['id'], after
+    done(ctx, [after])
+    return check_money(ctx, [before, after])
+
+
+SCENARIOS['standby_registration'] = standby_registration
 SCENARIOS['standby_deletion'] = standby_deletion
 SCENARIOS['delete_after_settlement'] = delete_after_settlement
 SCENARIOS['dynamic_registration'] = dynamic_registration
