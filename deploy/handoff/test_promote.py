@@ -92,6 +92,10 @@ class PromotionTests(unittest.TestCase):
   self.assertEqual(sum('stop-task' in call for call in controller.calls),1)
   controller.task=original
   self.assertEqual(controller.run()['stage'],'complete')
+ def test_resume_requires_existing_journal(self):
+  self.args.resume=True
+  with self.assertRaisesRegex(ValueError,'existing deployment journal'): Fake(self.args)
+  self.assertFalse(Path(self.args.journal).exists())
  def test_failed_prewarm_keeps_old(self):
   c=Fake(self.args);c.fail='candidate readiness'
   with self.assertRaises(RuntimeError):c.run()

@@ -67,6 +67,8 @@ class Controller:
             if self.state['source']!=args.source or self.state['digest']!=args.digest:raise ValueError('Resume candidate changed')
             if any(self.state.get(k)!=getattr(args,k) for k in ['cluster','service','container','region']):raise ValueError('Resume deployment target changed')
         else:
+            if args.resume:
+                raise ValueError('Cannot resume without the existing deployment journal')
             self.state={'cluster':args.cluster,'service':args.service,'container':args.container,'region':args.region,'source':args.source,'digest':args.digest,'id':str(uuid.uuid4()),'stage':'prepared'}
     def save(self,**values):
         self.state.update(values);self.path.parent.mkdir(parents=True,exist_ok=True)
