@@ -97,14 +97,22 @@ impl PostgresClient {
 }
 
 async fn queues_ready(state: &AppState) -> Result<bool, PostgresError> {
-    let rows =
-        state.db.query("SELECT id, chain_id FROM relayer.record WHERE NOT deleted", &[]).await?;
-    let queues = state.transactions_queues.lock().await;
-    Ok(rows.iter().all(|row| {
-        let chain: crate::network::ChainId = row.get("chain_id");
-        !state.network_configs.iter().any(|network| network.chain_id == chain)
-            || queues.get_transactions_queue(&row.get::<_, RelayerId>("id")).is_some()
-    }))
+    let chains: Vec<_> = state.network_configs.iter().map(|config| config.chain_id).collect();
+    let known: Vec<_> = state.transactions_queues.lock().await.queues.keys().copied().collect();
+    for relayer in state.db.missing_queue_relayers(&chains, &known).await? {
+        let Some(provider) =
+            crate::provider::find_provider_for_chain_id(&state.evm_providers, &relayer.chain_id)
+                .await
+        else {
+            return Ok(false);
+        };
+        if !matches!(provider.for_relayer(&relayer), Ok(None))
+            || state.db.has_unresolved_sender_work(&relayer.id).await?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub async fn readiness(

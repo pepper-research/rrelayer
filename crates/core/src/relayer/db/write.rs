@@ -11,6 +11,26 @@ use std::error::Error;
 use thiserror::Error;
 use tracing::log::error;
 
+const UNRESOLVED_SENDER_WORK: &str = r#"SELECT EXISTS(
+                SELECT 1 FROM relayer.transaction t WHERE t.relayer_id=$1
+                AND (t.status IN ('PENDING','INMEMPOOL','MINED')
+                  OR (t.status='FAILED' AND t.broadcast_attempted
+                    AND NOT EXISTS (SELECT 1 FROM relayer.transaction settled
+                      WHERE settled.chain_id=t.chain_id AND settled."from"=t."from"
+                        AND settled.nonce=t.nonce
+                        AND settled.hash IS NOT NULL AND settled.mined_at IS NOT NULL
+                        AND settled.block_hash IS NOT NULL AND settled.block_number IS NOT NULL
+                        AND settled.status IN ('CONFIRMED','FAILED')))))"#;
+
+impl PostgresClient {
+    pub(crate) async fn has_unresolved_sender_work(
+        &self,
+        id: &RelayerId,
+    ) -> Result<bool, PostgresError> {
+        Ok(self.query_one(UNRESOLVED_SENDER_WORK, &[id]).await?.get(0))
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum CreateRelayerError {
     #[error("Relayer could not be saved in DB - name: {0}, chainId: {1}: {0}")]
@@ -226,23 +246,7 @@ impl PostgresClient {
         let tx = conn.transaction().await?;
         tx.query_opt("SELECT id FROM relayer.record WHERE id=$1 FOR UPDATE", &[relayer_id]).await?;
         // This separate statement sees admissions committed while obtaining the row lock.
-        if tx
-            .query_one(
-                r#"SELECT EXISTS(
-                SELECT 1 FROM relayer.transaction t WHERE t.relayer_id=$1
-                AND (t.status IN ('PENDING','INMEMPOOL','MINED')
-                  OR (t.status='FAILED' AND t.broadcast_attempted
-                    AND NOT EXISTS (SELECT 1 FROM relayer.transaction settled
-                      WHERE settled.chain_id=t.chain_id AND settled."from"=t."from"
-                        AND settled.nonce=t.nonce
-                        AND settled.hash IS NOT NULL AND settled.mined_at IS NOT NULL
-                        AND settled.block_hash IS NOT NULL AND settled.block_number IS NOT NULL
-                        AND settled.status IN ('CONFIRMED','FAILED')))))"#,
-                &[relayer_id],
-            )
-            .await?
-            .get::<_, bool>(0)
-        {
+        if tx.query_one(UNRESOLVED_SENDER_WORK, &[relayer_id]).await?.get::<_, bool>(0) {
             return Ok(false);
         }
         tx.execute("UPDATE relayer.record SET deleted=TRUE WHERE id=$1", &[relayer_id]).await?;
