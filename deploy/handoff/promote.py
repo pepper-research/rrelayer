@@ -200,7 +200,9 @@ class Controller:
                 confirmed.update(original['previous_tasks'])
             if not confirmed.issubset(original['previous_tasks']):
                 raise ValueError('Shutdown confirmation does not belong to original task inventory')
-            inventory = set(reference['previous_tasks'])
+            direct_inventory = set(reference['previous_tasks'])
+            direct_confirmed = set(confirmed)
+            inventory = set(direct_inventory)
             ancestor = original.get('recovery')
             while ancestor and ancestor.get('legacy'):
                 if 'previous_tasks' not in ancestor:
@@ -225,6 +227,9 @@ class Controller:
             if recovery:
                 required = {'id','source','digest','warm_task','legacy','stage','target_group'}
                 prior_reference = dict(recovery)
+                for key, direct in [('previous_tasks', direct_inventory), ('stopped_legacy_tasks', direct_confirmed)]:
+                    if key in prior_reference and set(prior_reference[key]) in (direct, set(reference[key])):
+                        prior_reference[key] = reference[key]
                 if prior_reference.get('warm_retired') is False and reference['warm_retired']:
                     # Retirement is monotonic. Persist it after checking the live inventory.
                     prior_reference['warm_retired'] = True
