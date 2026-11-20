@@ -259,11 +259,14 @@ class Controller:
                     launched = task['taskArn']
             if not launched:
                 raise ValueError('Unaccounted relayer tasks; reconcile before deployment')
-        if 'previous_definition' not in self.state:
-            if not recovery and (not self.steady_deployment(service, service['taskDefinition'])
+        if not recovery and self.state['stage'] in ('prepared','launching','warming'):
+            baseline = self.state.get('previous_definition', service['taskDefinition'])
+            if (not self.steady_deployment(service, baseline)
                     or len(running) != 1 or not self.task_running(running[0])
-                    or running[0]['taskDefinitionArn'] != service['taskDefinition']):
+                    or running[0]['taskDefinitionArn'] != baseline
+                    or running[0]['taskArn'] not in self.state.get('previous_tasks', [running[0]['taskArn']])):
                 raise ValueError('Service is not steady; use its recovery journal')
+        if 'previous_definition' not in self.state:
             previous_source,_=source_of(current,a.container)
             old_api=None
             if not recovery and previous_source and running:old_api=self.api(running[0]['taskArn'],'/ready')
