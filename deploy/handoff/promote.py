@@ -165,10 +165,16 @@ class Controller:
     def healthy(self,target,group):
         rows=self.aws('elbv2','describe-target-health','--target-group-arn',group,'--targets',json.dumps([target]))['TargetHealthDescriptions']
         return rows and rows[0]['TargetHealth']['State']=='healthy'
+    def task_running(self, task):
+        return (task.get('lastStatus') == 'RUNNING' and task.get('desiredStatus') == 'RUNNING'
+                and task.get('healthStatus') != 'UNHEALTHY'
+                and all(c.get('healthStatus') != 'UNHEALTHY' and c.get('lastStatus', 'RUNNING') == 'RUNNING'
+                        for c in task.get('containers', []) if c.get('name') == self.a.container))
+
     def ready(self,arn,source,digest):
         task=self.task(arn)
         containers=[c for c in task.get('containers',[]) if c['name']==self.a.container]
-        if task['lastStatus']!='RUNNING' or task.get('desiredStatus')!='RUNNING' or not containers or containers[0].get('imageDigest')!=digest:return False
+        if not self.task_running(task) or not containers or containers[0].get('imageDigest')!=digest:return False
         status=self.api(arn,'/ready')
         if not protocol_one(status.get('protocol')) or status.get('release')!=source or status.get('queuesReady') is not True:return False
         return status
@@ -476,7 +482,7 @@ class Controller:
             return False
         tasks=self.tasks(a.service)
         if (len(tasks) != 1 or tasks[0]['taskDefinitionArn'] != a.task_definition
-                or tasks[0].get('lastStatus') != 'RUNNING' or tasks[0].get('desiredStatus') != 'RUNNING'):
+                or not self.task_running(tasks[0])):
             return False
         status=self.ready(tasks[0]['taskArn'],a.source,a.digest)
         return status and status['activeRelease'] == a.source and status['processing'] and status['durableIntakeReady'] and self.healthy(self.target(tasks[0]['taskArn']),group)
