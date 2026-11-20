@@ -244,14 +244,15 @@ class Controller:
                     # Its observation is checked before target registration or activation.
                     active = recovery['source']
                 else:
-                    owner_task = recovery['warm_task']
-                    if recovery.get('warm_retired'):
-                        if (recovery['stage'] not in ('retiring','complete') or counts != [1,1,0]
-                                or len(running) != 1 or running[0]['taskDefinitionArn'] != service['taskDefinition']
-                                or not self.healthy(self.target(running[0]['taskArn']), group)):
-                            raise ValueError('Replacement service identity or health could not be verified')
-                        owner_task = running[0]['taskArn']
-                    old_api = self.ready(owner_task, recovery['source'], recovery['digest'])
+                    old_api = None
+                    can_use_service = recovery['stage'] in ('activated','replacing-service','service-ready','retiring','complete')
+                    if (can_use_service and counts == [1,1,0] and len(running) == 1
+                            and running[0]['taskDefinitionArn'] == service['taskDefinition']
+                            and source_of(current,a.container)[0] == recovery['source']
+                            and self.healthy(self.target(running[0]['taskArn']),group)):
+                        old_api = self.ready(running[0]['taskArn'], recovery['source'], recovery['digest'])
+                    if not old_api and not recovery.get('warm_retired'):
+                        old_api = self.ready(recovery['warm_task'], recovery['source'], recovery['digest'])
                     if not old_api or not old_api['durableIntakeReady'] or not old_api['processing'] or old_api['activeRelease'] != recovery['source']:
                         raise ValueError('Interrupted warm sender is not the verified active release')
                     active = old_api['activeRelease']
