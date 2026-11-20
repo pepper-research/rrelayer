@@ -243,14 +243,21 @@ class PromotionTests(unittest.TestCase):
   proof={k:c.state[k] for k in ('id','cluster','region','service','warm_task','source','digest')}
   proof.update(lastStatus='STOPPED',evidence='production-verdict.json')
   file=self.path/proof['evidence']
-  verdict=dict(passed=True,source=SHA,imageDigest=DIGEST,retiredTasks=[dict(taskArn='old-task',lastStatus='STOPPED')])
+  verdict=dict(passed=True,source=SHA,imageDigest=DIGEST,retiredTasks=[dict(taskArn=t,lastStatus='STOPPED') for t in ('old-task','warm-task')])
   file.write_text(json.dumps(verdict))
   self.assertEqual(historical_retirements(c.state,proof,self.args.acceptance),{'old-task','warm-task'})
   for change in [dict(source='foreign'),dict(imageDigest='foreign'),dict(passed=False),
+                 dict(retiredTasks=[]),dict(retiredTasks=verdict['retiredTasks'][:1]),
+                 dict(retiredTasks=verdict['retiredTasks']*2),dict(retiredTasks=None),
                  dict(retiredTasks=[dict(taskArn='elsewhere',lastStatus='STOPPED')]),
                  dict(retiredTasks=[dict(taskArn='old-task',lastStatus='DEACTIVATING')])]:
    file.write_text(json.dumps(dict(verdict,**change)))
    with self.assertRaises(ValueError):historical_retirements(c.state,proof,self.args.acceptance)
+  for content in ('invalid','{}','[]'):
+   file.write_text(content)
+   with self.assertRaises(ValueError):historical_retirements(c.state,proof,self.args.acceptance)
+  file.unlink()
+  with self.assertRaises(ValueError):historical_retirements(c.state,proof,self.args.acceptance)
  def test_incompatible_rollback_preserves_incumbent(self):
   c=Fake(self.args);original=c.api
   def observe(task,path,body=None):

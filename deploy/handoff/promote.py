@@ -106,20 +106,15 @@ def historical_retirements(journal, shutdown, receipt_path):
             or any(shutdown.get(k) != journal[k] for k in keys)
             or shutdown.get('lastStatus') != 'STOPPED' or not report_reference(shutdown.get('evidence'))):
         raise ValueError('Historical shutdown evidence does not match the completed original journal')
-    confirmed = {journal['warm_task']}
-    # Older receipts attest to one warm sender and may reference a text report.
-    # A production verdict additionally identifies stopped predecessors by ARN.
     path = Path(receipt_path).parent / shutdown['evidence']
-    if not path.is_file():
-        return confirmed
     try:
         verdict = json.loads(path.read_text())
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return confirmed
-    if not isinstance(verdict, dict) or 'retiredTasks' not in verdict:
-        return confirmed
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ValueError('Historical retirement verdict could not be read') from exc
+    if not isinstance(verdict, dict):
+        raise ValueError('Expected a historical retirement verdict')
     if (verdict.get('passed') is not True or verdict.get('source') != journal['source']
-            or verdict.get('imageDigest') != journal['digest'] or not isinstance(verdict['retiredTasks'], list)):
+            or verdict.get('imageDigest') != journal['digest'] or not isinstance(verdict.get('retiredTasks'), list)):
         raise ValueError('Historical retirement verdict source or image mismatch')
     previous, warm, _ = retirement_inventory(journal)
     seen = set()
@@ -130,8 +125,9 @@ def historical_retirements(journal, shutdown, receipt_path):
         if task in seen or row.get('lastStatus') != 'STOPPED':
             raise ValueError('Historical retirement verdict has conflicting or nonterminal evidence')
         seen.add(task)
-        confirmed.add(task)
-    return confirmed
+    if journal['warm_task'] not in seen:
+        raise ValueError('Historical verdict lacks STOPPED evidence for its warm sender')
+    return seen
 
 
 class Controller:

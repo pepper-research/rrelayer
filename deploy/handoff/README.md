@@ -208,7 +208,8 @@ journal's `id`, `cluster`, `region`, `service`, `warm_task`, `source` and
 `digest`. Set `lastStatus` to `STOPPED` only when the cited `evidence` records
 verified shutdown of that task. Expiration of an ECS task record alone does
 not establish shutdown. To recover a predecessor whose ECS record also expired,
-point the evidence at the original passing production verdict JSON. The controller
+supply the original passing production verdict JSON as a readable file. It must
+explicitly record the warm task as STOPPED as well. The controller
 checks its source, image digest and each tracked task ARN and imports only
 explicit STOPPED records. The current cluster inventory must agree.
 
