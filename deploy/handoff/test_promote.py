@@ -159,6 +159,15 @@ class PromotionTests(unittest.TestCase):
   replacement[0]='rotated-1'
   self.assertEqual(c.run()['stage'],'complete')
   self.assertEqual(c.state['previous_tasks'],['old-task','rotated-1','rotated-2'])
+ def test_public_reopening_requires_same_service_task_after_probe(self):
+  c=Fake(self.args)
+  c.state['target_group']='tg'
+  with patch.object(c,'serving_task',side_effect=['service-new','rotated-service']) as inventory, patch.object(c,'probe_registration',return_value=True):
+   self.assertFalse(c.verify_registration_reopened('lb.test',80))
+   self.assertTrue(all(call.kwargs=={'sole_target':True,'registration_ready':True} for call in inventory.call_args_list))
+  with patch.object(c,'serving_task',return_value=False), patch.object(c,'probe_registration') as probe:
+   self.assertFalse(c.verify_registration_reopened('lb.test',80))
+   probe.assert_not_called()
  def test_incompatible_rollback_preserves_incumbent(self):
   c=Fake(self.args);original=c.api
   def observe(task,path,body=None):

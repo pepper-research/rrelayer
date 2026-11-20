@@ -568,6 +568,9 @@ class Controller:
                         for record in (service, deployments[0])))
 
     def service_ready(self, group):
+        return bool(self.serving_task(group))
+
+    def serving_task(self, group, *, sole_target=False, registration_ready=False):
         a = self.a
         service = self.aws('ecs','describe-services','--cluster',a.cluster,'--services',a.service)['services'][0]
         config = service.get('deploymentConfiguration', {})
@@ -583,8 +586,21 @@ class Controller:
         if (len(tasks) != 1 or tasks[0]['taskDefinitionArn'] != a.task_definition
                 or not self.task_running(tasks[0])):
             return False
-        status=self.ready(tasks[0]['taskArn'],a.source,a.digest)
-        return status and status.get('queueDiscovery') is True and status['activeRelease'] == a.source and status['processing'] and status['durableIntakeReady'] and self.healthy(self.target(tasks[0]['taskArn']),group)
+        arn = tasks[0]['taskArn']
+        status = self.ready(arn, a.source, a.digest)
+        if (not status or status.get('queueDiscovery') is not True or status['activeRelease'] != a.source
+                or not status['processing'] or not status['durableIntakeReady']
+                or (registration_ready and status.get('registrationReady') is not True)):
+            return False
+        target = self.target(arn)
+        if sole_target:
+            rows = self.aws('elbv2','describe-target-health','--target-group-arn',group)['TargetHealthDescriptions']
+            if (len(rows) != 1 or rows[0]['Target']['Id'] != target['Id']
+                    or rows[0]['Target']['Port'] != target['Port'] or rows[0]['TargetHealth']['State'] != 'healthy'):
+                return False
+        elif not self.healthy(target, group):
+            return False
+        return arn
 
     def registration_incumbent(self, group):
         definition = self.state['previous_definition']
@@ -616,14 +632,11 @@ class Controller:
         return self.probe_registration(self.state['warm_task'], hostname, port, paused=True)
 
     def verify_registration_reopened(self, hostname, port):
-        tasks = self.tasks(self.a.service)
-        if len(tasks) != 1 or tasks[0]['taskDefinitionArn'] != self.a.task_definition:
+        group = self.state['target_group']
+        arn = self.serving_task(group, sole_target=True, registration_ready=True)
+        if not arn or not self.probe_registration(arn, hostname, port, paused=False):
             return False
-        arn = tasks[0]['taskArn']
-        status = self.ready(arn, self.a.source, self.a.digest)
-        if not status or not status.get('processing') or not status.get('registrationReady'):
-            return False
-        return self.probe_registration(arn, hostname, port, paused=False)
+        return self.serving_task(group, sole_target=True, registration_ready=True) == arn
 
     def probe_registration(self, task, hostname, port, paused):
         # Malformed, unauthenticated POSTs cannot allocate a key or sender.
@@ -647,7 +660,25 @@ for path in /relayers/1/new /relayers/1/import /relayers/00000000-0000-0000-0000
   done
 done
 echo true"""
-        return self.task_json(task, script, 'registration ingress') is True
+        if paused:
+            return self.task_json(task, script, 'registration ingress') is True
+        # A different revision can return the same authentication error. Read
+        # the serving release on those same nodes before accepting their replies.
+        script = script.removesuffix('echo true') + '''printf '['
+sep=''
+for ip in $ips; do
+  printf '%s' "$sep"
+  curl --noproxy '*' --silent --fail --max-time 3 --resolve "$host:PORT:$ip" "http://$host:PORT/ready"
+  sep=','
+done
+printf ']'
+'''.replace('PORT', str(port))
+        statuses = self.task_json(task, script, 'registration ingress')
+        return (isinstance(statuses, list) and bool(statuses) and
+                all(isinstance(s, dict) and protocol_one(s.get('protocol')) and
+                    s.get('release') == self.a.source and s.get('activeRelease') == self.a.source and
+                    all(s.get(k) is True for k in ('queueDiscovery','registrationReady','queuesReady','processing','durableIntakeReady'))
+                    for s in statuses))
 
     def finish_replacement(self, group, recovery):
         a = self.a
@@ -676,16 +707,8 @@ echo true"""
         self.wait(lambda: self.service_ready(group),'replacement service health after retirement',900)
         if self.state.get('registration_window_owner'):
             def reopen_service():
-                if not self.service_ready(group):
-                    return False
-                tasks = self.tasks(a.service)
-                if len(tasks) != 1 or tasks[0]['taskDefinitionArn'] != a.task_definition:
-                    return False
-                arn = tasks[0]['taskArn']
-                target = self.target(arn)
-                rows = self.aws('elbv2','describe-target-health','--target-group-arn',group)['TargetHealthDescriptions']
-                if (len(rows) != 1 or rows[0]['Target']['Id'] != target['Id']
-                        or rows[0]['Target']['Port'] != target['Port'] or rows[0]['TargetHealth']['State'] != 'healthy'):
+                arn = self.serving_task(group, sole_target=True)
+                if not arn:
                     return False
                 self.api(arn, '/handoff/resume-registration', {})
                 status = self.ready(arn, a.source, a.digest)

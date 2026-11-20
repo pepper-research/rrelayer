@@ -75,6 +75,8 @@ class WindowTests(unittest.TestCase):
             for app, script in {
                 'getent': 'echo "127.0.0.1 STREAM lb"; echo "127.0.0.2 STREAM lb"',
                 'curl': """case "$*" in
+  *127.0.0.2*/ready*) echo "$LAST_NODE_READY" ;;
+  */ready*) echo "$READY" ;;
   *127.0.0.2*clone*) echo "$LAST_NODE_RESPONSE" ;;
   *) echo 'Unauthorized 401' ;;
 esac""",
@@ -82,10 +84,16 @@ esac""",
                 path = bin_path / app
                 path.write_text('#!/bin/sh\n' + script)
                 path.chmod(0o755)
-            for reply, expected in [('maintenance 503', False), ('Unauthorized 401', True)]:
-                env = dict(os.environ, PATH=directory + os.pathsep + os.environ['PATH'], LAST_NODE_RESPONSE=reply)
+            self.control.a.source = 'candidate'
+            status = dict(protocol=1, release='candidate', activeRelease='candidate', processing=True,
+                          durableIntakeReady=True, queuesReady=True, queueDiscovery=True, registrationReady=True)
+            for reply, last, expected in [('maintenance 503',status,False),
+                                          ('Unauthorized 401',dict(status,release='previous'),False),
+                                          ('Unauthorized 401',status,True)]:
+                env = dict(os.environ, PATH=directory + os.pathsep + os.environ['PATH'], LAST_NODE_RESPONSE=reply, READY=json.dumps(status), LAST_NODE_READY=json.dumps(last))
                 def task_json(task, script, label):
-                    return subprocess.run(['sh','-c',script], env=env, capture_output=True).returncode == 0
+                    result = subprocess.run(['sh','-c',script], env=env, capture_output=True)
+                    return json.loads(result.stdout) if result.returncode == 0 else False
                 self.control.task_json.side_effect = task_json
                 self.assertEqual(Controller.probe_registration(self.control, 'steady', 'lb.test', 80, False), expected)
 
