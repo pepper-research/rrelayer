@@ -50,6 +50,11 @@ class PromotionTests(unittest.TestCase):
   self.temp=tempfile.TemporaryDirectory();self.path=Path(self.temp.name);(self.path/'acceptance.json').write_text(json.dumps(receipt()))
   self.args=SimpleNamespace(cluster='cluster',service='service',container='relayer',region='region',journal=str(self.path/'journal.json'),resume=False,source=SHA,digest=DIGEST,acceptance=str(self.path/'acceptance.json'),task_definition='candidate:1',bootstrap=False,recover_journal=None,execute=True)
  def tearDown(self):self.temp.cleanup()
+ def test_protocol_version_is_an_integer(self):
+  for version in (True, 1.0, '1'):
+   with self.subTest(version=version), self.assertRaises(ValueError):
+    validate_acceptance(dict(receipt(), protocol=version), SHA, DIGEST)
+
  def test_required_check_needs_a_nonblank_report_reference(self):
   for evidence in (True, '   ', '', None):
    candidate = receipt()

@@ -24,14 +24,22 @@ REQUIRED = {'two_process_handoff','crash_boundaries','lost_rpc_response','stale_
 LOCAL_REQUIRED=REQUIRED-{'dev_ecs_handoff','downstream_no_refund_or_duplicate_credit'}
 
 
+def report_reference(value):
+    return isinstance(value, str) and bool(value.strip())
+
+
+def protocol_one(value):
+    return type(value) is int and value == 1
+
+
 def validate_acceptance(receipt, source, digest, *, dev_validation=False):
     if not re.fullmatch(r'[0-9a-f]{40}',source) or not re.fullmatch(r'sha256:[0-9a-f]{64}',digest):
         raise ValueError('Full source SHA and immutable image digest required')
-    if receipt.get('source') != source or receipt.get('image_digest') != digest or receipt.get('protocol') != 1:
+    if receipt.get('source') != source or receipt.get('image_digest') != digest or not protocol_one(receipt.get('protocol')):
         raise ValueError('Acceptance does not identify this exact source/image/protocol')
     passed = {name for name, result in receipt.get('checks', {}).items()
               if isinstance(result, dict) and result.get('passed') is True
-              and isinstance(result.get('evidence'), str) and result['evidence'].strip()}
+              and report_reference(result.get('evidence'))}
     required=LOCAL_REQUIRED if dev_validation else REQUIRED
     if not required <= passed:
         raise ValueError('Missing exact-image acceptance: '+', '.join(sorted(required-passed)))
@@ -162,7 +170,7 @@ class Controller:
         containers=[c for c in task.get('containers',[]) if c['name']==self.a.container]
         if task['lastStatus']!='RUNNING' or task.get('desiredStatus','RUNNING')!='RUNNING' or not containers or containers[0].get('imageDigest')!=digest:return False
         status=self.api(arn,'/ready')
-        if status.get('protocol')!=1 or status.get('release')!=source or status.get('queuesReady') is not True:return False
+        if not protocol_one(status.get('protocol')) or status.get('release')!=source or status.get('queuesReady') is not True:return False
         return status
     def run(self):
         a=self.a
@@ -235,7 +243,7 @@ class Controller:
             previous_source,_=source_of(current,a.container)
             old_api=None
             if not recovery and previous_source and running:old_api=self.api(running[0]['taskArn'],'/ready')
-            legacy=not old_api or old_api.get('protocol')!=1
+            legacy=not old_api or not protocol_one(old_api.get('protocol'))
             if legacy and not a.bootstrap and not recovery:raise ValueError('Legacy binary requires explicit bootstrap')
             possible_previous_owner = None
             if recovery:
@@ -298,7 +306,7 @@ class Controller:
                             and running[0]['taskArn'] in recovery['previous_tasks']
                             and running[0]['taskDefinitionArn'] == service['taskDefinition'] == recovery['previous_definition']):
                         old_api = self.api(running[0]['taskArn'], '/ready')
-                        if old_api.get('protocol') != 1 or old_api.get('release') != previous_source:
+                        if not protocol_one(old_api.get('protocol')) or old_api.get('release') != previous_source:
                             raise ValueError('Previous sender identity changed')
                         expected_active = previous_source
                     if not old_api or not old_api['durableIntakeReady'] or not old_api['processing'] or old_api['activeRelease'] != expected_active:
@@ -327,7 +335,7 @@ class Controller:
         if (not self.state['legacy'] and recovery and recovery['legacy'] and recovery['stage'] in ('stopping-legacy','legacy-stopped','activating')
                 and status['activeRelease'] is None and not status['durableIntakeReady']):
             service_state = self.aws('ecs','describe-services','--cluster',a.cluster,'--services',a.service)['services'][0]
-            if (not receipt.get('legacy_ingress_quiesced_evidence') or status['unresolvedTransactions'] != 0
+            if (not report_reference(receipt.get('legacy_ingress_quiesced_evidence')) or status['unresolvedTransactions'] != 0
                     or any(service_state.get(k) != 0 for k in ('desiredCount','runningCount','pendingCount'))
                     or (recovery['stage'] == 'activating' and self.task(recovery['warm_task'])['lastStatus'] != 'STOPPED')
                     or any(t['lastStatus'] != 'STOPPED' for t in self.tasks(a.service))
@@ -351,7 +359,7 @@ class Controller:
         if self.state['legacy'] and not status['durableIntakeReady']:
             # Ingress producers must already be quiesced with durable retry. Verify
             # the candidate observes no unresolved legacy rows before AND after stop.
-            if not receipt.get('legacy_ingress_quiesced_evidence') or status['unresolvedTransactions']!=0:
+            if not report_reference(receipt.get('legacy_ingress_quiesced_evidence')) or status['unresolvedTransactions']!=0:
                 raise ValueError('Legacy ingress must be quiesced and accepted work fully drained')
             confirmed = set(self.state.get('stopped_legacy_tasks', []))
             if self.state['stage'] in ('legacy-stopped','activating'):
