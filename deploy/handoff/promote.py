@@ -197,6 +197,8 @@ class Controller:
         groups=service.get('loadBalancers',[])
         if len(groups)!=1 or groups[0]['containerPort']!=3000:raise ValueError('Expected one IP target group on port 3000')
         group=groups[0]['targetGroupArn']
+        if self.state.get('target_group', group) != group:
+            raise ValueError('Service target group changed since the original handoff')
         target_group=self.aws('elbv2','describe-target-groups','--target-group-arns',group)['TargetGroups'][0]
         if target_group['TargetType']!='ip':raise ValueError('Expected IP target group')
         if recovery and recovery['target_group'] != group:
