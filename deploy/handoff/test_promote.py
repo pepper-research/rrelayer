@@ -2,7 +2,7 @@ import copy,json,os,tempfile,unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-from promote import TaskNotFound,retirement_inventory,ReadinessNotFound,Controller,REQUIRED,validate_acceptance,compatible_definition
+from promote import historical_retirements,TaskNotFound,retirement_inventory,ReadinessNotFound,Controller,REQUIRED,validate_acceptance,compatible_definition
 SHA='a'*40;DIGEST='sha256:'+'b'*64
 
 def receipt():return {'source':SHA,'image_digest':DIGEST,'protocol':1,'downstream_image_digest':DIGEST,'legacy_ingress_quiesced_evidence':'fixture ingress closed','checks':{k:{'passed':True,'evidence':'test fixture'} for k in REQUIRED}}
@@ -238,6 +238,19 @@ class PromotionTests(unittest.TestCase):
   rollback.state['recovery']['retired_tasks'].remove('old-task')
   rollback.state['retired_tasks'].remove('old-task')
   self.assertFalse(rollback.completed_service_task('tg'))
+ def test_scoped_historical_production_verdict_recovers_only_recorded_retirements(self):
+  c=Fake(self.args);c.run()
+  proof={k:c.state[k] for k in ('id','cluster','region','service','warm_task','source','digest')}
+  proof.update(lastStatus='STOPPED',evidence='production-verdict.json')
+  file=self.path/proof['evidence']
+  verdict=dict(passed=True,source=SHA,imageDigest=DIGEST,retiredTasks=[dict(taskArn='old-task',lastStatus='STOPPED')])
+  file.write_text(json.dumps(verdict))
+  self.assertEqual(historical_retirements(c.state,proof,self.args.acceptance),{'old-task','warm-task'})
+  for change in [dict(source='foreign'),dict(imageDigest='foreign'),dict(passed=False),
+                 dict(retiredTasks=[dict(taskArn='elsewhere',lastStatus='STOPPED')]),
+                 dict(retiredTasks=[dict(taskArn='old-task',lastStatus='DEACTIVATING')])]:
+   file.write_text(json.dumps(dict(verdict,**change)))
+   with self.assertRaises(ValueError):historical_retirements(c.state,proof,self.args.acceptance)
  def test_incompatible_rollback_preserves_incumbent(self):
   c=Fake(self.args);original=c.api
   def observe(task,path,body=None):
