@@ -23,6 +23,7 @@ class Fake(Controller):
   result=predicate()
   if not result:raise RuntimeError('fixture condition false: '+label)
   return result
+ def verify_public_ingress(self,group):self.calls.append(('verify_public_ingress',group))
  def registration_window(self,group,close):self.calls.append(('registration_window',close))
  def task(self,arn):return {'taskArn':arn,'desiredStatus':'STOPPED' if (arn=='old-task' and self.oldStopped) or (arn=='warm-task' and self.warmStopped) else 'RUNNING','taskDefinitionArn':'candidate:1' if arn!='old-task' else 'previous:1','lastStatus':'STOPPED' if (arn=='old-task' and self.oldStopped) or (arn=='warm-task' and self.warmStopped) else 'RUNNING'}
  def tasks(self,service=None):return [self.task('service-new' if self.replaced else 'old-task')] if service or 'warm_task' not in self.state else [self.task('service-new' if self.replaced else 'old-task'),self.task('warm-task')]
@@ -168,6 +169,22 @@ class PromotionTests(unittest.TestCase):
   with patch.object(c,'serving_task',return_value=False), patch.object(c,'probe_registration') as probe:
    self.assertFalse(c.verify_registration_reopened('lb.test',80))
    probe.assert_not_called()
+ def test_extra_healthy_target_blocks_completion_and_completed_resume_without_pause(self):
+  c=Fake(self.args)
+  normal=c.aws
+  def mixed(*args):
+   response=normal(*args)
+   if args[1]=='describe-target-health' and '--targets' not in args:
+    response['TargetHealthDescriptions'].append({'Target':{'Id':'unexpected','Port':3000},'TargetHealth':{'State':'healthy'}})
+   return response
+  c.aws=mixed
+  with self.assertRaisesRegex(RuntimeError,'sole accepted service'):c.run()
+  self.assertEqual(c.state['stage'],'retiring')
+  self.assertNotIn(('registration_window',True),c.calls)
+  c.aws=normal
+  self.assertEqual(c.run()['stage'],'complete')
+  c.aws=mixed
+  with self.assertRaisesRegex(RuntimeError,'sole accepted service'):c.run()
  def test_incompatible_rollback_preserves_incumbent(self):
   c=Fake(self.args);original=c.api
   def observe(task,path,body=None):

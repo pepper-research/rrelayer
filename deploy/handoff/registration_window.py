@@ -48,7 +48,9 @@ def registration_window(controller, group, close, verify_only=False):
             or controller.state.get('registration_listener', arn) != arn):
         raise ValueError('Registration listener does not exclusively serve this relayer')
     rules = [r for r in aws('elbv2', 'describe-rules', '--listener-arn', arn)['Rules'] if not r['IsDefault']]
-    owner = controller.state['registration_window_owner']
+    owner = controller.state.get('registration_window_owner')
+    if not verify_only and not owner:
+        raise ValueError('Registration window mutation requires a deployment owner')
     if rules:
         if verify_only:
             raise ValueError('Expected registration ingress to be open')

@@ -407,10 +407,7 @@ class Controller:
                       previous_tasks=sorted(inventory), stopped_legacy_tasks=stopped, previous_release=active,
                       legacy=legacy, target_group=group, recovery=recovery)
         if self.state['stage']=='complete':
-            if not self.service_ready(group):
-                raise RuntimeError('Completed handoff has a degraded replacement service')
-            if self.state.get('registration_window_owner'):
-                self.verify_completed_window(group)
+            self.verify_completion(group)
             return {'stage':'complete','source':a.source,'digest':a.digest}
         if not a.execute:
             return {'plan':'prewarm → verify → activate → replace service → retire warm task','legacy':self.state['legacy']}
@@ -625,7 +622,16 @@ class Controller:
     def registration_window(self, group, close):
         registration_window(self, group, close)
 
-    def verify_completed_window(self, group):
+    def verify_completion(self, group):
+        def confirmed():
+            arn = self.serving_task(group, sole_target=True, registration_ready=True)
+            if not arn:
+                return False
+            self.verify_public_ingress(group)
+            return self.serving_task(group, sole_target=True, registration_ready=True) == arn
+        self.wait(confirmed, 'sole accepted service and public ingress at completion')
+
+    def verify_public_ingress(self, group):
         registration_window(self, group, close=False, verify_only=True)
 
     def verify_registration_response(self, hostname, port):
@@ -715,6 +721,7 @@ printf ']'
                 return status and status.get('activeRelease') == a.source and status.get('processing') and status.get('registrationReady')
             self.wait(reopen_service, 'sole healthy registration-ready public sender')
             self.registration_window(group, close=False)
+        self.verify_completion(group)
         self.save(stage='complete')
         return {'stage':'complete','source':a.source,'digest':a.digest}
 
