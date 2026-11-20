@@ -265,7 +265,8 @@ class Controller:
                     or any(service_state.get(k) != 0 for k in ('desiredCount','runningCount','pendingCount'))
                     or (recovery['stage'] == 'activating' and self.task(recovery['warm_task'])['lastStatus'] != 'STOPPED')
                     or any(t['lastStatus'] != 'STOPPED' for t in self.tasks(a.service))
-                    or any(self.task(t)['lastStatus'] != 'STOPPED' for t in recovery['previous_tasks'])):
+                    or (recovery['stage'] == 'stopping-legacy' and
+                        any(self.task(t)['lastStatus'] != 'STOPPED' for t in recovery['previous_tasks']))):
                 raise ValueError('Cannot verify drained legacy shutdown for recovery bootstrap')
             self.save(legacy=True, previous_release=None, previous_tasks=recovery['previous_tasks'])
         expected_owners = {self.state['previous_release']}
@@ -279,9 +280,12 @@ class Controller:
             # the candidate observes no unresolved legacy rows before AND after stop.
             if not receipt.get('legacy_ingress_quiesced_evidence') or status['unresolvedTransactions']!=0:
                 raise ValueError('Legacy ingress must be quiesced and accepted work fully drained')
+            confirmed = set(self.state.get('stopped_legacy_tasks', []))
+            if self.state['stage'] in ('legacy-stopped','activating'):
+                confirmed.update(self.state['previous_tasks'])
             observed = set(self.state['previous_tasks'])
             observed.update(t['taskArn'] for t in self.tasks(a.service))
-            self.save(stage='stopping-legacy', previous_tasks=sorted(observed))
+            self.save(stage='stopping-legacy', previous_tasks=sorted(observed), stopped_legacy_tasks=sorted(confirmed))
             self.aws('ecs','update-service','--cluster',a.cluster,'--service',a.service,'--desired-count','0')
             def legacy_stopped():
                 service = self.aws('ecs','describe-services','--cluster',a.cluster,'--services',a.service)['services'][0]
@@ -289,8 +293,14 @@ class Controller:
                 if current - observed:
                     observed.update(current)
                     self.save(previous_tasks=sorted(observed))
-                return (all(service.get(k) == 0 for k in ('desiredCount','runningCount','pendingCount'))
-                        and all(self.task(task)['lastStatus'] == 'STOPPED' for task in observed))
+                if any(service.get(k) != 0 for k in ('desiredCount','runningCount','pendingCount')):
+                    return False
+                for task in sorted(observed - confirmed):
+                    if self.task(task)['lastStatus'] != 'STOPPED':
+                        return False
+                    confirmed.add(task)
+                    self.save(stopped_legacy_tasks=sorted(confirmed))
+                return True
             self.wait(legacy_stopped,'legacy tasks stopped')
             status = self.ready(warm, a.source, a.digest)
             if not status or status['unresolvedTransactions'] != 0:
