@@ -331,7 +331,10 @@ class Controller:
             else:
                 active=old_api and old_api.get('activeRelease')
             self.save(possible_previous_owner=possible_previous_owner, previous_definition=service['taskDefinition'],previous_tasks=[t['taskArn'] for t in running],previous_release=active,legacy=legacy,target_group=group,recovery=recovery)
-        if self.state['stage']=='complete':return {'stage':'complete','source':a.source,'digest':a.digest}
+        if self.state['stage']=='complete':
+            if not self.service_ready(group):
+                raise RuntimeError('Completed handoff has a degraded replacement service')
+            return {'stage':'complete','source':a.source,'digest':a.digest}
         if not a.execute:
             return {'plan':'prewarm → verify → activate → replace service → retire warm task','legacy':self.state['legacy']}
         if self.state['stage'] == 'staging-at-zero':
@@ -453,15 +456,17 @@ class Controller:
         self.save(stage='replacing-service')
         return self.finish_replacement(group, recovery)
 
+    def service_ready(self, group):
+        a = self.a
+        tasks=self.tasks(a.service)
+        if len(tasks)!=1 or tasks[0]['taskDefinitionArn']!=a.task_definition:return False
+        status=self.ready(tasks[0]['taskArn'],a.source,a.digest)
+        return status and status['activeRelease'] == a.source and status['processing'] and status['durableIntakeReady'] and self.healthy(self.target(tasks[0]['taskArn']),group)
+
     def finish_replacement(self, group, recovery):
         a = self.a
         warm = self.state["warm_task"]
-        def service_ready():
-            tasks=self.tasks(a.service)
-            if len(tasks)!=1 or tasks[0]['taskDefinitionArn']!=a.task_definition:return False
-            status=self.ready(tasks[0]['taskArn'],a.source,a.digest)
-            return status and status['activeRelease'] == a.source and status['processing'] and status['durableIntakeReady'] and self.healthy(self.target(tasks[0]['taskArn']),group)
-        self.wait(service_ready,'replacement service health',900)
+        self.wait(lambda: self.service_ready(group),'replacement service health',900)
         self.save(stage='retiring')
         retiring=[warm]+([recovery['warm_task']] if recovery and not recovery.get('warm_retired') else [])
         stopped = set(self.state.get('retired_tasks', []))
@@ -477,7 +482,7 @@ class Controller:
                         rows=self.aws('elbv2','describe-target-health','--target-group-arn',group,'--targets',json.dumps([target]))['TargetHealthDescriptions']
                         return not rows or rows[0]['TargetHealth']['State']=='unused'
                     self.wait(drained,'target drain')
-                    self.wait(service_ready,'replacement service health',900)
+                    self.wait(lambda: self.service_ready(group),'replacement service health',900)
                     self.aws('ecs','stop-task','--cluster',a.cluster,'--task',arn,'--reason','Verified handoff complete')
                 self.wait(lambda: self.task(arn)['lastStatus']=='STOPPED', 'task retirement')
             stopped.add(arn)
@@ -493,7 +498,8 @@ def main():
     args=p.parse_args();controller=Controller(args)
     try:print(json.dumps(controller.run()))
     except Exception as error:
-        controller.save(error=str(error))
+        if controller.state.get('stage') != 'complete':
+            controller.save(error=str(error))
         raise SystemExit(f'{error}. Preserve warm task; journal: {args.journal}')
 
 if __name__=='__main__':main()
