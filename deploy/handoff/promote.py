@@ -158,7 +158,22 @@ class Controller:
         service=self.aws('ecs','describe-services','--cluster',a.cluster,'--services',a.service)['services'][0]
         if service['deploymentConfiguration']['maximumPercent']!=100 or service['deploymentConfiguration']['minimumHealthyPercent']!=0:
             raise ValueError('Keep the service stop-before-start; temporary warm task supplies continuity')
-        if service['desiredCount']!=1 and not (a.resume and self.state.get('legacy') and service['desiredCount']==0):raise ValueError('Expected one service task')
+        recovery = self.state.get('recovery')
+        if a.recover_journal:
+            original = json.loads(Path(a.recover_journal).read_text())
+            if any(original.get(k) != getattr(a,k) for k in ('cluster','service','container','region')):
+                raise ValueError('Recovery deployment target changed')
+            if original['id'] == self.state['id'] or not original.get('warm_task'):
+                raise ValueError('Expected an independent recovery journal with a warm task')
+            reference = {k:original[k] for k in ('id','source','digest','warm_task','legacy','stage','target_group')}
+            if recovery and reference != recovery:
+                raise ValueError('Recovery journal changed')
+            recovery = reference
+        interrupted_bootstrap = recovery and recovery['legacy'] and recovery['stage'] in (
+            'activating','activated','replacing-service')
+        if service['desiredCount'] != 1 and not (service['desiredCount'] == 0
+                and (interrupted_bootstrap or a.resume and self.state.get('legacy'))):
+            raise ValueError('Expected one service task')
         current=self.aws('ecs','describe-task-definition','--task-definition',service['taskDefinition'])['taskDefinition']
         candidate=self.aws('ecs','describe-task-definition','--task-definition',a.task_definition)['taskDefinition']
         a.task_definition=candidate['taskDefinitionArn']
@@ -170,8 +185,9 @@ class Controller:
         group=groups[0]['targetGroupArn']
         target_group=self.aws('elbv2','describe-target-groups','--target-group-arns',group)['TargetGroups'][0]
         if target_group['TargetType']!='ip':raise ValueError('Expected IP target group')
+        if recovery and recovery['target_group'] != group:
+            raise ValueError('Recovery target group changed')
         running=self.tasks(a.service)
-        recovery=json.loads(Path(a.recover_journal).read_text()) if a.recover_journal else None
         allowed={t['taskArn'] for t in running}|{x for x in [self.state.get('warm_task'),recovery and recovery.get('warm_task')] if x}
         launched = None
         extras = [task for task in self.tasks() if task['taskArn'] not in allowed
@@ -194,9 +210,14 @@ class Controller:
             legacy=not old_api or old_api.get('protocol')!=1
             if legacy and not a.bootstrap and not recovery:raise ValueError('Legacy binary requires explicit bootstrap')
             if recovery:
-                old_api=self.api(recovery['warm_task'],'/ready');legacy=False
+                old_api = self.ready(recovery['warm_task'], recovery['source'], recovery['digest'])
+                if not old_api or not old_api['processing'] or old_api['activeRelease'] != recovery['source']:
+                    raise ValueError('Interrupted warm sender is not the verified active release')
+                if service['desiredCount'] == 0 and (service.get('runningCount') != 0 or service.get('pendingCount') != 0):
+                    raise ValueError('Legacy service has not stopped')
+                legacy=False
             active=old_api and old_api.get('activeRelease')
-            self.save(previous_definition=service['taskDefinition'],previous_tasks=[t['taskArn'] for t in running],previous_release=active,legacy=legacy,target_group=group)
+            self.save(previous_definition=service['taskDefinition'],previous_tasks=[t['taskArn'] for t in running],previous_release=active,legacy=legacy,target_group=group,recovery=recovery)
         if self.state['stage']=='complete':return {'stage':'complete','source':a.source,'digest':a.digest}
         if not a.execute:
             return {'plan':'prewarm → verify → activate → replace service → retire warm task','legacy':self.state['legacy']}

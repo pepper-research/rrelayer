@@ -118,6 +118,22 @@ class PromotionTests(unittest.TestCase):
   self.assertEqual(resumed.run()['stage'],'complete')
   self.assertEqual(resumed.state['warm_task'],'warm-task')
   self.assertFalse(any('run-task' in call for call in resumed.calls))
+ def test_rollback_plan_after_interrupted_bootstrap_at_zero(self):
+  self.args.bootstrap=True
+  original=Fake(self.args,True)
+  original.fail='active warm target health'
+  with self.assertRaises(RuntimeError): original.run()
+  self.assertEqual(original.state['stage'],'activated')
+  args=copy.copy(self.args)
+  args.journal=str(self.path/'rollback.json')
+  args.recover_journal=self.args.journal
+  args.execute=False
+  recovery=Fake(args)
+  recovery.aws=original.aws
+  recovery.ready=original.ready
+  self.assertFalse(recovery.run()['legacy'])
+  self.assertEqual(recovery.state['previous_release'],SHA)
+  self.assertEqual(recovery.state['recovery']['id'],original.state['id'])
  def test_failed_prewarm_keeps_old(self):
   c=Fake(self.args);c.fail='candidate readiness'
   with self.assertRaises(RuntimeError):c.run()
