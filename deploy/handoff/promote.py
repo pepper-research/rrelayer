@@ -29,7 +29,9 @@ def validate_acceptance(receipt, source, digest, *, dev_validation=False):
         raise ValueError('Full source SHA and immutable image digest required')
     if receipt.get('source') != source or receipt.get('image_digest') != digest or receipt.get('protocol') != 1:
         raise ValueError('Acceptance does not identify this exact source/image/protocol')
-    passed={name for name,result in receipt.get('checks',{}).items() if result.get('passed') is True and result.get('evidence')}
+    passed = {name for name, result in receipt.get('checks', {}).items()
+              if isinstance(result, dict) and result.get('passed') is True
+              and isinstance(result.get('evidence'), str) and result['evidence'].strip()}
     required=LOCAL_REQUIRED if dev_validation else REQUIRED
     if not required <= passed:
         raise ValueError('Missing exact-image acceptance: '+', '.join(sorted(required-passed)))
