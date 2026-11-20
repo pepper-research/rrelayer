@@ -134,6 +134,17 @@ class PromotionTests(unittest.TestCase):
   self.assertFalse(recovery.run()['legacy'])
   self.assertEqual(recovery.state['previous_release'],SHA)
   self.assertEqual(recovery.state['recovery']['id'],original.state['id'])
+  # Earlier controllers persisted the same reference without these two fields.
+  reference=recovery.state['recovery'].copy()
+  for key in ('previous_definition','previous_tasks'): reference.pop(key)
+  recovery.save(recovery=reference)
+  args.resume=True
+  resumed=Fake(args)
+  resumed.aws,resumed.ready=original.aws,original.ready
+  self.assertFalse(resumed.run()['legacy'])
+  self.assertEqual(resumed.state['recovery']['previous_definition'],original.state['previous_definition'])
+  resumed.state['recovery']['source']='wrong'
+  with self.assertRaisesRegex(ValueError,'Recovery journal changed'): resumed.run()
  def test_stopped_bootstrap_recovery_checks_durable_owner_before_activation(self):
   self.args.bootstrap=True
   original=Fake(self.args,True)

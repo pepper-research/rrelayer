@@ -166,8 +166,12 @@ class Controller:
             if original['id'] == self.state['id'] or not original.get('warm_task'):
                 raise ValueError('Expected an independent recovery journal with a warm task')
             reference = {k:original[k] for k in ('id','source','digest','warm_task','legacy','stage','target_group','previous_tasks','previous_definition')}
-            if recovery and reference != recovery:
-                raise ValueError('Recovery journal changed')
+            if recovery:
+                required = {'id','source','digest','warm_task','legacy','stage','target_group'}
+                if not required.issubset(recovery) or any(reference.get(k) != v for k,v in recovery.items()):
+                    raise ValueError('Recovery journal changed')
+                if recovery != reference:
+                    self.save(recovery=reference)
             recovery = reference
         interrupted_bootstrap = recovery and recovery['legacy'] and recovery['stage'] in (
             'stopping-legacy','legacy-stopped','activating','activated','replacing-service')
