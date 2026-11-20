@@ -148,7 +148,7 @@ class Controller:
     def ready(self,arn,source,digest):
         task=self.task(arn)
         containers=[c for c in task.get('containers',[]) if c['name']==self.a.container]
-        if task['lastStatus']!='RUNNING' or not containers or containers[0].get('imageDigest')!=digest:return False
+        if task['lastStatus']!='RUNNING' or task.get('desiredStatus','RUNNING')!='RUNNING' or not containers or containers[0].get('imageDigest')!=digest:return False
         status=self.api(arn,'/ready')
         if status.get('protocol')!=1 or status.get('release')!=source or status.get('queuesReady') is not True:return False
         return status
@@ -409,6 +409,7 @@ class Controller:
                         rows=self.aws('elbv2','describe-target-health','--target-group-arn',group,'--targets',json.dumps([target]))['TargetHealthDescriptions']
                         return not rows or rows[0]['TargetHealth']['State']=='unused'
                     self.wait(drained,'target drain')
+                    self.wait(service_ready,'replacement service health',900)
                     self.aws('ecs','stop-task','--cluster',a.cluster,'--task',arn,'--reason','Verified handoff complete')
                 self.wait(lambda: self.task(arn)['lastStatus']=='STOPPED', 'task retirement')
             stopped.add(arn)
