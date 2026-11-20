@@ -83,7 +83,10 @@ class Controller:
         ids=self.aws(*args)['taskArns']
         return self.aws('ecs','describe-tasks','--cluster',self.a.cluster,'--tasks',*ids)['tasks'] if ids else []
     def task(self,arn):
-        return self.aws('ecs','describe-tasks','--cluster',self.a.cluster,'--tasks',arn)['tasks'][0]
+        tasks = self.aws('ecs','describe-tasks','--cluster',self.a.cluster,'--tasks',arn)['tasks']
+        if len(tasks) != 1 or tasks[0]['taskArn'] != arn:
+            raise RuntimeError('Task status could not be verified: '+arn)
+        return tasks[0]
     def api(self,task,path,body=None):
         # Authentication stays inside the container. Never echo environment values.
         script='curl --silent --show-error --fail --max-time 8 '
@@ -324,20 +327,23 @@ class Controller:
         self.wait(service_ready,'replacement service health',900)
         self.save(stage='retiring')
         retiring=[warm]+([recovery['warm_task']] if recovery else [])
+        stopped = set(self.state.get('retired_tasks', []))
         for arn in retiring:
-            task = self.task(arn)
-            if task['lastStatus']=='STOPPED':continue
-            if task.get('desiredStatus')=='STOPPED':
-                self.wait(lambda: self.task(arn)['lastStatus']=='STOPPED', 'task retirement')
+            if arn in stopped:
                 continue
-            target=self.target(arn)
-            self.aws('elbv2','deregister-targets','--target-group-arn',group,'--targets',json.dumps([target]))
-            def drained():
-                rows=self.aws('elbv2','describe-target-health','--target-group-arn',group,'--targets',json.dumps([target]))['TargetHealthDescriptions']
-                return not rows or rows[0]['TargetHealth']['State']=='unused'
-            self.wait(drained,'target drain')
-            self.aws('ecs','stop-task','--cluster',a.cluster,'--task',arn,'--reason','Verified handoff complete')
-            self.wait(lambda: self.task(arn)['lastStatus']=='STOPPED', 'task retirement')
+            task = self.task(arn)
+            if task['lastStatus'] != 'STOPPED':
+                if task.get('desiredStatus') != 'STOPPED':
+                    target=self.target(arn)
+                    self.aws('elbv2','deregister-targets','--target-group-arn',group,'--targets',json.dumps([target]))
+                    def drained():
+                        rows=self.aws('elbv2','describe-target-health','--target-group-arn',group,'--targets',json.dumps([target]))['TargetHealthDescriptions']
+                        return not rows or rows[0]['TargetHealth']['State']=='unused'
+                    self.wait(drained,'target drain')
+                    self.aws('ecs','stop-task','--cluster',a.cluster,'--task',arn,'--reason','Verified handoff complete')
+                self.wait(lambda: self.task(arn)['lastStatus']=='STOPPED', 'task retirement')
+            stopped.add(arn)
+            self.save(retired_tasks=sorted(stopped))
         self.save(stage='complete')
         return {'stage':'complete','source':a.source,'digest':a.digest}
 
