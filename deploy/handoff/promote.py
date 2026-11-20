@@ -175,6 +175,7 @@ class Controller:
             if not confirmed.issubset(original['previous_tasks']):
                 raise ValueError('Shutdown confirmation does not belong to original task inventory')
             reference['stopped_legacy_tasks'] = sorted(confirmed)
+            reference['warm_retired'] = original['warm_task'] in original.get('retired_tasks', [])
             if recovery:
                 required = {'id','source','digest','warm_task','legacy','stage','target_group'}
                 if not required.issubset(recovery) or any(reference.get(k) != v for k,v in recovery.items()):
@@ -243,8 +244,15 @@ class Controller:
                     # Its observation is checked before target registration or activation.
                     active = recovery['source']
                 else:
-                    old_api = self.ready(recovery['warm_task'], recovery['source'], recovery['digest'])
-                    if not old_api or not old_api['processing'] or old_api['activeRelease'] != recovery['source']:
+                    owner_task = recovery['warm_task']
+                    if recovery.get('warm_retired'):
+                        if (recovery['stage'] not in ('retiring','complete') or counts != [1,1,0]
+                                or len(running) != 1 or running[0]['taskDefinitionArn'] != service['taskDefinition']
+                                or not self.healthy(self.target(running[0]['taskArn']), group)):
+                            raise ValueError('Replacement service identity or health could not be verified')
+                        owner_task = running[0]['taskArn']
+                    old_api = self.ready(owner_task, recovery['source'], recovery['digest'])
+                    if not old_api or not old_api['durableIntakeReady'] or not old_api['processing'] or old_api['activeRelease'] != recovery['source']:
                         raise ValueError('Interrupted warm sender is not the verified active release')
                     active = old_api['activeRelease']
                 legacy=live_legacy
@@ -344,7 +352,7 @@ class Controller:
             return status and status['processing'] and status['durableIntakeReady'] and self.healthy(self.target(tasks[0]['taskArn']),group)
         self.wait(service_ready,'replacement service health',900)
         self.save(stage='retiring')
-        retiring=[warm]+([recovery['warm_task']] if recovery else [])
+        retiring=[warm]+([recovery['warm_task']] if recovery and not recovery.get('warm_retired') else [])
         stopped = set(self.state.get('retired_tasks', []))
         for arn in retiring:
             if arn in stopped:
