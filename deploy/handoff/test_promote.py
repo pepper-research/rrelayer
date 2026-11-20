@@ -2,7 +2,7 @@ import copy,json,os,tempfile,unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-from promote import ReadinessNotFound,Controller,REQUIRED,validate_acceptance,compatible_definition
+from promote import TaskNotFound,retirement_inventory,ReadinessNotFound,Controller,REQUIRED,validate_acceptance,compatible_definition
 SHA='a'*40;DIGEST='sha256:'+'b'*64
 
 def receipt():return {'source':SHA,'image_digest':DIGEST,'protocol':1,'downstream_image_digest':DIGEST,'legacy_ingress_quiesced_evidence':'fixture ingress closed','checks':{k:{'passed':True,'evidence':'test fixture'} for k in REQUIRED}}
@@ -214,6 +214,30 @@ class PromotionTests(unittest.TestCase):
     self.assertIn('rotated-out',c.state['retired_tasks'])
    else:
     with self.assertRaisesRegex(RuntimeError,'sole accepted service'):c.run()
+ def test_recovery_preserves_confirmed_and_unconfirmed_senders_across_ancestors(self):
+  first=Fake(self.args);first.run()
+  prior=dict(id='ancestor',warm_task='ancestor-warm',previous_tasks=['ancestor-service'],
+             retired_tasks=['ancestor-service'],warm_retired=True,legacy=False)
+  first.save(recovery=prior)
+  args=copy.copy(self.args);args.recover_journal=args.journal;args.journal=str(self.path/'next.json');args.execute=False
+  rollback=Fake(args);rollback.active=SHA;rollback.replaced=rollback.warmStopped=True
+  rollback.run()
+  previous,warm,retired=retirement_inventory(rollback.state)
+  self.assertTrue({'old-task','ancestor-service'}.issubset(previous))
+  self.assertTrue({'warm-task','ancestor-warm'}.issubset(warm))
+  self.assertTrue({'old-task','warm-task','ancestor-service','ancestor-warm'}.issubset(retired))
+  rollback.save(warm_task='rollback-warm')
+  original=rollback.task
+  def expired(task):
+   if task in retired:raise TaskNotFound(task)
+   if task=='rollback-warm':return dict(original(task),lastStatus='STOPPED')
+   return original(task)
+  rollback.task=expired
+  rollback.tasks=lambda service=None:[original('service-new')]
+  self.assertEqual(rollback.completed_service_task('tg'),'service-new')
+  rollback.state['recovery']['retired_tasks'].remove('old-task')
+  rollback.state['retired_tasks'].remove('old-task')
+  self.assertFalse(rollback.completed_service_task('tg'))
  def test_incompatible_rollback_preserves_incumbent(self):
   c=Fake(self.args);original=c.api
   def observe(task,path,body=None):

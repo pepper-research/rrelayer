@@ -79,6 +79,27 @@ def compatible_definition(previous,candidate,container):
     if normalize(previous)!=normalize(candidate):raise ValueError('Task configuration changed beyond image/release ID; review separately')
 
 
+def retirement_inventory(journal):
+    previous, warm, retired = set(), set(), set()
+    # A recovery can itself be recovered. Keep its sender identities and prior
+    # STOPPED observations together across each import, including old journals.
+    chain = []
+    while journal:
+        chain.append(journal)
+        journal = journal.get('recovery')
+    for journal in reversed(chain):
+        previous.update(journal.get('previous_tasks', []))
+        if journal.get('warm_task'):
+            warm.add(journal['warm_task'])
+            if journal.get('warm_retired'):
+                retired.add(journal['warm_task'])
+        retired.update(journal.get('retired_tasks', []))
+        retired.update(journal.get('stopped_legacy_tasks', []))
+        if not retired.issubset(previous | warm):
+            raise ValueError('Retirement receipt does not identify a tracked sender')
+    return previous, warm, retired
+
+
 class Controller:
     def __init__(self,args):
         self.a=args;self.path=Path(args.journal);self.state={}
@@ -256,12 +277,21 @@ class Controller:
                         or shutdown.get('lastStatus') != 'STOPPED' or not report_reference(shutdown.get('evidence'))):
                     raise ValueError('Historical shutdown evidence does not match the completed original journal')
                 reference['warm_retired'] = True
+            # Persist the full retirement evidence independently of the legacy
+            # scale-down inventory. A task may expire before this rollback finishes.
+            retirement_inventory(original)
+            reference['retired_tasks'] = sorted(set(original.get('retired_tasks', [])))
+            if original.get('recovery'):
+                reference['recovery'] = original['recovery']
             if recovery:
                 required = {'id','source','digest','warm_task','legacy','stage','target_group'}
                 prior_reference = dict(recovery)
                 for key, direct in [('previous_tasks', direct_inventory), ('stopped_legacy_tasks', direct_confirmed)]:
                     if key in prior_reference and set(prior_reference[key]) in (direct, set(reference[key])):
                         prior_reference[key] = reference[key]
+                if ('retired_tasks' in prior_reference and
+                        set(prior_reference['retired_tasks']).issubset(reference['retired_tasks'])):
+                    prior_reference['retired_tasks'] = reference['retired_tasks']
                 if prior_reference.get('warm_retired') is False and reference['warm_retired']:
                     # Retirement is monotonic. Persist it after checking the live inventory.
                     prior_reference['warm_retired'] = True
@@ -633,17 +663,7 @@ class Controller:
         arn = self.serving_task(group, sole_target=True, registration_ready=registration_ready)
         if not arn:
             return False
-        previous = set(self.state['previous_tasks'])
-        warm = {self.state['warm_task']}
-        retired = set(self.state.get('retired_tasks', []))
-        retired.update(self.state.get('stopped_legacy_tasks', []))
-        recovery = self.state.get('recovery')
-        if recovery:
-            warm.add(recovery['warm_task'])
-            previous.update(recovery.get('previous_tasks', []))
-            retired.update(recovery.get('stopped_legacy_tasks', []))
-            if recovery.get('warm_retired'):
-                retired.add(recovery['warm_task'])
+        previous, warm, retired = retirement_inventory(self.state)
         families = {td.rsplit('/', 1)[-1].split(':')[0] for td in
                     (self.state['previous_definition'], self.a.task_definition)}
         tracked = previous | warm | {arn}
