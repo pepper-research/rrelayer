@@ -26,6 +26,10 @@ REQUIRED = {'two_process_handoff','crash_boundaries','lost_rpc_response','stale_
 LOCAL_REQUIRED=REQUIRED-{'dev_ecs_handoff','downstream_no_refund_or_duplicate_credit'}
 
 
+class TaskNotFound(RuntimeError):
+    pass
+
+
 class ReadinessNotFound(RuntimeError):
     pass
 
@@ -109,8 +113,11 @@ class Controller:
             tasks.extend(row for row in rows if row['lastStatus'] != 'STOPPED')
         return tasks
     def task(self,arn):
-        tasks = self.aws('ecs','describe-tasks','--cluster',self.a.cluster,'--tasks',arn)['tasks']
-        if len(tasks) != 1 or tasks[0]['taskArn'] != arn:
+        response = self.aws('ecs','describe-tasks','--cluster',self.a.cluster,'--tasks',arn)
+        tasks, failures = response['tasks'], response.get('failures', [])
+        if not tasks and len(failures) == 1 and failures[0].get('arn') == arn and failures[0].get('reason') == 'MISSING':
+            raise TaskNotFound('Task record expired or missing: '+arn)
+        if failures or len(tasks) != 1 or tasks[0]['taskArn'] != arn:
             raise RuntimeError('Task status could not be verified: '+arn)
         return tasks[0]
     def api(self,task,path,body=None):
@@ -622,13 +629,48 @@ class Controller:
     def registration_window(self, group, close):
         registration_window(self, group, close)
 
+    def completed_service_task(self, group):
+        arn = self.serving_task(group, sole_target=True, registration_ready=True)
+        if not arn:
+            return False
+        previous = set(self.state['previous_tasks'])
+        warm = {self.state['warm_task']}
+        retired = set(self.state.get('retired_tasks', []))
+        recovery = self.state.get('recovery')
+        if recovery:
+            warm.add(recovery['warm_task'])
+            previous.update(recovery.get('previous_tasks', []))
+            if recovery.get('warm_retired'):
+                retired.add(recovery['warm_task'])
+        families = {td.rsplit('/', 1)[-1].split(':')[0] for td in
+                    (self.state['previous_definition'], self.a.task_definition)}
+        tracked = previous | warm | {arn}
+        live = {t['taskArn'] for t in self.tasks() if t['lastStatus'] != 'STOPPED'
+                and (t['taskArn'] in tracked
+                     or t['taskDefinitionArn'].rsplit('/', 1)[-1].split(':')[0] in families)}
+        if live != {arn} or arn in warm:
+            return False
+        # Historical completed journals can predate retirement receipts. An
+        # absent task-list entry alone does not establish its terminal status.
+        for task in sorted(warm):
+            try:
+                if self.task(task)['lastStatus'] != 'STOPPED':
+                    return False
+            except TaskNotFound:
+                if task not in retired:
+                    return False
+            if task not in retired:
+                retired.add(task)
+                self.save(retired_tasks=sorted(retired))
+        return arn
+
     def verify_completion(self, group):
         def confirmed():
-            arn = self.serving_task(group, sole_target=True, registration_ready=True)
+            arn = self.completed_service_task(group)
             if not arn:
                 return False
             self.verify_public_ingress(group)
-            return self.serving_task(group, sole_target=True, registration_ready=True) == arn
+            return self.completed_service_task(group) == arn
         self.wait(confirmed, 'sole accepted service and public ingress at completion')
 
     def verify_public_ingress(self, group):

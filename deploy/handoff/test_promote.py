@@ -185,6 +185,18 @@ class PromotionTests(unittest.TestCase):
   self.assertEqual(c.run()['stage'],'complete')
   c.aws=mixed
   with self.assertRaisesRegex(RuntimeError,'sole accepted service'):c.run()
+ def test_completed_resume_requires_retirement_in_inventory_and_historical_receipt(self):
+  c=Fake(self.args);self.assertEqual(c.run()['stage'],'complete')
+  c.warmStopped=False
+  with self.assertRaisesRegex(RuntimeError,'sole accepted service'):c.run()
+  c.state.pop('retired_tasks');c.save()
+  with self.assertRaisesRegex(RuntimeError,'sole accepted service'):c.run()
+  service_tasks=c.tasks
+  c.tasks=lambda service=None:service_tasks(self.args.service)
+  with self.assertRaisesRegex(RuntimeError,'sole accepted service'):c.run()
+  c.warmStopped=True
+  self.assertEqual(c.run()['stage'],'complete')
+  self.assertIn('warm-task',c.state['retired_tasks'])
  def test_incompatible_rollback_preserves_incumbent(self):
   c=Fake(self.args);original=c.api
   def observe(task,path,body=None):
@@ -244,7 +256,7 @@ class PromotionTests(unittest.TestCase):
   resumed=Fake(self.args)
   service_tasks=resumed.tasks
   extra=dict(resumed.task('warm-task'),group='handoff-'+resumed.state['id'],startedBy=resumed.state['id'])
-  resumed.tasks=lambda service=None: service_tasks(service or 'service') + ([] if service else [extra])
+  resumed.tasks=lambda service=None: service_tasks(service or 'service') + ([] if service else [dict(extra, **resumed.task('warm-task'))])
   extra['group']='unrelated'
   with self.assertRaisesRegex(ValueError,'Unaccounted'): resumed.run()
   extra['group']='handoff-'+resumed.state['id']
