@@ -268,13 +268,17 @@ class Controller:
                                 raise
                             # The journaled warm sender must independently prove ownership below.
                     if not old_api and not recovery.get('warm_retired'):
-                        old_api = self.ready(recovery['warm_task'], recovery['source'], recovery['digest'])
+                        try:
+                            old_api = self.ready(recovery['warm_task'], recovery['source'], recovery['digest'])
+                        except RuntimeError:
+                            if recovery['stage'] not in ('prepared','launching','warming','activating'):
+                                raise
+                            old_api = None
                     expected_active = recovery['source']
-                    before_activation = recovery['stage'] in ('prepared','launching','warming')
                     standby_confirms_prior = (old_api and old_api.get('durableIntakeReady')
                                               and not old_api.get('processing')
                                               and old_api.get('activeRelease') == previous_source)
-                    if ((standby_confirms_prior or before_activation and not old_api) and previous_source
+                    if ((standby_confirms_prior or not old_api) and previous_source
                             and not recovery['legacy'] and recovery['stage'] in ('prepared','launching','warming','activating')
                             and counts == [1,1,0] and len(running) == 1
                             and running[0]['taskArn'] in recovery['previous_tasks']
