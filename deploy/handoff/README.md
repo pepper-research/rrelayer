@@ -202,6 +202,13 @@ Acceptance JSON must bind `source`, `image_digest`, `protocol:1`, and the exact
 `dev_ecs_handoff` or full downstream credit/settlement acceptance. Do not create
 an all-green receipt from the local results below.
 
+For a completed historical journal missing its retirement list, a reviewed
+acceptance receipt may include `historical_warm_shutdown`. Copy the original
+journal's `id`, `cluster`, `region`, `service`, `warm_task`, `source` and
+`digest`. Set `lastStatus` to `STOPPED` only when the cited `evidence` records
+verified shutdown of that task. Expiration of an ECS task record alone does
+not establish shutdown. The current cluster inventory must agree.
+
 ## Verification
 
 ```sh

@@ -196,6 +196,13 @@ class Controller:
                 raise ValueError('Shutdown confirmation does not belong to original task inventory')
             reference['stopped_legacy_tasks'] = sorted(confirmed)
             reference['warm_retired'] = original['warm_task'] in original.get('retired_tasks', [])
+            shutdown = receipt.get('historical_warm_shutdown')
+            if shutdown is not None:
+                if (original['stage'] != 'complete' or not isinstance(shutdown, dict)
+                        or any(shutdown.get(k) != original[k] for k in ('id','cluster','region','service','warm_task','source','digest'))
+                        or shutdown.get('lastStatus') != 'STOPPED' or not report_reference(shutdown.get('evidence'))):
+                    raise ValueError('Historical shutdown evidence does not match the completed original journal')
+                reference['warm_retired'] = True
             if recovery:
                 required = {'id','source','digest','warm_task','legacy','stage','target_group'}
                 if not required.issubset(recovery) or any(reference.get(k) != v for k,v in recovery.items()):
@@ -226,7 +233,11 @@ class Controller:
         running=self.tasks(a.service)
         allowed={t['taskArn'] for t in running}|{x for x in [self.state.get('warm_task'),recovery and recovery.get('warm_task')] if x}
         launched = None
-        extras = [task for task in self.tasks() if task['taskArn'] not in allowed
+        inventory = self.tasks()
+        if recovery and recovery.get('warm_retired') and any(
+                task['taskArn'] == recovery['warm_task'] and task['lastStatus'] != 'STOPPED' for task in inventory):
+            raise ValueError('Original warm sender is live despite retirement evidence')
+        extras = [task for task in inventory if task['taskArn'] not in allowed
                   and (task['taskDefinitionArn'].split('/')[-1].split(':')[0] == current['family']
                        or task['taskDefinitionArn'] == a.task_definition)]
         if extras:
