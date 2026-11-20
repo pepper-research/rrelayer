@@ -269,7 +269,18 @@ class Controller:
                             # The journaled warm sender must independently prove ownership below.
                     if not old_api and not recovery.get('warm_retired'):
                         old_api = self.ready(recovery['warm_task'], recovery['source'], recovery['digest'])
-                    if not old_api or not old_api['durableIntakeReady'] or not old_api['processing'] or old_api['activeRelease'] != recovery['source']:
+                    expected_active = recovery['source']
+                    if (old_api and old_api.get('durableIntakeReady') and not old_api.get('processing')
+                            and old_api.get('activeRelease') == previous_source and previous_source
+                            and not recovery['legacy'] and recovery['stage'] in ('prepared','launching','warming','activating')
+                            and counts == [1,1,0] and len(running) == 1
+                            and running[0]['taskArn'] in recovery['previous_tasks']
+                            and running[0]['taskDefinitionArn'] == service['taskDefinition'] == recovery['previous_definition']):
+                        old_api = self.api(running[0]['taskArn'], '/ready')
+                        if old_api.get('protocol') != 1 or old_api.get('release') != previous_source:
+                            raise ValueError('Previous sender identity changed')
+                        expected_active = previous_source
+                    if not old_api or not old_api['durableIntakeReady'] or not old_api['processing'] or old_api['activeRelease'] != expected_active:
                         raise ValueError('Interrupted warm sender is not the verified active release')
                     active = old_api['activeRelease']
                 legacy=live_legacy
