@@ -455,12 +455,12 @@ class Controller:
         if 'registration_window_owner' not in self.state:
             self.save(registration_window_owner=self.state['id'])
         if self.state['registration_window_owner']:
+            verify_incumbent = not self.state['legacy'] and not recovery and self.state['stage'] == 'warming'
+            if verify_incumbent:
+                self.wait(lambda: self.registration_incumbent(group), 'incumbent before registration pause')
             self.registration_window(group, close=True)
-            if not self.state['legacy'] and not recovery and self.state['stage'] == 'warming':
-                for arn in self.state['previous_tasks']:
-                    observed = self.api(arn, '/ready')
-                    if not observed.get('processing') or not observed.get('queuesReady'):
-                        raise ValueError('Incumbent queues are not processing at the registration boundary')
+            if verify_incumbent:
+                self.wait(lambda: self.registration_incumbent(group), 'incumbent after registration pause')
         target=self.target(warm)
         if self.state['legacy'] and not status['durableIntakeReady']:
             # Ingress producers must already be quiesced with durable retry. Verify
@@ -584,6 +584,26 @@ class Controller:
         status=self.ready(tasks[0]['taskArn'],a.source,a.digest)
         return status and status.get('queueDiscovery') is True and status['activeRelease'] == a.source and status['processing'] and status['durableIntakeReady'] and self.healthy(self.target(tasks[0]['taskArn']),group)
 
+    def registration_incumbent(self, group):
+        definition = self.state['previous_definition']
+        service = self.aws('ecs','describe-services','--cluster',self.a.cluster,'--services',self.a.service)['services'][0]
+        tasks = self.tasks(self.a.service)
+        if (not self.steady_deployment(service, definition) or len(tasks) != 1
+                or tasks[0]['taskDefinitionArn'] != definition or not self.task_running(tasks[0])):
+            return False
+        arn = tasks[0]['taskArn']
+        if not self.healthy(self.target(arn), group):
+            return False
+        status = self.api(arn, '/ready')
+        previous = self.state['previous_release']
+        if not (protocol_one(status.get('protocol')) and status.get('release') == previous
+                and status.get('activeRelease') == previous and status.get('processing') is True
+                and status.get('queuesReady') is True and status.get('durableIntakeReady') is True):
+            return False
+        if arn not in self.state['previous_tasks']:
+            self.save(previous_tasks=sorted({*self.state['previous_tasks'], arn}))
+        return True
+
     def registration_window(self, group, close):
         registration_window(self, group, close)
 
@@ -631,21 +651,22 @@ echo true"""
             self.save(retired_tasks=sorted(stopped))
         self.wait(lambda: self.service_ready(group),'replacement service health after retirement',900)
         if self.state.get('registration_window_owner'):
-            tasks = self.tasks(a.service)
-            if len(tasks) != 1:
-                raise RuntimeError('Expected one replacement before reopening registration')
-            arn = tasks[0]['taskArn']
-            target = self.target(arn)
-            def only_verified_target():
+            def reopen_service():
+                if not self.service_ready(group):
+                    return False
+                tasks = self.tasks(a.service)
+                if len(tasks) != 1 or tasks[0]['taskDefinitionArn'] != a.task_definition:
+                    return False
+                arn = tasks[0]['taskArn']
+                target = self.target(arn)
                 rows = self.aws('elbv2','describe-target-health','--target-group-arn',group)['TargetHealthDescriptions']
-                return (len(rows) == 1 and rows[0]['Target']['Id'] == target['Id']
-                        and rows[0]['Target']['Port'] == target['Port']
-                        and rows[0]['TargetHealth']['State'] == 'healthy')
-            self.wait(only_verified_target, 'sole public target before reopening registration')
-            self.api(arn, '/handoff/resume-registration', {})
-            status = self.ready(arn, a.source, a.digest)
-            if not status or not status.get('processing') or not status.get('registrationReady'):
-                raise RuntimeError('Registration readiness unverified')
+                if (len(rows) != 1 or rows[0]['Target']['Id'] != target['Id']
+                        or rows[0]['Target']['Port'] != target['Port'] or rows[0]['TargetHealth']['State'] != 'healthy'):
+                    return False
+                self.api(arn, '/handoff/resume-registration', {})
+                status = self.ready(arn, a.source, a.digest)
+                return status and status.get('activeRelease') == a.source and status.get('processing') and status.get('registrationReady')
+            self.wait(reopen_service, 'sole healthy registration-ready public sender')
             self.registration_window(group, close=False)
         self.save(stage='complete')
         return {'stage':'complete','source':a.source,'digest':a.digest}

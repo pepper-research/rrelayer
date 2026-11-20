@@ -133,6 +133,32 @@ class PromotionTests(unittest.TestCase):
   self.assertLess(c.calls.index(('registration_window',True)),c.calls.index(('wait','prewarmed target health')))
   self.assertLess(c.calls.index(('wait','task retirement')),c.calls.index(('registration_window',False)))
   self.assertFalse(any('--desired-count' in call and call[call.index('--desired-count')+1]=='0' for call in c.calls))
+ def test_rotated_incumbent_after_planning_and_during_pause(self):
+  self.args.execute=False
+  c=Fake(self.args)
+  original_api, original_tasks, original_window = c.api, c.tasks, c.registration_window
+  replacement=['old-task']
+  def tasks(service=None):
+   rows=original_tasks(service)
+   for row in rows:
+    if row['taskArn']=='old-task':row['taskArn']=replacement[0]
+   return rows
+  def api(arn,path,body=None):
+   if arn.startswith('rotated') or arn=='old-task':
+    self.assertEqual(arn,replacement[0])
+    response=original_api('old-task',path,body)
+    response.pop('queueDiscovery')
+    return response
+   return original_api(arn,path,body)
+  def window(group,close):
+   original_window(group,close)
+   if close:replacement[0]='rotated-2'
+  c.api,c.tasks,c.registration_window=api,tasks,window
+  c.run()
+  self.args.resume=self.args.execute=True
+  replacement[0]='rotated-1'
+  self.assertEqual(c.run()['stage'],'complete')
+  self.assertEqual(c.state['previous_tasks'],['old-task','rotated-1','rotated-2'])
  def test_incompatible_rollback_preserves_incumbent(self):
   c=Fake(self.args);original=c.api
   def observe(task,path,body=None):
