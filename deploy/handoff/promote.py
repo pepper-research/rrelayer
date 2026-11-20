@@ -200,6 +200,19 @@ class Controller:
                 confirmed.update(original['previous_tasks'])
             if not confirmed.issubset(original['previous_tasks']):
                 raise ValueError('Shutdown confirmation does not belong to original task inventory')
+            inventory = set(reference['previous_tasks'])
+            ancestor = original.get('recovery')
+            while ancestor and ancestor.get('legacy'):
+                if 'previous_tasks' not in ancestor:
+                    raise ValueError('Historical rollback sender inventory is incomplete')
+                prior_tasks = set(ancestor['previous_tasks'])
+                prior_stops = set(ancestor.get('stopped_legacy_tasks', []))
+                if not prior_stops.issubset(prior_tasks):
+                    raise ValueError('Historical shutdown confirmation has no sender')
+                inventory.update(prior_tasks)
+                confirmed.update(prior_stops)
+                ancestor = ancestor.get('recovery')
+            reference['previous_tasks'] = sorted(inventory)
             reference['stopped_legacy_tasks'] = sorted(confirmed)
             reference['warm_retired'] = original['warm_task'] in original.get('retired_tasks', [])
             shutdown = receipt.get('historical_warm_shutdown')
