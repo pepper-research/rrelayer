@@ -239,6 +239,14 @@ class Controller:
                     active = None
                 elif interrupted_bootstrap and before_activation and counts == [0,0,0]:
                     active = None
+                elif (not recovery['legacy'] and recovery['stage'] in ('activated','replacing-service')
+                      and counts == [1,1,0] and len(running) == 1
+                      and running[0]['taskArn'] in recovery['previous_tasks']
+                      and running[0]['taskDefinitionArn'] == service['taskDefinition'] == recovery['previous_definition']
+                      and self.task(recovery['warm_task'])['lastStatus'] == 'STOPPED'):
+                    # Only prewarm against this expectation. The standby must read
+                    # the matching durable fence before registration or activation.
+                    active = recovery['source']
                 elif stopped_bootstrap:
                     # Only the recovery standby can now read the durable release fence.
                     # Its observation is checked before target registration or activation.
@@ -296,6 +304,8 @@ class Controller:
             expected_owners.add(a.source)
         if status['activeRelease'] not in expected_owners:
             raise ValueError('Active release changed outside this handoff')
+        if recovery and not self.state['legacy'] and not status['durableIntakeReady']:
+            raise ValueError('Recovery standby cannot verify durable intake')
         target=self.target(warm)
         if self.state['legacy'] and not status['durableIntakeReady']:
             # Ingress producers must already be quiesced with durable retry. Verify
