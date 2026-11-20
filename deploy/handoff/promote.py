@@ -205,10 +205,12 @@ class Controller:
                 reference['warm_retired'] = True
             if recovery:
                 required = {'id','source','digest','warm_task','legacy','stage','target_group'}
-                if not required.issubset(recovery) or any(reference.get(k) != v for k,v in recovery.items()):
+                prior_reference = dict(recovery)
+                if prior_reference.get('warm_retired') is False and reference['warm_retired']:
+                    # Retirement is monotonic. Persist it after checking the live inventory.
+                    prior_reference['warm_retired'] = True
+                if not required.issubset(recovery) or any(reference.get(k) != v for k,v in prior_reference.items()):
                     raise ValueError('Recovery journal changed')
-                if recovery != reference:
-                    self.save(recovery=reference)
             recovery = reference
         interrupted_bootstrap = recovery and recovery['legacy'] and recovery['stage'] in (
             'stopping-legacy','legacy-stopped','activating','activated','staging-at-zero','replacing-service')
@@ -237,6 +239,8 @@ class Controller:
         if recovery and recovery.get('warm_retired') and any(
                 task['taskArn'] == recovery['warm_task'] and task['lastStatus'] != 'STOPPED' for task in inventory):
             raise ValueError('Original warm sender is live despite retirement evidence')
+        if a.recover_journal and self.state.get('recovery') and self.state['recovery'] != recovery:
+            self.save(recovery=recovery)
         extras = [task for task in inventory if task['taskArn'] not in allowed
                   and (task['taskDefinitionArn'].split('/')[-1].split(':')[0] == current['family']
                        or task['taskDefinitionArn'] == a.task_definition)]
