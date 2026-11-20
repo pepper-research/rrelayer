@@ -18,6 +18,8 @@ import subprocess
 import time
 import uuid
 
+from registration_window import MESSAGE as REGISTRATION_PAUSED, registration_window
+
 REQUIRED = {'two_process_handoff','crash_boundaries','lost_rpc_response','stale_owner',
             'database_reconnect','replacement_cancel','legacy_bootstrap','compatible_rollback',
             'api_journal_boundary','downstream_no_refund_or_duplicate_credit','dev_ecs_handoff'}
@@ -121,6 +123,9 @@ class Controller:
         if probe:
             script = "curl --silent --max-time 8 --write-out '\nHANDOFF_HTTP:%{http_code}' "
         script+='http://127.0.0.1:3000'+path
+        return self.task_json(task, script, path, probe)
+
+    def task_json(self, task, script, path, probe=False):
         encoded=base64.b64encode(script.encode()).decode()
         command="sh -c 'echo HANDOFF_BEGIN; echo "+encoded+" | base64 -d | sh; echo; echo HANDOFF_END'"
         master,slave=pty.openpty()
@@ -231,6 +236,8 @@ class Controller:
                 inventory.update(prior_tasks)
                 confirmed.update(prior_stops)
                 ancestor = ancestor.get('recovery')
+            if original.get('registration_window_owner') and original['stage'] != 'complete':
+                reference['registration_window_owner'] = original['registration_window_owner']
             reference['inventory_reconciled'] = True
             reference['previous_tasks'] = sorted(inventory)
             reference['stopped_legacy_tasks'] = sorted(confirmed)
@@ -391,7 +398,12 @@ class Controller:
             if legacy and recovery:
                 inventory.update(recovery['previous_tasks'])
                 stopped = recovery.get('stopped_legacy_tasks', [])
-            self.save(possible_previous_owner=possible_previous_owner, previous_definition=service['taskDefinition'],
+            # A pre-discovery sender cannot observe registrations accepted by another process.
+            # Independent recovery inherits a live ingress rule even if ownership already moved.
+            window_owner = (recovery or {}).get('registration_window_owner')
+            if not old_api or old_api.get('queueDiscovery') is not True or old_api.get('registrationReady') is not True:
+                window_owner = window_owner or self.state['id']
+            self.save(registration_window_owner=window_owner, possible_previous_owner=possible_previous_owner, previous_definition=service['taskDefinition'],
                       previous_tasks=sorted(inventory), stopped_legacy_tasks=stopped, previous_release=active,
                       legacy=legacy, target_group=group, recovery=recovery)
         if self.state['stage']=='complete':
@@ -400,6 +412,8 @@ class Controller:
             return {'stage':'complete','source':a.source,'digest':a.digest}
         if not a.execute:
             return {'plan':'prewarm → verify → activate → replace service → retire warm task','legacy':self.state['legacy']}
+        if 'registration_window_owner' not in self.state and self.state['stage'] not in ('prepared','launching','warming'):
+            raise ValueError('Historical in-flight deployment requires independent recovery with a registration-compatible image')
         if self.state['stage'] == 'staging-at-zero':
             return self.stage_legacy_replacement(group, recovery, service)
         replacement_applied = (self.state['stage'] == 'activated' and service['taskDefinition'] == a.task_definition)
@@ -436,6 +450,17 @@ class Controller:
             raise ValueError('Active release changed outside this handoff')
         if recovery and not self.state['legacy'] and not status['durableIntakeReady']:
             raise ValueError('Recovery standby cannot verify durable intake')
+        if status.get('queueDiscovery') is not True:
+            raise ValueError('Candidate and rollback images must support registration queue discovery')
+        if 'registration_window_owner' not in self.state:
+            self.save(registration_window_owner=self.state['id'])
+        if self.state['registration_window_owner']:
+            self.registration_window(group, close=True)
+            if not self.state['legacy'] and not recovery and self.state['stage'] == 'warming':
+                for arn in self.state['previous_tasks']:
+                    observed = self.api(arn, '/ready')
+                    if not observed.get('processing') or not observed.get('queuesReady'):
+                        raise ValueError('Incumbent queues are not processing at the registration boundary')
         target=self.target(warm)
         if self.state['legacy'] and not status['durableIntakeReady']:
             # Ingress producers must already be quiesced with durable retry. Verify
@@ -557,7 +582,28 @@ class Controller:
                 or not self.task_running(tasks[0])):
             return False
         status=self.ready(tasks[0]['taskArn'],a.source,a.digest)
-        return status and status['activeRelease'] == a.source and status['processing'] and status['durableIntakeReady'] and self.healthy(self.target(tasks[0]['taskArn']),group)
+        return status and status.get('queueDiscovery') is True and status['activeRelease'] == a.source and status['processing'] and status['durableIntakeReady'] and self.healthy(self.target(tasks[0]['taskArn']),group)
+
+    def registration_window(self, group, close):
+        registration_window(self, group, close)
+
+    def verify_registration_response(self, hostname, port):
+        # Probe all currently advertised nodes without credentials or valid bodies.
+        # A stale listener can only reject these probes for authentication or validation.
+        if not re.fullmatch(r'[A-Za-z0-9.-]+', hostname) or not isinstance(port, int):
+            raise ValueError('Unexpected load balancer address')
+        script = f"""set -eu
+host={hostname}
+ips=$(getent ahostsv4 "$host" | cut -d' ' -f1 | sort -u)
+test -n "$ips"
+for ip in $ips; do
+  for path in /relayers/1/new /relayers/1/import /relayers/00000000-0000-0000-0000-000000000000/clone; do
+    response=$(curl --noproxy '*' --silent --max-time 3 --resolve "$host:{port}:$ip" -w ' %{{http_code}}' -X POST "http://$host:{port}$path")
+    test "$response" = '{REGISTRATION_PAUSED} 503'
+  done
+done
+echo true"""
+        return self.task_json(self.state['warm_task'], script, 'registration ingress') is True
 
     def finish_replacement(self, group, recovery):
         a = self.a
@@ -584,6 +630,23 @@ class Controller:
             stopped.add(arn)
             self.save(retired_tasks=sorted(stopped))
         self.wait(lambda: self.service_ready(group),'replacement service health after retirement',900)
+        if self.state.get('registration_window_owner'):
+            tasks = self.tasks(a.service)
+            if len(tasks) != 1:
+                raise RuntimeError('Expected one replacement before reopening registration')
+            arn = tasks[0]['taskArn']
+            target = self.target(arn)
+            def only_verified_target():
+                rows = self.aws('elbv2','describe-target-health','--target-group-arn',group)['TargetHealthDescriptions']
+                return (len(rows) == 1 and rows[0]['Target']['Id'] == target['Id']
+                        and rows[0]['Target']['Port'] == target['Port']
+                        and rows[0]['TargetHealth']['State'] == 'healthy')
+            self.wait(only_verified_target, 'sole public target before reopening registration')
+            self.api(arn, '/handoff/resume-registration', {})
+            status = self.ready(arn, a.source, a.digest)
+            if not status or not status.get('processing') or not status.get('registrationReady'):
+                raise RuntimeError('Registration readiness unverified')
+            self.registration_window(group, close=False)
         self.save(stage='complete')
         return {'stage':'complete','source':a.source,'digest':a.digest}
 

@@ -15,7 +15,7 @@ class Fake(Controller):
   if path=='/handoff/activate':
    if self.legacy:assert self.oldStopped
    assert body['expected_release']==self.active;self.active=SHA;self.enabled=True
-  return {'protocol':1,'release':SHA if task!='old-task' else 'old','activeRelease':self.active,'durableIntakeReady':self.enabled,'processing':self.enabled and (task!='old-task' or self.active=='old'),'unresolvedTransactions':self.unresolved}
+  return {'queuesReady':True,'queueDiscovery':True,'registrationReady':True,'protocol':1,'release':SHA if task!='old-task' else 'old','activeRelease':self.active,'durableIntakeReady':self.enabled,'processing':self.enabled and (task!='old-task' or self.active=='old'),'unresolvedTransactions':self.unresolved}
  def ready(self,*args):return self.api(args[0],'/ready')
  def wait(self,predicate,label,seconds=600):
   self.calls.append(('wait',label))
@@ -23,6 +23,7 @@ class Fake(Controller):
   result=predicate()
   if not result:raise RuntimeError('fixture condition false: '+label)
   return result
+ def registration_window(self,group,close):self.calls.append(('registration_window',close))
  def task(self,arn):return {'taskArn':arn,'desiredStatus':'STOPPED' if (arn=='old-task' and self.oldStopped) or (arn=='warm-task' and self.warmStopped) else 'RUNNING','taskDefinitionArn':'candidate:1' if arn!='old-task' else 'previous:1','lastStatus':'STOPPED' if (arn=='old-task' and self.oldStopped) or (arn=='warm-task' and self.warmStopped) else 'RUNNING'}
  def tasks(self,service=None):return [self.task('service-new' if self.replaced else 'old-task')] if service or 'warm_task' not in self.state else [self.task('service-new' if self.replaced else 'old-task'),self.task('warm-task')]
  def target(self,arn):return {'Id':arn,'Port':3000}
@@ -42,6 +43,7 @@ class Fake(Controller):
    if self.staged and '--desired-count' in args and args[args.index('--desired-count')+1]=='1':
     self.replaced=True;self.staged=False
   if op=='stop-task':self.warmStopped=True
+  if op=='describe-target-health' and '--targets' not in args:return {'TargetHealthDescriptions':[{'Target':self.target('service-new'),'TargetHealth':{'State':'healthy'}}]}
   if op=='describe-target-health':return {'TargetHealthDescriptions':[{'TargetHealth':{'State':'unused'}}]}
   return {}
 
@@ -120,6 +122,27 @@ class PromotionTests(unittest.TestCase):
       with self.assertRaises(RuntimeError): c.run()
     self.assertFalse(any(call[:2]==('ecs','run-task') for call in c.calls))
 
+ def test_first_upgrade_keeps_payments_running_until_registration_reopens(self):
+  c=Fake(self.args);original=c.api
+  def observe(task,path,body=None):
+   status=original(task,path,body)
+   if task=='old-task':status.pop('queueDiscovery')
+   return status
+  c.api=observe
+  self.assertEqual(c.run()['stage'],'complete')
+  self.assertLess(c.calls.index(('registration_window',True)),c.calls.index(('wait','prewarmed target health')))
+  self.assertLess(c.calls.index(('wait','task retirement')),c.calls.index(('registration_window',False)))
+  self.assertFalse(any('--desired-count' in call and call[call.index('--desired-count')+1]=='0' for call in c.calls))
+ def test_incompatible_rollback_preserves_incumbent(self):
+  c=Fake(self.args);original=c.api
+  def observe(task,path,body=None):
+   status=original(task,path,body)
+   if task=='warm-task':status.pop('queueDiscovery')
+   return status
+  c.api=observe
+  with self.assertRaisesRegex(ValueError,'rollback images'):c.run()
+  self.assertEqual(c.active,'old')
+  self.assertNotIn(('api','warm-task','/handoff/activate'),c.calls)
  def test_normal_order_and_rollback_disabled(self):
   c=Fake(self.args);self.assertEqual(c.run()['stage'],'complete');self.assertTrue(c.warmStopped)
   pre=c.calls.index(('wait','prewarmed target health'));activate=c.calls.index(('api','warm-task','/handoff/activate'));self.assertLess(pre,activate)

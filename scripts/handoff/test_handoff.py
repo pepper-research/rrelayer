@@ -37,8 +37,8 @@ def done(ctx, txs, seconds=45):
     assert lab.wait_until(lambda: all(ctx.rows().get(t['id'],{}).get('status') in lab.OK_STATUSES for t in txs),seconds,.25), ctx.rows()
 
 
-def check_money(ctx, txs):
-    chain = ctx.chain_scan()
+def check_money(ctx, txs, senders=None):
+    chain = ctx.chain_scan(senders)
     counts = lab.payload_counts(chain)
     for tx in txs:
         assert counts.get(tx['value']) == 1, (tx, chain)
@@ -649,6 +649,57 @@ def standby_registration(ctx):
     return check_money(ctx, [before, after])
 
 
+def first_registration_upgrade(ctx):
+    """Run with the deployed peer and a separately built, queue-discovering rollback."""
+    assert ctx.old_bin and ctx.registration_rollback, 'deployed --baseline and --registration-rollback required'
+    startup(ctx, binary=ctx.old_bin)
+    ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
+    api = ctx.rr['new']['api']
+    senders = [ctx.relayer]
+    existing = ctx.relayer_id
+    count = lambda: ctx.pg.psql(ctx.dbname, 'SELECT count(*) FROM relayer.record', tuples_only=True).strip()
+    initial = count()
+    def assert_paused():
+        for path, request in [
+            (f'{lab.CHAIN_ID}/new', {'name': 'during-window'}),
+            (f'{lab.CHAIN_ID}/import', {'name': 'during-window', 'address': ctx.relayer, 'keyId': 'fixture'}),
+            (f'{existing}/clone', {'chainId': lab.CHAIN_ID, 'newRelayerName': 'during-window'}),
+        ]:
+            code, message = lab.http('POST', api + '/relayers/' + path, request, auth=True)
+            assert code == 503 and 'paused' in message, (code, message)
+        assert count() == initial
+    assert_paused()
+    payments = [ctx.submit('new')]
+    done(ctx, payments)
+    activate(ctx, 'new', 'old')
+    assert_paused()
+    payments.append(ctx.submit('new'))
+    done(ctx, payments)
+    ctx.stop_rr('old')
+    assert lab.http('POST', api + '/handoff/resume-registration', {}, auth=True)[0] == 200
+    ctx.create_relayer(api)
+    senders.append(ctx.relayer)
+    payments.append(ctx.submit('new'))
+    done(ctx, payments)
+    # A separate compatibility build prewarms and accepts a new sender. Its
+    # first payment must settle on the incumbent before ownership changes.
+    ctx.start_rr('rollback', ctx.registration_rollback, lab.PORTS['api'])
+    ctx.create_relayer(ctx.rr['rollback']['api'])
+    senders.append(ctx.relayer)
+    payments.append(ctx.submit('rollback'))
+    done(ctx, payments)
+    activate(ctx, 'rollback', 'new')
+    payments.append(ctx.submit('rollback'))
+    done(ctx, payments)
+    activate(ctx, 'new', 'rollback')
+    payments.append(ctx.submit('new'))
+    done(ctx, payments)
+    evidence = check_money(ctx, payments, senders)
+    evidence['previousBinarySha256'] = hashlib.sha256(Path(ctx.old_bin).read_bytes()).hexdigest()
+    evidence['rollbackBinarySha256'] = hashlib.sha256(Path(ctx.registration_rollback).read_bytes()).hexdigest()
+    return evidence
+
+
 SCENARIOS['standby_registration'] = standby_registration
 SCENARIOS['standby_deletion'] = standby_deletion
 SCENARIOS['delete_after_settlement'] = delete_after_settlement
@@ -660,7 +711,7 @@ SCENARIOS['restart_gap_below_loaded_row_no_gap_rejection'] = restart_gap_below_l
 SCENARIOS['failed_attempt_keeps_nonce_reserved'] = failed_attempt_keeps_nonce_reserved
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--binary',required=True);p.add_argument('--baseline');p.add_argument('--out',required=True);p.add_argument('--scenarios',default=','.join(SCENARIOS));args=p.parse_args();SCENARIOS.update(LEGACY)
+    p=argparse.ArgumentParser();p.add_argument('--binary',required=True);p.add_argument('--baseline');p.add_argument('--registration-rollback');p.add_argument('--out',required=True);p.add_argument('--scenarios',default=','.join(SCENARIOS));args=p.parse_args();SCENARIOS.update(LEGACY);SCENARIOS['first_registration_upgrade'] = first_registration_upgrade
     out=Path(args.out).resolve();out.mkdir(parents=True,exist_ok=True)
     pg=lab.Postgres(str(out));results=[]
     try:
@@ -669,6 +720,7 @@ def main():
             sdir=out/name;sdir.mkdir(exist_ok=True)
             ctx=lab.Ctx(pg,str(sdir),'handoff_'+name,str(Path(args.binary).resolve()),args.baseline,lab.TIP_WEI)
             try:
+                ctx.registration_rollback = args.registration_rollback
                 ctx.start_infra();result=SCENARIOS[name](ctx)
                 results.append({'scenario':name,'pass':True,'binarySha256':hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),**result})
             except Exception as error:
