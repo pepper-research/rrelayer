@@ -24,6 +24,10 @@ REQUIRED = {'two_process_handoff','crash_boundaries','lost_rpc_response','stale_
 LOCAL_REQUIRED=REQUIRED-{'dev_ecs_handoff','downstream_no_refund_or_duplicate_credit'}
 
 
+class ReadinessNotFound(RuntimeError):
+    pass
+
+
 def report_reference(value):
     return isinstance(value, str) and bool(value.strip())
 
@@ -113,6 +117,9 @@ class Controller:
         if body is not None:
             encoded=base64.b64encode(json.dumps(body).encode()).decode()
             script+='--user "$RRELAYER_AUTH_USERNAME:$RRELAYER_AUTH_PASSWORD" -H "Content-Type: application/json" --data "$(echo '+encoded+' | base64 -d)" '
+        probe = path == '/ready' and body is None
+        if probe:
+            script = "curl --silent --max-time 8 --write-out '\nHANDOFF_HTTP:%{http_code}' "
         script+='http://127.0.0.1:3000'+path
         encoded=base64.b64encode(script.encode()).decode()
         command="sh -c 'echo HANDOFF_BEGIN; echo "+encoded+" | base64 -d | sh; echo; echo HANDOFF_END'"
@@ -137,7 +144,15 @@ class Controller:
             if b'HANDOFF_BEGIN' not in data or b'HANDOFF_END' not in data:
                 raise RuntimeError('Incomplete ECS Exec response')
             body=data.split(b'HANDOFF_BEGIN',1)[1].split(b'HANDOFF_END',1)[0].replace(b'\r',b'').strip()
+            if probe:
+                body, marker, status = body.rpartition(b'HANDOFF_HTTP:')
+                if not marker or status != b'200':
+                    if marker and status == b'404':
+                        raise ReadinessNotFound('Readiness endpoint returned HTTP 404')
+                    raise RuntimeError('Readiness HTTP status unavailable or unsuccessful')
             return json.loads(body)
+        except ReadinessNotFound:
+            raise
         except Exception:
             raise RuntimeError('Task API unavailable: '+path) from None
         finally:
@@ -289,7 +304,16 @@ class Controller:
         if 'previous_definition' not in self.state:
             previous_source,_=source_of(current,a.container)
             old_api=None
-            if not recovery and previous_source and running:old_api=self.api(running[0]['taskArn'],'/ready')
+            if not recovery and previous_source and running:
+                arn = running[0]['taskArn']
+                try:
+                    old_api = self.api(arn, '/ready')
+                except ReadinessNotFound:
+                    if not a.bootstrap or not self.healthy(self.target(arn), group):
+                        raise
+                else:
+                    if not isinstance(old_api, dict) or not protocol_one(old_api.get('protocol')):
+                        raise ValueError('Tagged sender returned an unknown readiness protocol')
             legacy=not old_api or not protocol_one(old_api.get('protocol'))
             if legacy and not a.bootstrap and not recovery:raise ValueError('Legacy binary requires explicit bootstrap')
             possible_previous_owner = None

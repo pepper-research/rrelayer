@@ -2,7 +2,7 @@ import copy,json,os,tempfile,unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-from promote import Controller,REQUIRED,validate_acceptance,compatible_definition
+from promote import ReadinessNotFound,Controller,REQUIRED,validate_acceptance,compatible_definition
 SHA='a'*40;DIGEST='sha256:'+'b'*64
 
 def receipt():return {'source':SHA,'image_digest':DIGEST,'protocol':1,'downstream_image_digest':DIGEST,'legacy_ingress_quiesced_evidence':'fixture ingress closed','checks':{k:{'passed':True,'evidence':'test fixture'} for k in REQUIRED}}
@@ -98,11 +98,28 @@ class PromotionTests(unittest.TestCase):
   self.assertEqual(c.calls,[])
  def test_ecs_exec_uses_tty_and_reads_json(self):
   fake=self.path/'aws'
-  fake.write_text('#!/usr/bin/env python3\nimport json,sys\nassert sys.stdin.isatty() and sys.stdout.isatty()\nprint("HANDOFF_BEGIN")\nprint(json.dumps({"protocol":1,"processing":True}))\nprint("HANDOFF_END")\n')
+  fake.write_text('#!/usr/bin/env python3\nimport json,sys\nassert sys.stdin.isatty() and sys.stdout.isatty()\nprint("HANDOFF_BEGIN")\nprint(json.dumps({"protocol":1,"processing":True}))\nprint("HANDOFF_HTTP:200")\nprint("HANDOFF_END")\n')
   fake.chmod(0o755)
   with patch.dict(os.environ,PATH=str(self.path)+os.pathsep+os.environ['PATH']):
    result=Controller(self.args).api('task','/ready')
   self.assertEqual(result,{'protocol':1,'processing':True})
+ def test_tagged_bootstrap_requires_confirmed_404_and_healthy_target(self):
+  self.args.execute=False
+  for bootstrap, healthy, error, allowed in (
+      (True, True, ReadinessNotFound('404'), True),
+      (False, True, ReadinessNotFound('404'), False),
+      (True, False, ReadinessNotFound('404'), False),
+      (True, True, RuntimeError('transport unavailable'), False)):
+   with self.subTest(bootstrap=bootstrap,healthy=healthy,error=error):
+    self.args.bootstrap=bootstrap
+    self.args.journal=str(self.path/('journal-'+str(bootstrap)+str(healthy)+type(error).__name__))
+    c=Fake(self.args)
+    with patch.object(c,'api',side_effect=error), patch.object(c,'healthy',return_value=healthy):
+     if allowed: self.assertTrue(c.run()['legacy'])
+     else:
+      with self.assertRaises(RuntimeError): c.run()
+    self.assertFalse(any(call[:2]==('ecs','run-task') for call in c.calls))
+
  def test_normal_order_and_rollback_disabled(self):
   c=Fake(self.args);self.assertEqual(c.run()['stage'],'complete');self.assertTrue(c.warmStopped)
   pre=c.calls.index(('wait','prewarmed target health'));activate=c.calls.index(('api','warm-task','/handoff/activate'));self.assertLess(pre,activate)
