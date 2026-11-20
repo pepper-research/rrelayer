@@ -263,8 +263,7 @@ class Controller:
             baseline = self.state.get('previous_definition', service['taskDefinition'])
             if (not self.steady_deployment(service, baseline)
                     or len(running) != 1 or not self.task_running(running[0])
-                    or running[0]['taskDefinitionArn'] != baseline
-                    or running[0]['taskArn'] not in self.state.get('previous_tasks', [running[0]['taskArn']])):
+                    or running[0]['taskDefinitionArn'] != baseline):
                 raise ValueError('Service is not steady; use its recovery journal')
         if 'previous_definition' not in self.state:
             previous_source,_=source_of(current,a.container)
