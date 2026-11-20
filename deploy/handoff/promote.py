@@ -409,6 +409,8 @@ class Controller:
         if self.state['stage']=='complete':
             if not self.service_ready(group):
                 raise RuntimeError('Completed handoff has a degraded replacement service')
+            if self.state.get('registration_window_owner'):
+                self.verify_completed_window(group)
             return {'stage':'complete','source':a.source,'digest':a.digest}
         if not a.execute:
             return {'plan':'prewarm → verify → activate → replace service → retire warm task','legacy':self.state['legacy']}
@@ -607,23 +609,45 @@ class Controller:
     def registration_window(self, group, close):
         registration_window(self, group, close)
 
+    def verify_completed_window(self, group):
+        registration_window(self, group, close=False, verify_only=True)
+
     def verify_registration_response(self, hostname, port):
-        # Probe all currently advertised nodes without credentials or valid bodies.
-        # A stale listener can only reject these probes for authentication or validation.
+        return self.probe_registration(self.state['warm_task'], hostname, port, paused=True)
+
+    def verify_registration_reopened(self, hostname, port):
+        tasks = self.tasks(self.a.service)
+        if len(tasks) != 1 or tasks[0]['taskDefinitionArn'] != self.a.task_definition:
+            return False
+        arn = tasks[0]['taskArn']
+        status = self.ready(arn, self.a.source, self.a.digest)
+        if not status or not status.get('processing') or not status.get('registrationReady'):
+            return False
+        return self.probe_registration(arn, hostname, port, paused=False)
+
+    def probe_registration(self, task, hostname, port, paused):
+        # Malformed, unauthenticated POSTs cannot allocate a key or sender.
         if not re.fullmatch(r'[A-Za-z0-9.-]+', hostname) or not isinstance(port, int):
             raise ValueError('Unexpected load balancer address')
+        expected = (f"expected='{REGISTRATION_PAUSED} 503'" if paused else
+                    '''expected=$(probe "http://127.0.0.1:3000$path")
+    case "$expected" in *" 400"|*" 401"|*" 403"|*" 422") ;; *) exit 1 ;; esac''')
         script = f"""set -eu
 host={hostname}
+probe() {{
+  curl --noproxy '*' --silent --show-error --max-time 3 -H 'Content-Type: application/json' --data '{{' -w ' %{{http_code}}' "$@"
+}}
 ips=$(getent ahostsv4 "$host" | cut -d' ' -f1 | sort -u)
 test -n "$ips"
-for ip in $ips; do
-  for path in /relayers/1/new /relayers/1/import /relayers/00000000-0000-0000-0000-000000000000/clone; do
-    response=$(curl --noproxy '*' --silent --max-time 3 --resolve "$host:{port}:$ip" -w ' %{{http_code}}' -X POST "http://$host:{port}$path")
-    test "$response" = '{REGISTRATION_PAUSED} 503'
+for path in /relayers/1/new /relayers/1/import /relayers/00000000-0000-0000-0000-000000000000/clone; do
+  {expected}
+  for ip in $ips; do
+    response=$(probe --resolve "$host:{port}:$ip" "http://$host:{port}$path")
+    test "$response" = "$expected"
   done
 done
 echo true"""
-        return self.task_json(self.state['warm_task'], script, 'registration ingress') is True
+        return self.task_json(task, script, 'registration ingress') is True
 
     def finish_replacement(self, group, recovery):
         a = self.a

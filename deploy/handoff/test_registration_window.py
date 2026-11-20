@@ -1,8 +1,13 @@
 import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 from copy import deepcopy
 from unittest.mock import Mock
 
+from promote import Controller
 from registration_window import ACTIONS, CONDITIONS, matches, registration_window
 
 
@@ -12,6 +17,7 @@ class WindowTests(unittest.TestCase):
         self.control.state = {'registration_window_owner': 'fixture'}
         self.control.wait.side_effect = lambda fn, _: self.assertTrue(fn())
         self.control.verify_registration_response.return_value = True
+        self.control.verify_registration_reopened.return_value = True
         self.control.aws.side_effect = self.aws
         self.rules = []
         self.tags = []
@@ -52,6 +58,36 @@ class WindowTests(unittest.TestCase):
         for _ in range(2):
             registration_window(self.control, 'group', close=False)
         self.assertFalse(self.rules)
+
+    def test_rule_removal_and_resumed_open_require_public_forwarding(self):
+        registration_window(self.control, 'group', close=True)
+        self.control.verify_registration_reopened.return_value = False
+        for _ in range(2):
+            with self.assertRaises(AssertionError):
+                registration_window(self.control, 'group', close=False)
+            self.assertFalse(self.rules)
+        self.control.verify_registration_reopened.return_value = True
+        registration_window(self.control, 'group', close=False, verify_only=True)
+
+    def test_public_probe_checks_all_nodes_and_routes_against_the_live_response(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bin_path = Path(directory)
+            for app, script in {
+                'getent': 'echo "127.0.0.1 STREAM lb"; echo "127.0.0.2 STREAM lb"',
+                'curl': """case "$*" in
+  *127.0.0.2*clone*) echo "$LAST_NODE_RESPONSE" ;;
+  *) echo 'Unauthorized 401' ;;
+esac""",
+            }.items():
+                path = bin_path / app
+                path.write_text('#!/bin/sh\n' + script)
+                path.chmod(0o755)
+            for reply, expected in [('maintenance 503', False), ('Unauthorized 401', True)]:
+                env = dict(os.environ, PATH=directory + os.pathsep + os.environ['PATH'], LAST_NODE_RESPONSE=reply)
+                def task_json(task, script, label):
+                    return subprocess.run(['sh','-c',script], env=env, capture_output=True).returncode == 0
+                self.control.task_json.side_effect = task_json
+                self.assertEqual(Controller.probe_registration(self.control, 'steady', 'lb.test', 80, False), expected)
 
     def test_never_remove_another_deployments_rule(self):
         registration_window(self.control, 'group', close=True)

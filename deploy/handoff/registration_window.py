@@ -24,7 +24,7 @@ def matches(rule):
             and actions[0].get('FixedResponseConfig') == ACTIONS[0]['FixedResponseConfig'])
 
 
-def registration_window(controller, group, close):
+def registration_window(controller, group, close, verify_only=False):
     aws = controller.aws
     groups = aws('elbv2', 'describe-target-groups', '--target-group-arns', group)['TargetGroups']
     if len(groups) != 1 or len(groups[0]['LoadBalancerArns']) != 1:
@@ -39,8 +39,9 @@ def registration_window(controller, group, close):
         raise ValueError('Unverified registration listener transport')
     def verify_response():
         lb = aws('elbv2', 'describe-load-balancers', '--load-balancer-arns', groups[0]['LoadBalancerArns'][0])['LoadBalancers'][0]
-        controller.wait(lambda: controller.verify_registration_response(lb['DNSName'], listener['Port']),
-                        'registration pause on public ingress')
+        probe = controller.verify_registration_response if close else controller.verify_registration_reopened
+        controller.wait(lambda: probe(lb['DNSName'], listener['Port']),
+                        'registration pause on public ingress' if close else 'registration reopened on public ingress')
     actions = listener['DefaultActions']
     if (len(actions) != 1 or actions[0]['Type'] != 'forward' or actions[0].get('TargetGroupArn') != group
             or any(g['TargetGroupArn'] != group for g in actions[0].get('ForwardConfig', {}).get('TargetGroups', []))
@@ -49,6 +50,8 @@ def registration_window(controller, group, close):
     rules = [r for r in aws('elbv2', 'describe-rules', '--listener-arn', arn)['Rules'] if not r['IsDefault']]
     owner = controller.state['registration_window_owner']
     if rules:
+        if verify_only:
+            raise ValueError('Expected registration ingress to be open')
         if len(rules) != 1 or not matches(rules[0]):
             raise ValueError('Unexpected routing rules on relayer listener')
         rule = rules[0]['RuleArn']
@@ -62,6 +65,7 @@ def registration_window(controller, group, close):
             controller.wait(lambda: all(r['IsDefault'] for r in
                             aws('elbv2', 'describe-rules', '--listener-arn', arn)['Rules']),
                             'registration rule removed')
+            verify_response()
         return
     if close:
         controller.save(registration_listener=arn)
@@ -71,4 +75,6 @@ def registration_window(controller, group, close):
         controller.wait(lambda: any(not r['IsDefault'] and matches(r) for r in
                         aws('elbv2', 'describe-rules', '--listener-arn', arn)['Rules']),
                         'registration rule installed')
+        verify_response()
+    else:
         verify_response()
