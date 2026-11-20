@@ -214,7 +214,6 @@ class Controller:
                 if counts[0] == 0 and counts != [0,0,0]:
                     raise ValueError('Legacy service has not stopped')
                 stopped_bootstrap = (counts == [0,0,0] and interrupted_bootstrap
-                                     and recovery['stage'] in ('activated','replacing-service')
                                      and self.task(recovery['warm_task'])['lastStatus'] == 'STOPPED'
                                      and all(t['lastStatus'] == 'STOPPED' for t in running))
                 if stopped_bootstrap:
@@ -243,7 +242,11 @@ class Controller:
             if result.get('failures') or len(result.get('tasks',[]))!=1:raise RuntimeError('Candidate launch failed; existing service unchanged')
             self.save(warm_task=result['tasks'][0]['taskArn'],stage='warming')
         warm=self.state['warm_task'];status=self.wait(lambda:self.ready(warm,a.source,a.digest),'candidate readiness')
-        if status['activeRelease'] not in (self.state['previous_release'],a.source):raise ValueError('Active release changed outside this handoff')
+        expected_owners = {self.state['previous_release']}
+        if self.state['stage'] in ('activating','activated'):
+            expected_owners.add(a.source)
+        if status['activeRelease'] not in expected_owners:
+            raise ValueError('Active release changed outside this handoff')
         target=self.target(warm)
         if self.state['legacy'] and not status['durableIntakeReady']:
             # Ingress producers must already be quiesced with durable retry. Verify

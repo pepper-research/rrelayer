@@ -139,6 +139,7 @@ class PromotionTests(unittest.TestCase):
   original=Fake(self.args,True)
   original.fail='active warm target health'
   with self.assertRaises(RuntimeError): original.run()
+  original.save(stage='activating')
   original.warmStopped=True
   args=copy.copy(self.args)
   args.journal=str(self.path/'recovery.json')
