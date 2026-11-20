@@ -81,7 +81,15 @@ class Controller:
         args=['ecs','list-tasks','--cluster',self.a.cluster,'--desired-status','RUNNING']
         if service:args+=['--service-name',service]
         ids=self.aws(*args)['taskArns']
-        return self.aws('ecs','describe-tasks','--cluster',self.a.cluster,'--tasks',*ids)['tasks'] if ids else []
+        tasks = []
+        for start in range(0, len(ids), 100):
+            batch = ids[start:start+100]
+            response = self.aws('ecs','describe-tasks','--cluster',self.a.cluster,'--tasks',*batch)
+            rows = response['tasks']
+            if response.get('failures') or sorted(t['taskArn'] for t in rows) != sorted(batch):
+                raise RuntimeError('Incomplete ECS task inventory')
+            tasks.extend(rows)
+        return tasks
     def task(self,arn):
         tasks = self.aws('ecs','describe-tasks','--cluster',self.a.cluster,'--tasks',arn)['tasks']
         if len(tasks) != 1 or tasks[0]['taskArn'] != arn:
