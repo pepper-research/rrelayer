@@ -165,7 +165,7 @@ class Controller:
                 raise ValueError('Recovery deployment target changed')
             if original['id'] == self.state['id'] or not original.get('warm_task'):
                 raise ValueError('Expected an independent recovery journal with a warm task')
-            reference = {k:original[k] for k in ('id','source','digest','warm_task','legacy','stage','target_group','previous_tasks')}
+            reference = {k:original[k] for k in ('id','source','digest','warm_task','legacy','stage','target_group','previous_tasks','previous_definition')}
             if recovery and reference != recovery:
                 raise ValueError('Recovery journal changed')
             recovery = reference
@@ -217,7 +217,13 @@ class Controller:
                                      and self.task(recovery['warm_task'])['lastStatus'] == 'STOPPED'
                                      and all(t['lastStatus'] == 'STOPPED' for t in running))
                 before_activation = recovery['stage'] in ('stopping-legacy', 'legacy-stopped')
-                if interrupted_bootstrap and before_activation and counts == [0,0,0]:
+                live_legacy = (recovery['legacy'] and recovery['stage'] in ('prepared','launching','warming','stopping-legacy')
+                               and counts == [1,1,0] and service['taskDefinition'] == recovery['previous_definition']
+                               and len(running) == 1 and running[0]['lastStatus'] == 'RUNNING'
+                               and running[0]['taskDefinitionArn'] == service['taskDefinition'])
+                if live_legacy:
+                    active = None
+                elif interrupted_bootstrap and before_activation and counts == [0,0,0]:
                     active = None
                 elif stopped_bootstrap:
                     # Only the recovery standby can now read the durable release fence.
@@ -228,7 +234,7 @@ class Controller:
                     if not old_api or not old_api['processing'] or old_api['activeRelease'] != recovery['source']:
                         raise ValueError('Interrupted warm sender is not the verified active release')
                     active = old_api['activeRelease']
-                legacy=False
+                legacy=live_legacy
             else:
                 active=old_api and old_api.get('activeRelease')
             self.save(previous_definition=service['taskDefinition'],previous_tasks=[t['taskArn'] for t in running],previous_release=active,legacy=legacy,target_group=group,recovery=recovery)
@@ -245,7 +251,7 @@ class Controller:
             if result.get('failures') or len(result.get('tasks',[]))!=1:raise RuntimeError('Candidate launch failed; existing service unchanged')
             self.save(warm_task=result['tasks'][0]['taskArn'],stage='warming')
         warm=self.state['warm_task'];status=self.wait(lambda:self.ready(warm,a.source,a.digest),'candidate readiness')
-        if (recovery and recovery['legacy'] and recovery['stage'] in ('stopping-legacy','legacy-stopped','activating')
+        if (not self.state['legacy'] and recovery and recovery['legacy'] and recovery['stage'] in ('stopping-legacy','legacy-stopped','activating')
                 and status['activeRelease'] is None and not status['durableIntakeReady']):
             service_state = self.aws('ecs','describe-services','--cluster',a.cluster,'--services',a.service)['services'][0]
             if (not receipt.get('legacy_ingress_quiesced_evidence') or status['unresolvedTransactions'] != 0
