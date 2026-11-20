@@ -165,7 +165,7 @@ class Controller:
                 raise ValueError('Recovery deployment target changed')
             if original['id'] == self.state['id'] or not original.get('warm_task'):
                 raise ValueError('Expected an independent recovery journal with a warm task')
-            reference = {k:original[k] for k in ('id','source','digest','warm_task','legacy','stage','target_group')}
+            reference = {k:original[k] for k in ('id','source','digest','warm_task','legacy','stage','target_group','previous_tasks')}
             if recovery and reference != recovery:
                 raise ValueError('Recovery journal changed')
             recovery = reference
@@ -242,6 +242,16 @@ class Controller:
             if result.get('failures') or len(result.get('tasks',[]))!=1:raise RuntimeError('Candidate launch failed; existing service unchanged')
             self.save(warm_task=result['tasks'][0]['taskArn'],stage='warming')
         warm=self.state['warm_task'];status=self.wait(lambda:self.ready(warm,a.source,a.digest),'candidate readiness')
+        if (recovery and recovery['legacy'] and recovery['stage'] == 'activating'
+                and status['activeRelease'] is None and not status['durableIntakeReady']):
+            service_state = self.aws('ecs','describe-services','--cluster',a.cluster,'--services',a.service)['services'][0]
+            if (not receipt.get('legacy_ingress_quiesced_evidence') or status['unresolvedTransactions'] != 0
+                    or any(service_state.get(k) != 0 for k in ('desiredCount','runningCount','pendingCount'))
+                    or self.task(recovery['warm_task'])['lastStatus'] != 'STOPPED'
+                    or any(t['lastStatus'] != 'STOPPED' for t in self.tasks(a.service))
+                    or any(self.task(t)['lastStatus'] != 'STOPPED' for t in recovery['previous_tasks'])):
+                raise ValueError('Cannot verify drained legacy shutdown for recovery bootstrap')
+            self.save(legacy=True, previous_release=None, previous_tasks=recovery['previous_tasks'])
         expected_owners = {self.state['previous_release']}
         if self.state['stage'] in ('activating','activated'):
             expected_owners.add(a.source)
