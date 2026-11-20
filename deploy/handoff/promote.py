@@ -223,6 +223,7 @@ class Controller:
             if not recovery and previous_source and running:old_api=self.api(running[0]['taskArn'],'/ready')
             legacy=not old_api or old_api.get('protocol')!=1
             if legacy and not a.bootstrap and not recovery:raise ValueError('Legacy binary requires explicit bootstrap')
+            possible_previous_owner = None
             if recovery:
                 counts = [service.get(k) for k in ('desiredCount','runningCount','pendingCount')]
                 if counts[0] == 0 and counts != [0,0,0]:
@@ -239,7 +240,7 @@ class Controller:
                     active = None
                 elif interrupted_bootstrap and before_activation and counts == [0,0,0]:
                     active = None
-                elif (not recovery['legacy'] and recovery['stage'] in ('activated','replacing-service')
+                elif (not recovery['legacy'] and recovery['stage'] in ('activating','activated','replacing-service')
                       and counts == [1,1,0] and len(running) == 1
                       and running[0]['taskArn'] in recovery['previous_tasks']
                       and running[0]['taskDefinitionArn'] == service['taskDefinition'] == recovery['previous_definition']
@@ -247,6 +248,8 @@ class Controller:
                     # Only prewarm against this expectation. The standby must read
                     # the matching durable fence before registration or activation.
                     active = recovery['source']
+                    if recovery['stage'] == 'activating':
+                        possible_previous_owner = previous_source
                 elif stopped_bootstrap:
                     # Only the recovery standby can now read the durable release fence.
                     # Its observation is checked before target registration or activation.
@@ -272,7 +275,7 @@ class Controller:
                 legacy=live_legacy
             else:
                 active=old_api and old_api.get('activeRelease')
-            self.save(previous_definition=service['taskDefinition'],previous_tasks=[t['taskArn'] for t in running],previous_release=active,legacy=legacy,target_group=group,recovery=recovery)
+            self.save(possible_previous_owner=possible_previous_owner, previous_definition=service['taskDefinition'],previous_tasks=[t['taskArn'] for t in running],previous_release=active,legacy=legacy,target_group=group,recovery=recovery)
         if self.state['stage']=='complete':return {'stage':'complete','source':a.source,'digest':a.digest}
         if not a.execute:
             return {'plan':'prewarm → verify → activate → replace service → retire warm task','legacy':self.state['legacy']}
@@ -299,6 +302,9 @@ class Controller:
                 raise ValueError('Cannot verify drained legacy shutdown for recovery bootstrap')
             self.save(legacy=True, previous_release=None, previous_tasks=recovery['previous_tasks'],
                       stopped_legacy_tasks=recovery.get('stopped_legacy_tasks', []))
+        prior = self.state.get('possible_previous_owner')
+        if prior and self.state['stage'] == 'warming' and status['durableIntakeReady'] and status['activeRelease'] == prior:
+            self.save(previous_release=prior, possible_previous_owner=None)
         expected_owners = {self.state['previous_release']}
         if self.state['stage'] in ('activating','activated'):
             expected_owners.add(a.source)
