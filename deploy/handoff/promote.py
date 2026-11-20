@@ -179,7 +179,7 @@ class Controller:
                 raise ValueError('Expected an independent recovery journal with a warm task')
             reference = {k:original[k] for k in ('id','source','digest','warm_task','legacy','stage','target_group','previous_tasks','previous_definition')}
             confirmed = set(original.get('stopped_legacy_tasks', []))
-            if original['legacy'] and original['stage'] in ('legacy-stopped','activating','activated','replacing-service'):
+            if original['legacy'] and original['stage'] in ('legacy-stopped','activating','activated','staging-at-zero','replacing-service'):
                 confirmed.update(original['previous_tasks'])
             if not confirmed.issubset(original['previous_tasks']):
                 raise ValueError('Shutdown confirmation does not belong to original task inventory')
@@ -193,9 +193,9 @@ class Controller:
                     self.save(recovery=reference)
             recovery = reference
         interrupted_bootstrap = recovery and recovery['legacy'] and recovery['stage'] in (
-            'stopping-legacy','legacy-stopped','activating','activated','replacing-service')
+            'stopping-legacy','legacy-stopped','activating','activated','staging-at-zero','replacing-service')
         if service['desiredCount'] != 1 and not (service['desiredCount'] == 0
-                and (interrupted_bootstrap or a.resume and self.state.get('legacy'))):
+                and (interrupted_bootstrap or a.resume and (self.state.get('legacy') or self.state['stage'] == 'staging-at-zero'))):
             raise ValueError('Expected one service task')
         current=self.aws('ecs','describe-task-definition','--task-definition',service['taskDefinition'])['taskDefinition']
         candidate=self.aws('ecs','describe-task-definition','--task-definition',a.task_definition)['taskDefinition']
@@ -308,6 +308,8 @@ class Controller:
         if self.state['stage']=='complete':return {'stage':'complete','source':a.source,'digest':a.digest}
         if not a.execute:
             return {'plan':'prewarm → verify → activate → replace service → retire warm task','legacy':self.state['legacy']}
+        if self.state['stage'] == 'staging-at-zero':
+            return self.stage_legacy_replacement(group, recovery, service)
         replacement_applied = (self.state['stage'] == 'activated' and service['taskDefinition'] == a.task_definition)
         if replacement_applied or self.state['stage'] in ('replacing-service', 'service-ready', 'retiring'):
             return self.finish_replacement(group, recovery)
@@ -390,7 +392,38 @@ class Controller:
         self.save(stage='activated')
         self.aws('elbv2','register-targets','--target-group-arn',group,'--targets',json.dumps([target]))
         self.wait(lambda:self.healthy(target,group),'active warm target health')
+        if self.state['legacy'] or (recovery and service['desiredCount'] == 0):
+            self.save(stage='staging-at-zero')
+            return self.stage_legacy_replacement(group, recovery)
         self.aws('ecs','update-service','--cluster',a.cluster,'--service',a.service,'--task-definition',a.task_definition,'--desired-count','1','--enable-execute-command')
+        self.save(stage='replacing-service')
+        return self.finish_replacement(group, recovery)
+
+    def stage_legacy_replacement(self, group, recovery, service=None):
+        a = self.a
+        def current_service():
+            return self.aws('ecs','describe-services','--cluster',a.cluster,'--services',a.service)['services'][0]
+        service = service or current_service()
+        if service['desiredCount'] == 0:
+            if service['taskDefinition'] != a.task_definition:
+                self.aws('ecs','update-service','--cluster',a.cluster,'--service',a.service,
+                         '--task-definition',a.task_definition,'--desired-count','0','--enable-execute-command')
+            def staged():
+                service = current_service()
+                deployments = service.get('deployments', [])
+                return (service['taskDefinition'] == a.task_definition and len(deployments) == 1
+                        and deployments[0]['taskDefinition'] == a.task_definition
+                        and all(service[k] == 0 and deployments[0][k] == 0
+                                for k in ('desiredCount','pendingCount','runningCount'))
+                        and all(t['lastStatus'] == 'STOPPED' for t in self.tasks(a.service)))
+            self.wait(staged,'sole candidate deployment at zero')
+            status = self.ready(self.state['warm_task'], a.source, a.digest)
+            if not status or not status['processing'] or not status['durableIntakeReady'] or status['activeRelease'] != a.source:
+                raise ValueError('Warm sender ownership changed before scale-up')
+            self.save(zero_verified=True)
+            self.aws('ecs','update-service','--cluster',a.cluster,'--service',a.service,'--desired-count','1')
+        elif not self.state.get('zero_verified') or service['taskDefinition'] != a.task_definition:
+            raise ValueError('Service changed before verified scale-up')
         self.save(stage='replacing-service')
         return self.finish_replacement(group, recovery)
 

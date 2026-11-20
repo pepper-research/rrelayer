@@ -9,7 +9,7 @@ def receipt():return {'source':SHA,'image_digest':DIGEST,'protocol':1,'downstrea
 
 class Fake(Controller):
  def __init__(self,args,legacy=False):
-  super().__init__(args);self.calls=[];self.active=None if legacy else 'old';self.enabled=not legacy;self.legacy=legacy;self.fail=None;self.oldStopped=False;self.warmStopped=False;self.replaced=False;self.unresolved=0
+  super().__init__(args);self.calls=[];self.active=None if legacy else 'old';self.enabled=not legacy;self.legacy=legacy;self.fail=None;self.oldStopped=False;self.warmStopped=False;self.replaced=False;self.staged=False;self.unresolved=0
  def api(self,task,path,body=None):
   self.calls.append(('api',task,path))
   if path=='/handoff/activate':
@@ -29,14 +29,18 @@ class Fake(Controller):
  def healthy(self,*args):return True
  def aws(self,*args):
   self.calls.append(args);op=args[1]
-  if op=='describe-services':return {'services':[{'deploymentConfiguration':{'maximumPercent':100,'minimumHealthyPercent':0,'deploymentCircuitBreaker':{'enable':True,'rollback':True}},'runningCount':0 if self.oldStopped and not self.replaced else 1,'pendingCount':0,'desiredCount':0 if self.oldStopped and not self.replaced else 1,'taskDefinition':'candidate:1' if self.replaced else 'previous:1','loadBalancers':[{'containerPort':3000,'targetGroupArn':'tg'}],'networkConfiguration':{}}]}
+  if op=='describe-services':return {'services':[{'deploymentConfiguration':{'maximumPercent':100,'minimumHealthyPercent':0,'deploymentCircuitBreaker':{'enable':True,'rollback':True}},'runningCount':0 if self.oldStopped and not self.replaced else 1,'pendingCount':0,'desiredCount':0 if self.oldStopped and not self.replaced else 1,'taskDefinition':'candidate:1' if self.replaced or self.staged else 'previous:1','loadBalancers':[{'containerPort':3000,'targetGroupArn':'tg'}],'networkConfiguration':{},'deployments':[dict(taskDefinition='candidate:1',desiredCount=0,pendingCount=0,runningCount=0)] if self.staged else []}]}
   if op=='describe-task-definition':
    candidate=args[3]=='candidate:1';return {'taskDefinition':{'taskDefinitionArn':args[3],'family':'rrelayer','containerDefinitions':[{'name':'relayer','image':'image@'+DIGEST if candidate else 'image:old','environment':[{'name':'RRELAYER_RELEASE_ID','value':SHA if candidate else 'old'}] if candidate or not self.legacy else []}]}}
   if op=='describe-target-groups':return {'TargetGroups':[{'TargetType':'ip'}]}
   if op=='run-task':return {'tasks':[{'taskArn':'warm-task'}]}
   if op=='update-service':
    if '--desired-count' in args and args[args.index('--desired-count')+1]=='0':self.oldStopped=True
-   if '--task-definition' in args:self.replaced=True;self.oldStopped=True
+   if '--task-definition' in args:
+    self.staged='--desired-count' in args and args[args.index('--desired-count')+1]=='0'
+    self.replaced=not self.staged;self.oldStopped=True
+   if self.staged and '--desired-count' in args and args[args.index('--desired-count')+1]=='1':
+    self.replaced=True;self.staged=False
   if op=='stop-task':self.warmStopped=True
   if op=='describe-target-health':return {'TargetHealthDescriptions':[{'TargetHealth':{'State':'unused'}}]}
   return {}
