@@ -230,7 +230,7 @@ class Controller:
         if source!=a.source or not image.endswith('@'+a.digest):raise ValueError('Candidate definition must pin the accepted digest and release ID')
         compatible_definition(current,candidate,a.container)
         groups=service.get('loadBalancers',[])
-        if len(groups)!=1 or groups[0]['containerPort']!=3000:raise ValueError('Expected one IP target group on port 3000')
+        if len(groups)!=1 or groups[0].get('containerPort')!=3000 or groups[0].get('containerName')!=a.container:raise ValueError('Expected one IP target group on port 3000')
         group=groups[0]['targetGroupArn']
         if self.state.get('target_group', group) != group:
             raise ValueError('Service target group changed since the original handoff')
@@ -478,7 +478,8 @@ class Controller:
             return False
         if (service['taskDefinition'] != a.task_definition
                 or [service.get(k) for k in ('desiredCount','runningCount','pendingCount')] != [1,1,0]
-                or [lb.get('targetGroupArn') for lb in service.get('loadBalancers', [])] != [group]):
+                or [(lb.get('targetGroupArn'), lb.get('containerName'), lb.get('containerPort'))
+                    for lb in service.get('loadBalancers', [])] != [(group, a.container, 3000)]):
             return False
         tasks=self.tasks(a.service)
         if (len(tasks) != 1 or tasks[0]['taskDefinitionArn'] != a.task_definition
