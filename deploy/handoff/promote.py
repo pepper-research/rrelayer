@@ -629,17 +629,19 @@ class Controller:
     def registration_window(self, group, close):
         registration_window(self, group, close)
 
-    def completed_service_task(self, group):
-        arn = self.serving_task(group, sole_target=True, registration_ready=True)
+    def completed_service_task(self, group, *, registration_ready=True):
+        arn = self.serving_task(group, sole_target=True, registration_ready=registration_ready)
         if not arn:
             return False
         previous = set(self.state['previous_tasks'])
         warm = {self.state['warm_task']}
         retired = set(self.state.get('retired_tasks', []))
+        retired.update(self.state.get('stopped_legacy_tasks', []))
         recovery = self.state.get('recovery')
         if recovery:
             warm.add(recovery['warm_task'])
             previous.update(recovery.get('previous_tasks', []))
+            retired.update(recovery.get('stopped_legacy_tasks', []))
             if recovery.get('warm_retired'):
                 retired.add(recovery['warm_task'])
         families = {td.rsplit('/', 1)[-1].split(':')[0] for td in
@@ -652,7 +654,7 @@ class Controller:
             return False
         # Historical completed journals can predate retirement receipts. An
         # absent task-list entry alone does not establish its terminal status.
-        for task in sorted(warm):
+        for task in sorted((previous | warm) - {arn}):
             try:
                 if self.task(task)['lastStatus'] != 'STOPPED':
                     return False
@@ -681,10 +683,10 @@ class Controller:
 
     def verify_registration_reopened(self, hostname, port):
         group = self.state['target_group']
-        arn = self.serving_task(group, sole_target=True, registration_ready=True)
+        arn = self.completed_service_task(group)
         if not arn or not self.probe_registration(arn, hostname, port, paused=False):
             return False
-        return self.serving_task(group, sole_target=True, registration_ready=True) == arn
+        return self.completed_service_task(group) == arn
 
     def probe_registration(self, task, hostname, port, paused):
         # Malformed, unauthenticated POSTs cannot allocate a key or sender.
@@ -755,7 +757,7 @@ printf ']'
         self.wait(lambda: self.service_ready(group),'replacement service health after retirement',900)
         if self.state.get('registration_window_owner'):
             def reopen_service():
-                arn = self.serving_task(group, sole_target=True)
+                arn = self.completed_service_task(group, registration_ready=False)
                 if not arn:
                     return False
                 self.api(arn, '/handoff/resume-registration', {})

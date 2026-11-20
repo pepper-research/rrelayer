@@ -154,6 +154,12 @@ class PromotionTests(unittest.TestCase):
   def window(group,close):
    original_window(group,close)
    if close:replacement[0]='rotated-2'
+  original_task=c.task
+  def task(arn):
+   if arn.startswith('rotated'):
+    return dict(original_task('old-task'),taskArn=arn,lastStatus='STOPPED' if c.replaced or arn!=replacement[0] else 'RUNNING')
+   return original_task(arn)
+  c.task=task
   c.api,c.tasks,c.registration_window=api,tasks,window
   c.run()
   self.args.resume=self.args.execute=True
@@ -163,10 +169,10 @@ class PromotionTests(unittest.TestCase):
  def test_public_reopening_requires_same_service_task_after_probe(self):
   c=Fake(self.args)
   c.state['target_group']='tg'
-  with patch.object(c,'serving_task',side_effect=['service-new','rotated-service']) as inventory, patch.object(c,'probe_registration',return_value=True):
+  with patch.object(c,'completed_service_task',side_effect=['service-new','rotated-service']) as inventory, patch.object(c,'probe_registration',return_value=True):
    self.assertFalse(c.verify_registration_reopened('lb.test',80))
-   self.assertTrue(all(call.kwargs=={'sole_target':True,'registration_ready':True} for call in inventory.call_args_list))
-  with patch.object(c,'serving_task',return_value=False), patch.object(c,'probe_registration') as probe:
+   self.assertEqual(inventory.call_count,2)
+  with patch.object(c,'completed_service_task',return_value=False), patch.object(c,'probe_registration') as probe:
    self.assertFalse(c.verify_registration_reopened('lb.test',80))
    probe.assert_not_called()
  def test_extra_healthy_target_blocks_completion_and_completed_resume_without_pause(self):
@@ -197,6 +203,17 @@ class PromotionTests(unittest.TestCase):
   c.warmStopped=True
   self.assertEqual(c.run()['stage'],'complete')
   self.assertIn('warm-task',c.state['retired_tasks'])
+ def test_completed_resume_checks_each_previous_sender_even_with_incomplete_list(self):
+  c=Fake(self.args);self.assertEqual(c.run()['stage'],'complete')
+  c.save(previous_tasks=['old-task','rotated-out'])
+  original=c.task
+  for state in ('RUNNING','DEACTIVATING','STOPPED'):
+   c.task=lambda arn:dict(original(arn),lastStatus=state) if arn=='rotated-out' else original(arn)
+   if state=='STOPPED':
+    self.assertEqual(c.run()['stage'],'complete')
+    self.assertIn('rotated-out',c.state['retired_tasks'])
+   else:
+    with self.assertRaisesRegex(RuntimeError,'sole accepted service'):c.run()
  def test_incompatible_rollback_preserves_incumbent(self):
   c=Fake(self.args);original=c.api
   def observe(task,path,body=None):
