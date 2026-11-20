@@ -458,6 +458,11 @@ class Controller:
 
     def service_ready(self, group):
         a = self.a
+        service = self.aws('ecs','describe-services','--cluster',a.cluster,'--services',a.service)['services'][0]
+        if (service['taskDefinition'] != a.task_definition
+                or [service.get(k) for k in ('desiredCount','runningCount','pendingCount')] != [1,1,0]
+                or [lb.get('targetGroupArn') for lb in service.get('loadBalancers', [])] != [group]):
+            return False
         tasks=self.tasks(a.service)
         if len(tasks)!=1 or tasks[0]['taskDefinitionArn']!=a.task_definition:return False
         status=self.ready(tasks[0]['taskArn'],a.source,a.digest)
