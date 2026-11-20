@@ -182,7 +182,7 @@ class Controller:
                 task = extras[0]
                 if (task.get('group') == 'handoff-' + self.state['id']
                         and task['taskDefinitionArn'] == a.task_definition
-                        and task.get('startedBy', self.state['id']) == self.state['id']):
+                        and task.get('startedBy') == self.state['id']):
                     launched = task['taskArn']
             if not launched:
                 raise ValueError('Unaccounted relayer tasks; reconcile before deployment')

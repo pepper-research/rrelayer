@@ -110,6 +110,11 @@ class PromotionTests(unittest.TestCase):
   extra['group']='unrelated'
   with self.assertRaisesRegex(ValueError,'Unaccounted'): resumed.run()
   extra['group']='handoff-'+resumed.state['id']
+  del extra['startedBy']
+  with self.assertRaisesRegex(ValueError,'Unaccounted'): resumed.run()
+  extra['startedBy']='another deployment'
+  with self.assertRaisesRegex(ValueError,'Unaccounted'): resumed.run()
+  extra['startedBy']=resumed.state['id']
   self.assertEqual(resumed.run()['stage'],'complete')
   self.assertEqual(resumed.state['warm_task'],'warm-task')
   self.assertFalse(any('run-task' in call for call in resumed.calls))
