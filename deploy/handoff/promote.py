@@ -394,7 +394,15 @@ class Controller:
             if self.state['stage'] in ('legacy-stopped','activating'):
                 confirmed.update(self.state['previous_tasks'])
             observed = set(self.state['previous_tasks'])
-            observed.update(t['taskArn'] for t in self.tasks(a.service))
+            listed = {t['taskArn'] for t in self.tasks(a.service)}
+            observed.update(listed)
+            self.save(previous_tasks=sorted(observed))
+            if self.state['stage'] not in ('stopping-legacy','legacy-stopped','activating'):
+                for task in sorted(observed - listed - confirmed):
+                    if self.task(task)['lastStatus'] != 'STOPPED':
+                        raise RuntimeError('Cannot verify legacy tasks stopped before scale-down')
+                    confirmed.add(task)
+                    self.save(stopped_legacy_tasks=sorted(confirmed))
             self.save(stage='stopping-legacy', previous_tasks=sorted(observed), stopped_legacy_tasks=sorted(confirmed))
             self.aws('ecs','update-service','--cluster',a.cluster,'--service',a.service,'--desired-count','0')
             def legacy_stopped():
