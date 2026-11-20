@@ -78,9 +78,10 @@ class Controller:
         if result.returncode:raise RuntimeError('AWS operation failed: '+' '.join(args[:2]))
         return json.loads(result.stdout or '{}')
     def tasks(self,service=None):
-        args=['ecs','list-tasks','--cluster',self.a.cluster,'--desired-status','RUNNING']
+        args=['ecs','list-tasks','--cluster',self.a.cluster]
         if service:args+=['--service-name',service]
-        ids=self.aws(*args)['taskArns']
+        ids = sorted({arn for desired in ('RUNNING','STOPPED')
+                      for arn in self.aws(*args,'--desired-status',desired)['taskArns']})
         tasks = []
         for start in range(0, len(ids), 100):
             batch = ids[start:start+100]
@@ -88,7 +89,7 @@ class Controller:
             rows = response['tasks']
             if response.get('failures') or sorted(t['taskArn'] for t in rows) != sorted(batch):
                 raise RuntimeError('Incomplete ECS task inventory')
-            tasks.extend(rows)
+            tasks.extend(row for row in rows if row['lastStatus'] != 'STOPPED')
         return tasks
     def task(self,arn):
         tasks = self.aws('ecs','describe-tasks','--cluster',self.a.cluster,'--tasks',arn)['tasks']
