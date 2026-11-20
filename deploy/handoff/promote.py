@@ -169,6 +169,12 @@ class Controller:
             if original['id'] == self.state['id'] or not original.get('warm_task'):
                 raise ValueError('Expected an independent recovery journal with a warm task')
             reference = {k:original[k] for k in ('id','source','digest','warm_task','legacy','stage','target_group','previous_tasks','previous_definition')}
+            confirmed = set(original.get('stopped_legacy_tasks', []))
+            if original['legacy'] and original['stage'] in ('legacy-stopped','activating','activated','replacing-service'):
+                confirmed.update(original['previous_tasks'])
+            if not confirmed.issubset(original['previous_tasks']):
+                raise ValueError('Shutdown confirmation does not belong to original task inventory')
+            reference['stopped_legacy_tasks'] = sorted(confirmed)
             if recovery:
                 required = {'id','source','digest','warm_task','legacy','stage','target_group'}
                 if not required.issubset(recovery) or any(reference.get(k) != v for k,v in recovery.items()):
@@ -266,9 +272,11 @@ class Controller:
                     or (recovery['stage'] == 'activating' and self.task(recovery['warm_task'])['lastStatus'] != 'STOPPED')
                     or any(t['lastStatus'] != 'STOPPED' for t in self.tasks(a.service))
                     or (recovery['stage'] == 'stopping-legacy' and
-                        any(self.task(t)['lastStatus'] != 'STOPPED' for t in recovery['previous_tasks']))):
+                        any(self.task(t)['lastStatus'] != 'STOPPED' for t in recovery['previous_tasks']
+                            if t not in recovery.get('stopped_legacy_tasks', [])))):
                 raise ValueError('Cannot verify drained legacy shutdown for recovery bootstrap')
-            self.save(legacy=True, previous_release=None, previous_tasks=recovery['previous_tasks'])
+            self.save(legacy=True, previous_release=None, previous_tasks=recovery['previous_tasks'],
+                      stopped_legacy_tasks=recovery.get('stopped_legacy_tasks', []))
         expected_owners = {self.state['previous_release']}
         if self.state['stage'] in ('activating','activated'):
             expected_owners.add(a.source)
