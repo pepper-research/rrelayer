@@ -50,6 +50,12 @@ class PromotionTests(unittest.TestCase):
   self.temp=tempfile.TemporaryDirectory();self.path=Path(self.temp.name);(self.path/'acceptance.json').write_text(json.dumps(receipt()))
   self.args=SimpleNamespace(cluster='cluster',service='service',container='relayer',region='region',journal=str(self.path/'journal.json'),resume=False,source=SHA,digest=DIGEST,acceptance=str(self.path/'acceptance.json'),task_definition='candidate:1',bootstrap=False,recover_journal=None,execute=True)
  def tearDown(self):self.temp.cleanup()
+ def test_downstream_image_must_have_an_immutable_digest(self):
+  for value in (None, '', 'latest', 'sha256:abc', 123):
+   with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'Downstream'):
+    validate_acceptance(dict(receipt(), downstream_image_digest=value), SHA, DIGEST)
+  validate_acceptance(receipt(), SHA, DIGEST)
+
  def test_missing_evidence_refuses_before_aws(self):
   r=receipt();del r['checks']['stale_owner'];(self.path/'acceptance.json').write_text(json.dumps(r));c=Fake(self.args)
   with self.assertRaises(ValueError):c.run()

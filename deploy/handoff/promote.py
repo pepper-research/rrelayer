@@ -33,7 +33,8 @@ def validate_acceptance(receipt, source, digest, *, dev_validation=False):
     required=LOCAL_REQUIRED if dev_validation else REQUIRED
     if not required <= passed:
         raise ValueError('Missing exact-image acceptance: '+', '.join(sorted(required-passed)))
-    if receipt.get('downstream_image_digest') is None:
+    downstream = receipt.get('downstream_image_digest')
+    if not isinstance(downstream, str) or not re.fullmatch(r'sha256:[0-9a-f]{64}', downstream):
         raise ValueError('Downstream API compatibility image must be recorded')
 
 
