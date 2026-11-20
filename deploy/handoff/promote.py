@@ -210,13 +210,25 @@ class Controller:
             legacy=not old_api or old_api.get('protocol')!=1
             if legacy and not a.bootstrap and not recovery:raise ValueError('Legacy binary requires explicit bootstrap')
             if recovery:
-                old_api = self.ready(recovery['warm_task'], recovery['source'], recovery['digest'])
-                if not old_api or not old_api['processing'] or old_api['activeRelease'] != recovery['source']:
-                    raise ValueError('Interrupted warm sender is not the verified active release')
-                if service['desiredCount'] == 0 and (service.get('runningCount') != 0 or service.get('pendingCount') != 0):
+                counts = [service.get(k) for k in ('desiredCount','runningCount','pendingCount')]
+                if counts[0] == 0 and counts != [0,0,0]:
                     raise ValueError('Legacy service has not stopped')
+                stopped_bootstrap = (counts == [0,0,0] and interrupted_bootstrap
+                                     and recovery['stage'] in ('activated','replacing-service')
+                                     and self.task(recovery['warm_task'])['lastStatus'] == 'STOPPED'
+                                     and all(t['lastStatus'] == 'STOPPED' for t in running))
+                if stopped_bootstrap:
+                    # Only the recovery standby can now read the durable release fence.
+                    # Its observation is checked before target registration or activation.
+                    active = recovery['source']
+                else:
+                    old_api = self.ready(recovery['warm_task'], recovery['source'], recovery['digest'])
+                    if not old_api or not old_api['processing'] or old_api['activeRelease'] != recovery['source']:
+                        raise ValueError('Interrupted warm sender is not the verified active release')
+                    active = old_api['activeRelease']
                 legacy=False
-            active=old_api and old_api.get('activeRelease')
+            else:
+                active=old_api and old_api.get('activeRelease')
             self.save(previous_definition=service['taskDefinition'],previous_tasks=[t['taskArn'] for t in running],previous_release=active,legacy=legacy,target_group=group,recovery=recovery)
         if self.state['stage']=='complete':return {'stage':'complete','source':a.source,'digest':a.digest}
         if not a.execute:

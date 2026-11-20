@@ -134,6 +134,23 @@ class PromotionTests(unittest.TestCase):
   self.assertFalse(recovery.run()['legacy'])
   self.assertEqual(recovery.state['previous_release'],SHA)
   self.assertEqual(recovery.state['recovery']['id'],original.state['id'])
+ def test_stopped_bootstrap_recovery_checks_durable_owner_before_activation(self):
+  self.args.bootstrap=True
+  original=Fake(self.args,True)
+  original.fail='active warm target health'
+  with self.assertRaises(RuntimeError): original.run()
+  original.warmStopped=True
+  args=copy.copy(self.args)
+  args.journal=str(self.path/'recovery.json')
+  args.recover_journal=self.args.journal
+  recovery=Fake(args)
+  recovery.aws=original.aws
+  recovery.tasks=lambda service=None: []
+  recovery.task=original.task
+  recovery.active='unexpected'
+  with self.assertRaisesRegex(ValueError,'Active release changed'): recovery.run()
+  self.assertEqual(recovery.state['previous_release'],SHA)
+  self.assertNotIn(('api','warm-task','/handoff/activate'),recovery.calls)
  def test_failed_prewarm_keeps_old(self):
   c=Fake(self.args);c.fail='candidate readiness'
   with self.assertRaises(RuntimeError):c.run()
