@@ -29,7 +29,7 @@ class Fake(Controller):
  def healthy(self,*args):return True
  def aws(self,*args):
   self.calls.append(args);op=args[1]
-  if op=='describe-services':return {'services':[{'deploymentConfiguration':{'maximumPercent':100,'minimumHealthyPercent':0,'deploymentCircuitBreaker':{'enable':True,'rollback':True}},'desiredCount':0 if self.oldStopped and not self.replaced else 1,'taskDefinition':'candidate:1' if self.replaced else 'previous:1','loadBalancers':[{'containerPort':3000,'targetGroupArn':'tg'}],'networkConfiguration':{}}]}
+  if op=='describe-services':return {'services':[{'deploymentConfiguration':{'maximumPercent':100,'minimumHealthyPercent':0,'deploymentCircuitBreaker':{'enable':True,'rollback':True}},'runningCount':0 if self.oldStopped and not self.replaced else 1,'pendingCount':0,'desiredCount':0 if self.oldStopped and not self.replaced else 1,'taskDefinition':'candidate:1' if self.replaced else 'previous:1','loadBalancers':[{'containerPort':3000,'targetGroupArn':'tg'}],'networkConfiguration':{}}]}
   if op=='describe-task-definition':
    candidate=args[3]=='candidate:1';return {'taskDefinition':{'taskDefinitionArn':args[3],'family':'rrelayer','containerDefinitions':[{'name':'relayer','image':'image@'+DIGEST if candidate else 'image:old','environment':[{'name':'RRELAYER_RELEASE_ID','value':SHA if candidate else 'old'}] if candidate or not self.legacy else []}]}}
   if op=='describe-target-groups':return {'TargetGroups':[{'TargetType':'ip'}]}
@@ -132,6 +132,18 @@ class PromotionTests(unittest.TestCase):
  def test_bootstrap_drains_before_activate(self):
   self.args.bootstrap=True;c=Fake(self.args,True);c.run();self.assertTrue(c.oldStopped)
   self.assertLess(c.calls.index(('wait','legacy tasks stopped')),c.calls.index(('api','warm-task','/handoff/activate')))
+ def test_rotated_legacy_sender_must_stop_before_activation(self):
+  self.args.bootstrap=True
+  self.args.execute=False
+  c=Fake(self.args,True)
+  c.run()
+  self.args.execute=True
+  original=c.tasks
+  rotated=dict(c.task('old-task'),taskArn='rotated')
+  c.tasks=lambda service=None: ([rotated] if service else original(service)+[rotated])
+  with self.assertRaisesRegex(RuntimeError,'legacy tasks stopped'): c.run()
+  self.assertIn('rotated',c.state['previous_tasks'])
+  self.assertIsNone(c.active)
  def test_pending_legacy_cannot_activate(self):
   self.args.bootstrap=True;c=Fake(self.args,True);c.unresolved=1
   with self.assertRaises(ValueError):c.run()

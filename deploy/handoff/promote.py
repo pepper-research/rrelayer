@@ -217,9 +217,22 @@ class Controller:
             # the candidate observes no unresolved legacy rows before AND after stop.
             if not receipt.get('legacy_ingress_quiesced_evidence') or status['unresolvedTransactions']!=0:
                 raise ValueError('Legacy ingress must be quiesced and accepted work fully drained')
-            self.save(stage='stopping-legacy')
+            observed = set(self.state['previous_tasks'])
+            observed.update(t['taskArn'] for t in self.tasks(a.service))
+            self.save(stage='stopping-legacy', previous_tasks=sorted(observed))
             self.aws('ecs','update-service','--cluster',a.cluster,'--service',a.service,'--desired-count','0')
-            self.wait(lambda:all(self.task(t)['lastStatus']=='STOPPED' for t in self.state['previous_tasks']),'legacy tasks stopped')
+            def legacy_stopped():
+                service = self.aws('ecs','describe-services','--cluster',a.cluster,'--services',a.service)['services'][0]
+                current = {task['taskArn'] for task in self.tasks(a.service)}
+                if current - observed:
+                    observed.update(current)
+                    self.save(previous_tasks=sorted(observed))
+                return (all(service.get(k) == 0 for k in ('desiredCount','runningCount','pendingCount'))
+                        and all(self.task(task)['lastStatus'] == 'STOPPED' for task in observed))
+            self.wait(legacy_stopped,'legacy tasks stopped')
+            status = self.ready(warm, a.source, a.digest)
+            if not status or status['unresolvedTransactions'] != 0:
+                raise ValueError('Legacy work remains after service shutdown')
             self.save(stage='legacy-stopped')
         if status['durableIntakeReady']:
             self.aws('elbv2','register-targets','--target-group-arn',group,'--targets',json.dumps([target]))
