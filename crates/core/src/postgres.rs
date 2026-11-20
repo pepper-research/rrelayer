@@ -54,6 +54,8 @@ pub enum PostgresError {
 
     #[error("Fixed Base relayer has an unresolved original transaction")]
     FixedBaseLaneBusy,
+    #[error("Relayer is deleted or missing")]
+    RelayerDeleted,
 }
 
 // A failed advisory unlock must destroy the session, never return it to the pool.

@@ -7,6 +7,18 @@ use crate::{
 };
 
 impl PostgresClient {
+    pub(crate) async fn missing_queue_relayers(
+        &self,
+        chains: &[ChainId],
+        known: &[RelayerId],
+    ) -> Result<Vec<Relayer>, PostgresError> {
+        let rows = self.query(
+            "SELECT * FROM relayer.record WHERE NOT deleted AND chain_id=ANY($1) AND NOT (id=ANY($2)) ORDER BY id",
+            &[&chains, &known],
+        ).await?;
+        Ok(rows.iter().map(build_relayer).collect())
+    }
+
     pub async fn get_relayers(
         &self,
         paging_context: &PagingContext,

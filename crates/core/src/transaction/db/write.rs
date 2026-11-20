@@ -62,6 +62,18 @@ impl PostgresClient {
         let mut conn = self.pool.get().await?;
         let trans = conn.transaction().await.map_err(PostgresError::PgError)?;
 
+        // A successful deletion and an admission must never both commit.
+        if trans
+            .query_opt(
+                "SELECT id FROM relayer.record WHERE id=$1 AND NOT deleted FOR SHARE",
+                &[relayer_id],
+            )
+            .await?
+            .is_none()
+        {
+            return Err(PostgresError::RelayerDeleted);
+        }
+
         if signed_envelope.is_some() {
             // Serialize admissions across overlapping ECS tasks using the durable
             // relayer identity. The lock is released with this DB transaction.
@@ -761,7 +773,9 @@ mod fixed_base_admission_postgres_tests {
             relayer_id,
             authorization_list: None,
             to: EvmAddress::zero(),
-            from: EvmAddress::zero(),
+            from: EvmAddress::new(alloy::primitives::Address::from_slice(
+                &alloy::primitives::keccak256(relayer_id.to_string())[12..],
+            )),
             value: TransactionValue::zero(),
             data: TransactionData::empty(),
             nonce: TransactionNonce::new(nonce),
@@ -816,6 +830,49 @@ mod fixed_base_admission_postgres_tests {
         let mut first = PostgresClient::for_test_url(&url).await?;
         let mut second = PostgresClient::for_test_url(&url).await?;
         apply_schema(&first).await?;
+
+        let raced_id = RelayerId::new();
+        record_relayer(&first, raced_id).await?;
+        let entry = pending(raced_id, 0);
+        let (admitted, deleted) = tokio::join!(
+            first.save_transaction(&raced_id, &entry),
+            second.delete_relayer(&raced_id),
+        );
+        if deleted? {
+            assert!(matches!(admitted, Err(PostgresError::RelayerDeleted)));
+        } else {
+            admitted?;
+        }
+        let pending_id = RelayerId::new();
+        record_relayer(&first, pending_id).await?;
+        first.save_transaction(&pending_id, &pending(pending_id, 0)).await?;
+        for status in ["PENDING", "INMEMPOOL", "MINED"] {
+            first.execute("UPDATE relayer.transaction SET status=$2::text::relayer.tx_status WHERE relayer_id=$1", &[&pending_id, &status]).await?;
+            assert!(!second.delete_relayer(&pending_id).await?);
+        }
+        first
+            .execute(
+                "UPDATE relayer.transaction SET status='CONFIRMED' WHERE relayer_id=$1",
+                &[&pending_id],
+            )
+            .await?;
+        assert!(second.delete_relayer(&pending_id).await?);
+        assert!(matches!(
+            first.save_transaction(&pending_id, &pending(pending_id, 1)).await,
+            Err(PostgresError::RelayerDeleted)
+        ));
+
+        let legacy_id = RelayerId::new();
+        record_relayer(&first, legacy_id).await?;
+        let failed = pending(legacy_id, 0);
+        let later = pending(legacy_id, 1);
+        first.save_transaction(&legacy_id, &failed).await?;
+        first.save_transaction(&legacy_id, &later).await?;
+        first.execute("UPDATE relayer.transaction SET status='FAILED', broadcast_attempted=TRUE WHERE id=$1", &[&failed.id]).await?;
+        first.execute("UPDATE relayer.transaction SET status='CONFIRMED', hash=$2, block_hash=$2, block_number=2, mined_at=NOW() WHERE id=$1", &[&later.id, &vec![0x11u8; 32]]).await?;
+        assert!(!second.delete_relayer(&legacy_id).await?);
+        first.execute("UPDATE relayer.transaction SET hash=$2, block_hash=$2, block_number=1, mined_at=NOW() WHERE id=$1", &[&failed.id, &vec![0x22u8; 32]]).await?;
+        assert!(second.delete_relayer(&legacy_id).await?);
 
         let fixed_id = RelayerId::new();
         record_relayer(&first, fixed_id).await?;

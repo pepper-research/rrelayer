@@ -7,6 +7,19 @@ use crate::{
 };
 
 impl PostgresClient {
+    pub async fn count_transactions_by_status(
+        &self,
+        relayer_id: &crate::relayer::RelayerId,
+        status: crate::transaction::types::TransactionStatus,
+    ) -> Result<usize, PostgresError> {
+        self.query_one(
+            "SELECT COUNT(*) FROM relayer.transaction WHERE relayer_id=$1 AND status=$2",
+            &[relayer_id, &status],
+        )
+        .await
+        .map(|row| row.get::<_, i64>(0) as usize)
+    }
+
     pub async fn get_prebroadcast_failure(
         &self,
         id: &TransactionId,

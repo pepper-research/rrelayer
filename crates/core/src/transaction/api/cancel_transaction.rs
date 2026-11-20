@@ -82,7 +82,13 @@ async fn cancel_transaction_inner(
     )
     .await?;
 
-    let mut queues = state.transactions_queues.lock().await;
+    let (_processing, _slot, mut queues) =
+        crate::transaction::queue_system::TransactionsQueues::sender_operation(
+            &state.transactions_queues,
+            &transaction.relayer_id,
+        )
+        .await
+        .ok_or_else(|| not_found("Relayer queue does not exist".to_string()))?;
     let cancel_result = if let Some(expected_nonce) = legacy_nonce {
         queues.cancel_legacy_nonce(&transaction, expected_nonce).await?
     } else {

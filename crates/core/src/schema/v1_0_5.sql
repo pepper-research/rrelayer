@@ -7,6 +7,8 @@ CREATE TABLE IF NOT EXISTS relayer.sender_deployment (
     enabled BOOLEAN NOT NULL DEFAULT FALSE,
     active_release TEXT
 );
+-- An older release cannot attest to discovering newly registered queues.
+ALTER TABLE relayer.sender_deployment ADD COLUMN IF NOT EXISTS registration_release TEXT;
 INSERT INTO relayer.sender_deployment(singleton) VALUES (TRUE) ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS relayer.sender_owner (
     chain_id BIGINT NOT NULL,

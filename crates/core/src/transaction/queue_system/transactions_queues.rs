@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use alloy::{
     consensus::TypedTransaction,
@@ -9,7 +6,7 @@ use alloy::{
 };
 use chrono::{DateTime, Utc};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tracing::{error, info, warn};
 
 /// Error types for transaction queues operations.
@@ -54,12 +51,19 @@ use crate::{
     webhooks::WebhookManager,
 };
 
-/// Container for managing multiple transaction queues across different relayers.
-///
-/// This struct coordinates transaction processing for all active relayers,
-/// providing centralized access to individual queue operations and shared resources.
+/// Local serialization and durable-enqueue wakeups for one relayer.
+#[derive(Default)]
+pub(super) struct QueueCoordination {
+    pub processing: Arc<Mutex<()>>,
+    pub pending: Arc<Notify>,
+}
+
+/// Registry and shared resources for the active sender queues.
 pub struct TransactionsQueues {
     pub queues: HashMap<RelayerId, Arc<Mutex<TransactionsQueue>>>,
+    draining: HashMap<RelayerId, tokio::sync::watch::Receiver<()>>,
+    pub(super) processing_slots: Arc<Semaphore>,
+    pub(super) coordination: HashMap<RelayerId, Arc<QueueCoordination>>,
     pub relayer_block_times_ms: HashMap<RelayerId, u64>,
     gas_oracle_cache: Arc<Mutex<GasOracleCache>>,
     blob_gas_oracle_cache: Arc<Mutex<BlobGasOracleCache>>,
@@ -70,6 +74,41 @@ pub struct TransactionsQueues {
 }
 
 impl TransactionsQueues {
+    // Processing keeps the existing per-queue mutex and database sender fence,
+    // but must not hold the registry lock across another chain's RPC work.
+    // Each operation gets its own fence token; sharing that mutable token would
+    // let concurrent signers overwrite one another's database authorization.
+    pub(super) fn for_processing(&self, relayer_id: &RelayerId) -> Self {
+        Self {
+            draining: HashMap::new(),
+            processing_slots: self.processing_slots.clone(),
+            coordination: self
+                .coordination
+                .get(relayer_id)
+                .map(|coordination| (*relayer_id, coordination.clone()))
+                .into_iter()
+                .collect(),
+            queues: self
+                .queues
+                .get(relayer_id)
+                .map(|queue| (*relayer_id, queue.clone()))
+                .into_iter()
+                .collect(),
+            relayer_block_times_ms: self
+                .relayer_block_times_ms
+                .get(relayer_id)
+                .map(|ms| (*relayer_id, *ms))
+                .into_iter()
+                .collect(),
+            gas_oracle_cache: self.gas_oracle_cache.clone(),
+            blob_gas_oracle_cache: self.blob_gas_oracle_cache.clone(),
+            db: PostgresClient { pool: self.db.pool.inner.clone().into() },
+            cache: self.cache.clone(),
+            webhook_manager: self.webhook_manager.clone(),
+            safe_proxy_manager: self.safe_proxy_manager.clone(),
+        }
+    }
+
     pub async fn new(
         setups: Vec<TransactionRelayerSetup>,
         gas_oracle_cache: Arc<Mutex<GasOracleCache>>,
@@ -141,7 +180,13 @@ impl TransactionsQueues {
         }
 
         Ok(Self {
+            coordination: queues
+                .keys()
+                .map(|id| (*id, Arc::new(QueueCoordination::default())))
+                .collect(),
             queues,
+            draining: HashMap::new(),
+            processing_slots: Arc::new(Semaphore::new(4)),
             relayer_block_times_ms,
             gas_oracle_cache,
             blob_gas_oracle_cache,
@@ -172,8 +217,36 @@ impl TransactionsQueues {
     }
 
     /// Removes a transaction queue for the specified relayer.
-    pub async fn delete_queue(&mut self, relayer_id: &RelayerId) {
-        self.queues.remove(relayer_id);
+    pub async fn delete_queue(registry: &Arc<Mutex<Self>>, relayer_id: &RelayerId) {
+        let mut drained = {
+            let mut queues = registry.lock().await;
+            if let Some(drained) = queues.draining.get(relayer_id) {
+                drained.clone()
+            } else if let Some(queue) = queues.queues.remove(relayer_id) {
+                let coordination = queues.coordination.remove(relayer_id);
+                queues.relayer_block_times_ms.remove(relayer_id);
+                let (finished, drained) = tokio::sync::watch::channel(());
+                queues.draining.insert(*relayer_id, drained.clone());
+                let registry = registry.clone();
+                let id = *relayer_id;
+                // Finish draining even if the DELETE client disconnects.
+                tokio::spawn(async move {
+                    {
+                        let _worker = match &coordination {
+                            Some(coordination) => Some(coordination.processing.lock().await),
+                            None => None,
+                        };
+                        let _inflight = queue.lock().await;
+                    }
+                    registry.lock().await.draining.remove(&id);
+                    drop(finished);
+                });
+                drained
+            } else {
+                return;
+            }
+        };
+        let _ = drained.changed().await;
     }
 
     /// Invalidates the cache entry for a specific transaction.
@@ -186,53 +259,35 @@ impl TransactionsQueues {
         &self,
         relayer_id: &RelayerId,
     ) -> Result<usize, crate::postgres::PostgresError> {
-        self.db
-            .query_one(
-                "SELECT COUNT(*) FROM relayer.transaction WHERE relayer_id=$1 AND status='PENDING'",
-                &[relayer_id],
-            )
-            .await
-            .map(|r| r.get::<_, i64>(0) as usize)
+        self.db.count_transactions_by_status(relayer_id, TransactionStatus::PENDING).await
     }
 
     pub async fn inmempool_transactions_count(
         &self,
         relayer_id: &RelayerId,
     ) -> Result<usize, crate::postgres::PostgresError> {
-        self.db.query_one("SELECT COUNT(*) FROM relayer.transaction WHERE relayer_id=$1 AND status='INMEMPOOL'", &[relayer_id]).await.map(|r|r.get::<_,i64>(0) as usize)
+        self.db.count_transactions_by_status(relayer_id, TransactionStatus::INMEMPOOL).await
     }
 
     /// Adds a new relayer and its transaction queue to the system.
-    pub async fn add_new_relayer(
-        &mut self,
-        setup: TransactionsQueueSetup,
-        queues_arc: Arc<Mutex<TransactionsQueues>>,
-    ) -> Result<(), WalletOrProviderError> {
-        let current_nonce = setup.evm_provider.get_nonce(&setup.relayer).await?;
+    pub async fn add_new_relayer(queues: Arc<Mutex<Self>>, setup: TransactionsQueueSetup) {
         let relayer_id = setup.relayer.id;
-
-        self.queues.insert(
-            relayer_id,
-            Arc::new(Mutex::new(TransactionsQueue::new(
-                TransactionsQueueSetup::new(
-                    setup.relayer,
-                    setup.evm_provider,
-                    NonceManager::new(current_nonce),
-                    VecDeque::new(),
-                    VecDeque::new(),
-                    HashMap::new(),
-                    self.safe_proxy_manager.clone(),
-                    setup.gas_bump_config,
-                    setup.max_gas_price_multiplier,
-                ),
-                self.gas_oracle_cache.clone(),
-                self.blob_gas_oracle_cache.clone(),
-            ))),
-        );
-
-        spawn_processing_tasks_for_relayer(queues_arc, &relayer_id).await;
-
-        Ok(())
+        {
+            let mut queues = queues.lock().await;
+            if queues.queues.contains_key(&relayer_id) || queues.draining.contains_key(&relayer_id)
+            {
+                return;
+            }
+            queues.relayer_block_times_ms.insert(relayer_id, setup.evm_provider.blocks_every);
+            let queue = TransactionsQueue::new(
+                setup,
+                queues.gas_oracle_cache.clone(),
+                queues.blob_gas_oracle_cache.clone(),
+            );
+            queues.coordination.insert(relayer_id, Arc::new(QueueCoordination::default()));
+            queues.queues.insert(relayer_id, Arc::new(Mutex::new(queue)));
+        }
+        spawn_processing_tasks_for_relayer(queues, &relayer_id).await;
     }
 
     fn expires_at(&self) -> DateTime<Utc> {
@@ -320,29 +375,27 @@ impl TransactionsQueues {
         const TEMP_GAS_LIMIT: u128 = 10_000_000;
         let temp_gas_limit = GasLimit::new(TEMP_GAS_LIMIT);
 
-        let current_onchain_nonce = transactions_queue.get_nonce().await.map_err(|e| {
-            AddTransactionError::CouldNotGetCurrentOnChainNonce(transaction.relayer_id, e)
-        })?;
-
-        let mut estimation_transaction = transaction.clone();
-        estimation_transaction.nonce = current_onchain_nonce;
-
         let temp_transaction_request = Self::create_typed_transaction(
             transactions_queue,
-            &estimation_transaction,
+            transaction,
             gas_price,
             blob_gas_price,
             temp_gas_limit,
         )?;
 
-        let estimated_gas_limit = transactions_queue
-            .estimate_gas(&temp_transaction_request, transaction.is_noop, Some(transaction))
-            .await
-            .map_err(|e| {
-                AddTransactionError::TransactionEstimateGasError(transaction.relayer_id, e)
-            })?;
-
-        let relayer_balance = transactions_queue.get_balance().await.map_err(|e| {
+        let (estimated_gas_limit, relayer_balance) = tokio::join!(
+            transactions_queue.estimate_gas(
+                &temp_transaction_request,
+                transaction.is_noop,
+                Some(transaction)
+            ),
+            transactions_queue.get_balance(),
+        );
+        // Preserve gas-validation error precedence when both reads fail.
+        let estimated_gas_limit = estimated_gas_limit.map_err(|e| {
+            AddTransactionError::TransactionEstimateGasError(transaction.relayer_id, e)
+        })?;
+        let relayer_balance = relayer_balance.map_err(|e| {
             AddTransactionError::TransactionEstimateGasError(transaction.relayer_id, e)
         })?;
 
@@ -366,13 +419,39 @@ impl TransactionsQueues {
         Ok(estimated_gas_limit)
     }
 
+    pub(crate) async fn sender_operation(
+        registry: &Arc<Mutex<Self>>,
+        relayer_id: &RelayerId,
+    ) -> Option<(tokio::sync::OwnedMutexGuard<()>, tokio::sync::OwnedSemaphorePermit, Self)> {
+        let coordination = registry.lock().await.coordination.get(relayer_id).cloned()?;
+        let processing = coordination.processing.clone().lock_owned().await;
+        let (slot, queues) = super::start::processing_context(registry, relayer_id).await;
+        queues.queues.contains_key(relayer_id).then_some((processing, slot, queues))
+    }
+
+    pub async fn admit_transaction(
+        registry: &Arc<Mutex<Self>>,
+        relayer_id: &RelayerId,
+        transaction: &TransactionToSend,
+    ) -> Result<Transaction, AddTransactionError> {
+        let (_processing, _slot, mut queues) =
+            Self::sender_operation(registry, relayer_id)
+                .await
+                .ok_or(AddTransactionError::RelayerNotFound(*relayer_id))?;
+        let admitted = queues.add_transaction(relayer_id, transaction).await?;
+        if let Some(coordination) = queues.coordination.get(relayer_id) {
+            coordination.pending.notify_one();
+        }
+        Ok(admitted)
+    }
+
     /// Adds a new transaction to the specified relayer's queue.
     pub async fn add_transaction(
         &mut self,
         relayer_id: &RelayerId,
         transaction_to_send: &TransactionToSend,
     ) -> Result<Transaction, AddTransactionError> {
-        let _sender = self
+        let sender = self
             .db
             .acquire_sender(relayer_id, false)
             .await
@@ -563,6 +642,9 @@ impl TransactionsQueues {
                     let _ = transactions_queue.nonce_manager.get_and_increment().await;
                 }
             }
+            Err(crate::postgres::PostgresError::RelayerDeleted) => {
+                return Err(AddTransactionError::RelayerNotFound(*relayer_id))
+            }
             Err(crate::postgres::PostgresError::FixedBaseLaneBusy) => {
                 return Err(AddTransactionError::FixedBaseLaneBusy);
             }
@@ -581,6 +663,7 @@ impl TransactionsQueues {
             });
         }
 
+        sender.release().await;
         Ok(transaction)
     }
 
@@ -1317,7 +1400,10 @@ mod receipt_poll_tests {
                 &[&release],
             )
             .await?;
-            let mut queues = TransactionsQueues {
+            let queues = TransactionsQueues {
+                coordination: HashMap::from([(relayer_id, Arc::new(QueueCoordination::default()))]),
+                draining: HashMap::new(),
+                processing_slots: Arc::new(Semaphore::new(4)),
                 queues: HashMap::from([(relayer_id, queue)]),
                 relayer_block_times_ms: HashMap::from([(relayer_id, block_time)]),
                 gas_oracle_cache: Arc::new(Mutex::new(GasOracleCache::new())),
@@ -1327,7 +1413,48 @@ mod receipt_poll_tests {
                 webhook_manager: None,
                 safe_proxy_manager: Arc::new(SafeProxyManager::new(vec![])),
             };
-            let result = queues.process_single_inmempool(&relayer_id).await?;
+            let registry = Arc::new(Mutex::new(queues));
+            let (_slot, mut processing) =
+                super::super::start::processing_context(&registry, &relayer_id).await;
+            // An admitted worker must not hold the shared registry while it
+            // waits on its chain. API intake and other chains can still enter.
+            let registry_guard = registry.try_lock().expect("worker held global registry lock");
+            let mut competing = registry_guard.for_processing(&relayer_id);
+            let original_token = registry_guard.db.pool.token.clone();
+            drop(registry_guard);
+            let sender = processing.db.acquire_sender(&relayer_id, true).await?;
+            let token = processing.db.pool.token.clone();
+            assert!(matches!(
+                competing.db.acquire_sender(&relayer_id, true).await,
+                Err(crate::postgres::PostgresError::SenderUnavailable)
+            ));
+            // Another signer can acquire its fence without overwriting this
+            // worker's token or the API intake client's token.
+            let other_id = RelayerId::new();
+            processing.db.execute(
+                "INSERT INTO relayer.record(id,name,chain_id,address,wallet_index) VALUES($1,'other-signer',$2,$3,1)",
+                &[&other_id, &original.chain_id, &vec![0x99u8; 20]],
+            ).await?;
+            let other_sender = competing.db.acquire_sender(&other_id, true).await?;
+            assert_ne!(token, competing.db.pool.token);
+            assert_eq!(token, processing.db.pool.token);
+            assert_eq!(original_token, registry.lock().await.db.pool.token);
+            other_sender.release().await;
+            sender.release().await;
+            // Wait for asynchronous advisory unlock before processing the same signer.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let result = loop {
+                match processing.process_single_inmempool(&relayer_id).await {
+                    Ok(result) => break result,
+                    Err(ProcessInmempoolTransactionError::Handoff(
+                        crate::postgres::PostgresError::SenderUnavailable,
+                    )) => {
+                        assert!(std::time::Instant::now() < deadline);
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
             assert_eq!(result.status, ProcessInmempoolStatus::StillInmempool);
             if result.process_again_after != expected_wait {
                 failures.push(format!("receipt wait: chain={chain_id} capped={capped} actual={} expected={expected_wait}", result.process_again_after));
@@ -1337,7 +1464,60 @@ mod receipt_poll_tests {
                 .await
                 .iter()
                 .any(|request| request["method"] == "eth_sendRawTransaction"));
-            db = queues.db;
+            drop(competing);
+            let active_queue = processing.get_transactions_queue(&relayer_id).unwrap();
+            let other_queue = Fixture::new(chain_id, json!(null), 0).await.queue;
+            registry.lock().await.queues.insert(other_id, Arc::new(Mutex::new(other_queue)));
+            let active = active_queue.lock().await;
+            let deleting_registry = registry.clone();
+            let mut deletion = tokio::spawn(async move {
+                TransactionsQueues::delete_queue(&deleting_registry, &relayer_id).await;
+            });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(25), &mut deletion)
+                    .await
+                    .is_err(),
+                "deletion returned while an operation was active"
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let registry_guard = registry.lock().await;
+                    if registry_guard.get_transactions_queue(&relayer_id).is_none() {
+                        drop(registry_guard);
+                        let (_slot, mut other) =
+                            super::super::start::processing_context(&registry, &other_id).await;
+                        let queue = other.get_transactions_queue(&other_id).unwrap();
+                        assert!(queue
+                            .lock()
+                            .await
+                            .get_next_inmempool_transaction()
+                            .await
+                            .is_some());
+                        let sender = other.db.acquire_sender(&other_id, true).await.unwrap();
+                        sender.release().await;
+                        break;
+                    }
+                    drop(registry_guard);
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("unrelated sender could not progress during deletion");
+            assert!(!deletion.is_finished());
+            deletion.abort();
+            assert!(deletion.await.unwrap_err().is_cancelled());
+            {
+                let retry = TransactionsQueues::delete_queue(&registry, &relayer_id);
+                tokio::pin!(retry);
+                assert!(tokio::time::timeout(std::time::Duration::from_millis(25), &mut retry)
+                    .await
+                    .is_err());
+                drop(active);
+                retry.await;
+            }
+            assert!(registry.lock().await.for_processing(&relayer_id).queues.is_empty());
+            drop(processing);
+            db = Arc::try_unwrap(registry).ok().unwrap().into_inner().db;
         }
         drop(db);
         // Owned pools and sender guards close normally; never terminate database clients.
