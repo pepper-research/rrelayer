@@ -397,7 +397,8 @@ class Controller:
             listed = {t['taskArn'] for t in self.tasks(a.service)}
             observed.update(listed)
             self.save(previous_tasks=sorted(observed))
-            if self.state['stage'] not in ('stopping-legacy','legacy-stopped','activating'):
+            live_service = self.aws('ecs','describe-services','--cluster',a.cluster,'--services',a.service)['services'][0]
+            if live_service['desiredCount'] != 0:
                 for task in sorted(observed - listed - confirmed):
                     if self.task(task)['lastStatus'] != 'STOPPED':
                         raise RuntimeError('Cannot verify legacy tasks stopped before scale-down')
