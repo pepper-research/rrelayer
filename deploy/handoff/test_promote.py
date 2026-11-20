@@ -68,6 +68,21 @@ class PromotionTests(unittest.TestCase):
     validate_acceptance(dict(receipt(), downstream_image_digest=value), SHA, DIGEST)
   validate_acceptance(receipt(), SHA, DIGEST)
 
+ def test_recovery_plan_retains_original_and_rotated_legacy_inventory(self):
+  self.args.bootstrap = True
+  original = Fake(self.args, legacy=True)
+  original.fail = 'candidate readiness'
+  with self.assertRaises(RuntimeError): original.run()
+  original.save(stage='stopping-legacy', previous_tasks=['old-task','retired-task'], stopped_legacy_tasks=['retired-task'])
+  self.args.recover_journal = self.args.journal
+  self.args.journal = str(self.path / 'rollback.json')
+  self.args.execute = False
+  recovery = Fake(self.args, legacy=True)
+  recovery.tasks = lambda service=None: [dict(recovery.task('old-task'), taskArn='rotated')]
+  recovery.run()
+  self.assertEqual(recovery.state['previous_tasks'], ['old-task','retired-task','rotated'])
+  self.assertEqual(recovery.state['stopped_legacy_tasks'], ['retired-task'])
+
  def test_refuses_unfinished_baseline_before_launch(self):
   controller = Fake(self.args)
   tasks = controller.tasks

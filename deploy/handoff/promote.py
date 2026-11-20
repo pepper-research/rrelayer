@@ -341,7 +341,14 @@ class Controller:
                 legacy=live_legacy
             else:
                 active=old_api and old_api.get('activeRelease')
-            self.save(possible_previous_owner=possible_previous_owner, previous_definition=service['taskDefinition'],previous_tasks=[t['taskArn'] for t in running],previous_release=active,legacy=legacy,target_group=group,recovery=recovery)
+            inventory = {t['taskArn'] for t in running}
+            stopped = []
+            if legacy and recovery:
+                inventory.update(recovery['previous_tasks'])
+                stopped = recovery.get('stopped_legacy_tasks', [])
+            self.save(possible_previous_owner=possible_previous_owner, previous_definition=service['taskDefinition'],
+                      previous_tasks=sorted(inventory), stopped_legacy_tasks=stopped, previous_release=active,
+                      legacy=legacy, target_group=group, recovery=recovery)
         if self.state['stage']=='complete':
             if not self.service_ready(group):
                 raise RuntimeError('Completed handoff has a degraded replacement service')
