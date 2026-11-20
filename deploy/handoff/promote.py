@@ -494,6 +494,7 @@ class Controller:
                 self.wait(lambda: self.task(arn)['lastStatus']=='STOPPED', 'task retirement')
             stopped.add(arn)
             self.save(retired_tasks=sorted(stopped))
+        self.wait(lambda: self.service_ready(group),'replacement service health after retirement',900)
         self.save(stage='complete')
         return {'stage':'complete','source':a.source,'digest':a.digest}
 
