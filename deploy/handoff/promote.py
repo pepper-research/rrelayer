@@ -170,7 +170,7 @@ class Controller:
                 raise ValueError('Recovery journal changed')
             recovery = reference
         interrupted_bootstrap = recovery and recovery['legacy'] and recovery['stage'] in (
-            'activating','activated','replacing-service')
+            'stopping-legacy','legacy-stopped','activating','activated','replacing-service')
         if service['desiredCount'] != 1 and not (service['desiredCount'] == 0
                 and (interrupted_bootstrap or a.resume and self.state.get('legacy'))):
             raise ValueError('Expected one service task')
@@ -216,7 +216,10 @@ class Controller:
                 stopped_bootstrap = (counts == [0,0,0] and interrupted_bootstrap
                                      and self.task(recovery['warm_task'])['lastStatus'] == 'STOPPED'
                                      and all(t['lastStatus'] == 'STOPPED' for t in running))
-                if stopped_bootstrap:
+                before_activation = recovery['stage'] in ('stopping-legacy', 'legacy-stopped')
+                if interrupted_bootstrap and before_activation and counts == [0,0,0]:
+                    active = None
+                elif stopped_bootstrap:
                     # Only the recovery standby can now read the durable release fence.
                     # Its observation is checked before target registration or activation.
                     active = recovery['source']
@@ -242,12 +245,12 @@ class Controller:
             if result.get('failures') or len(result.get('tasks',[]))!=1:raise RuntimeError('Candidate launch failed; existing service unchanged')
             self.save(warm_task=result['tasks'][0]['taskArn'],stage='warming')
         warm=self.state['warm_task'];status=self.wait(lambda:self.ready(warm,a.source,a.digest),'candidate readiness')
-        if (recovery and recovery['legacy'] and recovery['stage'] == 'activating'
+        if (recovery and recovery['legacy'] and recovery['stage'] in ('stopping-legacy','legacy-stopped','activating')
                 and status['activeRelease'] is None and not status['durableIntakeReady']):
             service_state = self.aws('ecs','describe-services','--cluster',a.cluster,'--services',a.service)['services'][0]
             if (not receipt.get('legacy_ingress_quiesced_evidence') or status['unresolvedTransactions'] != 0
                     or any(service_state.get(k) != 0 for k in ('desiredCount','runningCount','pendingCount'))
-                    or self.task(recovery['warm_task'])['lastStatus'] != 'STOPPED'
+                    or (recovery['stage'] == 'activating' and self.task(recovery['warm_task'])['lastStatus'] != 'STOPPED')
                     or any(t['lastStatus'] != 'STOPPED' for t in self.tasks(a.service))
                     or any(self.task(t)['lastStatus'] != 'STOPPED' for t in recovery['previous_tasks'])):
                 raise ValueError('Cannot verify drained legacy shutdown for recovery bootstrap')
