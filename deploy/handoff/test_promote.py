@@ -23,7 +23,7 @@ class Fake(Controller):
   result=predicate()
   if not result:raise RuntimeError('fixture condition false: '+label)
   return result
- def task(self,arn):return {'taskArn':arn,'taskDefinitionArn':'candidate:1' if arn!='old-task' else 'previous:1','lastStatus':'STOPPED' if (arn=='old-task' and self.oldStopped) or (arn=='warm-task' and self.warmStopped) else 'RUNNING'}
+ def task(self,arn):return {'taskArn':arn,'desiredStatus':'STOPPED' if (arn=='old-task' and self.oldStopped) or (arn=='warm-task' and self.warmStopped) else 'RUNNING','taskDefinitionArn':'candidate:1' if arn!='old-task' else 'previous:1','lastStatus':'STOPPED' if (arn=='old-task' and self.oldStopped) or (arn=='warm-task' and self.warmStopped) else 'RUNNING'}
  def tasks(self,service=None):return [self.task('service-new' if self.replaced else 'old-task')] if service or 'warm_task' not in self.state else [self.task('service-new' if self.replaced else 'old-task'),self.task('warm-task')]
  def target(self,arn):return {'Id':arn,'Port':3000}
  def healthy(self,*args):return True

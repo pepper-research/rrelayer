@@ -168,7 +168,7 @@ class Controller:
     def ready(self,arn,source,digest):
         task=self.task(arn)
         containers=[c for c in task.get('containers',[]) if c['name']==self.a.container]
-        if task['lastStatus']!='RUNNING' or task.get('desiredStatus','RUNNING')!='RUNNING' or not containers or containers[0].get('imageDigest')!=digest:return False
+        if task['lastStatus']!='RUNNING' or task.get('desiredStatus')!='RUNNING' or not containers or containers[0].get('imageDigest')!=digest:return False
         status=self.api(arn,'/ready')
         if not protocol_one(status.get('protocol')) or status.get('release')!=source or status.get('queuesReady') is not True:return False
         return status
@@ -464,7 +464,9 @@ class Controller:
                 or [lb.get('targetGroupArn') for lb in service.get('loadBalancers', [])] != [group]):
             return False
         tasks=self.tasks(a.service)
-        if len(tasks)!=1 or tasks[0]['taskDefinitionArn']!=a.task_definition:return False
+        if (len(tasks) != 1 or tasks[0]['taskDefinitionArn'] != a.task_definition
+                or tasks[0].get('lastStatus') != 'RUNNING' or tasks[0].get('desiredStatus') != 'RUNNING'):
+            return False
         status=self.ready(tasks[0]['taskArn'],a.source,a.digest)
         return status and status['activeRelease'] == a.source and status['processing'] and status['durableIntakeReady'] and self.healthy(self.target(tasks[0]['taskArn']),group)
 
