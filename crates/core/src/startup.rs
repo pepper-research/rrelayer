@@ -223,6 +223,8 @@ async fn start_api(
         private_key_only_networks: Arc::new(private_key_only_networks),
     });
 
+    tokio::spawn(crate::relayer::discover_relayer_queues(app_state.clone()));
+
     let cors = CorsLayer::new()
         .allow_origin(
             if api_config.allowed_origins.as_ref().is_none_or(|origins| origins.is_empty()) {
@@ -245,7 +247,7 @@ async fn start_api(
     let api_routes = Router::new()
         .nest("/auth", create_basic_auth_routes())
         .nest("/networks", create_network_routes())
-        .nest("/relayers", create_relayer_routes())
+        .nest("/relayers", create_relayer_routes(app_state.clone()))
         .nest("/transactions", create_transactions_routes())
         .nest("/signing", create_signing_routes());
 
@@ -253,6 +255,10 @@ async fn start_api(
         .route("/health", get(health_check))
         .route("/ready", get(crate::sender_handoff::readiness))
         .route("/handoff/activate", axum::routing::post(crate::sender_handoff::activate))
+        .route(
+            "/handoff/resume-registration",
+            axum::routing::post(crate::sender_handoff::resume_registration),
+        )
         .merge(api_routes)
         .layer(middleware::from_fn(inject_basic_auth_status))
         .layer(middleware::from_fn(activity_logger))

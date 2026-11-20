@@ -5781,6 +5781,7 @@ dependencies = [
  "chrono",
  "cryptoki",
  "dotenv",
+ "futures-util",
  "google-secretmanager1",
  "hex",
  "hmac 0.12.1",

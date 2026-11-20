@@ -93,15 +93,67 @@ async fn queues_ready(state: &AppState) -> Result<bool, PostgresError> {
 pub async fn readiness(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, HttpError> {
-    let row = state.db.query_one("SELECT protocol, enabled, active_release FROM relayer.sender_deployment WHERE singleton", &[]).await?;
+    let row = state.db.query_one("SELECT protocol, enabled, active_release, registration_release FROM relayer.sender_deployment WHERE singleton", &[]).await?;
     let active: Option<String> = row.get("active_release");
     let enabled: bool = row.get("enabled");
     let queues_ready = queues_ready(&state).await?;
     let unresolved: i64 = state.db.query_one("SELECT COUNT(*) FROM relayer.transaction WHERE status IN ('PENDING','INMEMPOOL','MINED')", &[]).await?.get(0);
     Ok(Json(
         serde_json::json!({"activeRelease":active,"unresolvedTransactions":unresolved,"protocol": row.get::<_,i32>("protocol"), "release":release_id(),
+        "queueDiscovery": true, "registrationReady": !enabled || (active.is_some() && active == row.get::<_, Option<String>>("registration_release")),
         "queuesReady": queues_ready, "durableIntakeReady": enabled && queues_ready, "processing":enabled && queues_ready && active.as_deref()==Some(&release_id())}),
     ))
+}
+
+/// Hold the deployment row through key creation, the insert and worker startup.
+pub async fn admit_registration(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, HttpError> {
+    state.validate_basic_auth_valid(request.headers())?;
+    let _creation = state.relayer_creation_mutex.lock().await;
+    let mut conn = state.db.pool.get().await.map_err(PostgresError::from)?;
+    let tx = conn.transaction().await.map_err(PostgresError::from)?;
+    // Key-provider calls can exceed the pool's ten-second idle transaction limit.
+    // Dropping the request rolls back this guard and releases its row lock.
+    tx.batch_execute(
+        "SET LOCAL idle_in_transaction_session_timeout = 0; SET LOCAL idle_session_timeout = 0",
+    )
+    .await
+    .map_err(PostgresError::from)?;
+    let row = tx.query_one(
+        "SELECT NOT enabled OR COALESCE(registration_release = active_release, FALSE) FROM relayer.sender_deployment WHERE singleton FOR NO KEY UPDATE",
+        &[],
+    ).await.map_err(PostgresError::from)?;
+    if !row.get::<_, bool>(0) {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Relayer registration is paused during the sender upgrade. Retry after handoff.".into(),
+        ));
+    }
+    let response = next.run(request).await;
+    drop(tx);
+    Ok(response)
+}
+
+pub async fn resume_registration(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, HttpError> {
+    state.validate_basic_auth_valid(&headers)?;
+    let release = release_id();
+    if release.is_empty() || !queues_ready(&state).await? {
+        return Err(crate::shared::conflict("Sender queues are not ready".into()));
+    }
+    let changed = state.db.execute(
+        "UPDATE relayer.sender_deployment SET registration_release=$1 WHERE singleton AND enabled AND active_release=$1",
+        &[&release],
+    ).await?;
+    if changed != 1 {
+        return Err(crate::shared::conflict("Active release changed".into()));
+    }
+    Ok(Json(serde_json::json!({"registrationRelease": release})))
 }
 
 #[derive(Deserialize)]
@@ -115,16 +167,16 @@ pub async fn activate(
     Json(request): Json<Activate>,
 ) -> Result<Json<serde_json::Value>, HttpError> {
     state.validate_basic_auth_valid(&headers)?;
-    if !queues_ready(&state).await? {
-        return Err(internal_server_error(Some("Configured relayer queues are not ready".into())));
-    }
     let release = release_id();
     if release.is_empty() {
         return Err(internal_server_error(Some("RRELAYER_RELEASE_ID is required".into())));
     }
     let mut conn = state.db.pool.get().await.map_err(PostgresError::from)?;
     let tx = conn.transaction().await.map_err(PostgresError::from)?;
-    let row = tx.query_one("SELECT enabled, active_release FROM relayer.sender_deployment WHERE singleton FOR UPDATE", &[]).await.map_err(PostgresError::from)?;
+    let row = tx.query_one("SELECT enabled, active_release, registration_release FROM relayer.sender_deployment WHERE singleton FOR UPDATE", &[]).await.map_err(PostgresError::from)?;
+    if !queues_ready(&state).await? {
+        return Err(internal_server_error(Some("Configured relayer queues are not ready".into())));
+    }
     let active: Option<String> = row.get("active_release");
     if active != request.expected_release {
         return Err(internal_server_error(Some(
@@ -143,7 +195,8 @@ pub async fn activate(
         }
     }
     tx.execute(
-        "UPDATE relayer.sender_deployment SET enabled=TRUE, active_release=$1 WHERE singleton",
+        "UPDATE relayer.sender_deployment SET registration_release=CASE WHEN NOT enabled OR registration_release=active_release THEN $1 ELSE NULL END,
+            enabled=TRUE, active_release=$1 WHERE singleton",
         &[&release],
     )
     .await

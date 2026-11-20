@@ -16,4 +16,5 @@ mod get_relayer;
 pub use get_relayer::{get_relayer, get_relayer_provider_context_by_relayer_id, relayer_exists};
 
 mod queue_utils;
+pub(crate) use queue_utils::discover_relayer_queues;
 pub use queue_utils::start_relayer_queue;
