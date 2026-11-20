@@ -220,7 +220,7 @@ class Controller:
             if len(running)!=1 and not recovery:raise ValueError('Service is not steady; use its recovery journal')
             previous_source,_=source_of(current,a.container)
             old_api=None
-            if previous_source and running:old_api=self.api(running[0]['taskArn'],'/ready')
+            if not recovery and previous_source and running:old_api=self.api(running[0]['taskArn'],'/ready')
             legacy=not old_api or old_api.get('protocol')!=1
             if legacy and not a.bootstrap and not recovery:raise ValueError('Legacy binary requires explicit bootstrap')
             if recovery:
@@ -250,7 +250,12 @@ class Controller:
                             and running[0]['taskDefinitionArn'] == service['taskDefinition']
                             and source_of(current,a.container)[0] == recovery['source']
                             and self.healthy(self.target(running[0]['taskArn']),group)):
-                        old_api = self.ready(running[0]['taskArn'], recovery['source'], recovery['digest'])
+                        try:
+                            old_api = self.ready(running[0]['taskArn'], recovery['source'], recovery['digest'])
+                        except RuntimeError:
+                            if recovery.get('warm_retired'):
+                                raise
+                            # The journaled warm sender must independently prove ownership below.
                     if not old_api and not recovery.get('warm_retired'):
                         old_api = self.ready(recovery['warm_task'], recovery['source'], recovery['digest'])
                     if not old_api or not old_api['durableIntakeReady'] or not old_api['processing'] or old_api['activeRelease'] != recovery['source']:
