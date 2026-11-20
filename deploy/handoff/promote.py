@@ -459,6 +459,11 @@ class Controller:
     def service_ready(self, group):
         a = self.a
         service = self.aws('ecs','describe-services','--cluster',a.cluster,'--services',a.service)['services'][0]
+        config = service.get('deploymentConfiguration', {})
+        breaker = config.get('deploymentCircuitBreaker', {})
+        if (config.get('maximumPercent') != 100 or config.get('minimumHealthyPercent') != 0
+                or breaker.get('enable') is not True or breaker.get('rollback') is not False):
+            return False
         deployments = service.get('deployments', [])
         if (len(deployments) != 1 or deployments[0].get('status') != 'PRIMARY'
                 or deployments[0].get('rolloutState') != 'COMPLETED'
