@@ -68,6 +68,15 @@ class PromotionTests(unittest.TestCase):
     validate_acceptance(dict(receipt(), downstream_image_digest=value), SHA, DIGEST)
   validate_acceptance(receipt(), SHA, DIGEST)
 
+ def test_refuses_unfinished_baseline_before_launch(self):
+  controller = Fake(self.args)
+  tasks = controller.tasks
+  controller.tasks = lambda service=None: [dict(t, taskDefinitionArn='previous:0') for t in tasks(service)]
+  with self.assertRaisesRegex(ValueError, 'not steady'):
+   controller.run()
+  self.assertNotIn('previous_definition', controller.state)
+  self.assertFalse(any(call[:2] == ('ecs','run-task') for call in controller.calls))
+
  def test_missing_evidence_refuses_before_aws(self):
   r=receipt();del r['checks']['stale_owner'];(self.path/'acceptance.json').write_text(json.dumps(r));c=Fake(self.args)
   with self.assertRaises(ValueError):c.run()

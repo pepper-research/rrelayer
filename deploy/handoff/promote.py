@@ -260,7 +260,10 @@ class Controller:
             if not launched:
                 raise ValueError('Unaccounted relayer tasks; reconcile before deployment')
         if 'previous_definition' not in self.state:
-            if len(running)!=1 and not recovery:raise ValueError('Service is not steady; use its recovery journal')
+            if not recovery and (not self.steady_deployment(service, service['taskDefinition'])
+                    or len(running) != 1 or not self.task_running(running[0])
+                    or running[0]['taskDefinitionArn'] != service['taskDefinition']):
+                raise ValueError('Service is not steady; use its recovery journal')
             previous_source,_=source_of(current,a.container)
             old_api=None
             if not recovery and previous_source and running:old_api=self.api(running[0]['taskArn'],'/ready')
@@ -462,6 +465,15 @@ class Controller:
         self.save(stage='replacing-service')
         return self.finish_replacement(group, recovery)
 
+    @staticmethod
+    def steady_deployment(service, definition):
+        deployments = service.get('deployments', [])
+        return (len(deployments) == 1 and deployments[0].get('status') == 'PRIMARY'
+                and deployments[0].get('rolloutState') == 'COMPLETED'
+                and all(record.get('taskDefinition') == definition and
+                        [record.get(k) for k in ('desiredCount','runningCount','pendingCount')] == [1,1,0]
+                        for record in (service, deployments[0])))
+
     def service_ready(self, group):
         a = self.a
         service = self.aws('ecs','describe-services','--cluster',a.cluster,'--services',a.service)['services'][0]
@@ -470,14 +482,7 @@ class Controller:
         if (config.get('maximumPercent') != 100 or config.get('minimumHealthyPercent') != 0
                 or breaker.get('enable') is not True or breaker.get('rollback') is not False):
             return False
-        deployments = service.get('deployments', [])
-        if (len(deployments) != 1 or deployments[0].get('status') != 'PRIMARY'
-                or deployments[0].get('rolloutState') != 'COMPLETED'
-                or deployments[0].get('taskDefinition') != a.task_definition
-                or [deployments[0].get(k) for k in ('desiredCount','runningCount','pendingCount')] != [1,1,0]):
-            return False
-        if (service['taskDefinition'] != a.task_definition
-                or [service.get(k) for k in ('desiredCount','runningCount','pendingCount')] != [1,1,0]
+        if (not self.steady_deployment(service, a.task_definition)
                 or [(lb.get('targetGroupArn'), lb.get('containerName'), lb.get('containerPort'))
                     for lb in service.get('loadBalancers', [])] != [(group, a.container, 3000)]):
             return False
