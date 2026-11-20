@@ -188,6 +188,8 @@ class Controller:
         if service['deploymentConfiguration']['maximumPercent']!=100 or service['deploymentConfiguration']['minimumHealthyPercent']!=0:
             raise ValueError('Keep the service stop-before-start; temporary warm task supplies continuity')
         recovery = self.state.get('recovery')
+        if recovery and not a.recover_journal and recovery.get('legacy') and not recovery.get('inventory_reconciled'):
+            raise ValueError('Resume legacy recovery with the original --recover-journal to reconcile sender inventory')
         if a.recover_journal:
             original = json.loads(Path(a.recover_journal).read_text())
             if any(original.get(k) != getattr(a,k) for k in ('cluster','service','container','region')):
@@ -214,6 +216,7 @@ class Controller:
                 inventory.update(prior_tasks)
                 confirmed.update(prior_stops)
                 ancestor = ancestor.get('recovery')
+            reference['inventory_reconciled'] = True
             reference['previous_tasks'] = sorted(inventory)
             reference['stopped_legacy_tasks'] = sorted(confirmed)
             reference['warm_retired'] = original['warm_task'] in original.get('retired_tasks', [])
