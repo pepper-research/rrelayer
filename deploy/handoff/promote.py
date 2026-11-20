@@ -401,6 +401,9 @@ class Controller:
             if self.state['stage'] in ('legacy-stopped','activating'):
                 confirmed.update(self.state['previous_tasks'])
             observed = set(self.state['previous_tasks'])
+            if recovery and recovery.get('legacy'):
+                observed.update(recovery['previous_tasks'])
+                confirmed.update(recovery.get('stopped_legacy_tasks', []))
             listed = {t['taskArn'] for t in self.tasks(a.service)}
             observed.update(listed)
             self.save(previous_tasks=sorted(observed))
