@@ -267,7 +267,7 @@ class Controller:
                     active = recovery['source']
                 else:
                     old_api = None
-                    can_use_service = recovery['stage'] in ('activated','replacing-service','service-ready','retiring','complete')
+                    can_use_service = recovery['stage'] in ('activated','staging-at-zero','replacing-service','service-ready','retiring','complete')
                     if (can_use_service and counts == [1,1,0] and len(running) == 1
                             and running[0]['taskDefinitionArn'] == service['taskDefinition']
                             and source_of(current,a.container)[0] == recovery['source']
