@@ -202,6 +202,17 @@ Acceptance JSON must bind `source`, `image_digest`, `protocol:1`, and the exact
 `dev_ecs_handoff` or full downstream credit/settlement acceptance. Do not create
 an all-green receipt from the local results below.
 
+For a completed historical journal missing its retirement list, a reviewed
+acceptance receipt may include `historical_warm_shutdown`. Copy the original
+journal's `id`, `cluster`, `region`, `service`, `warm_task`, `source` and
+`digest`. Set `lastStatus` to `STOPPED` only when the cited `evidence` records
+verified shutdown of that task. Expiration of an ECS task record alone does
+not establish shutdown. To recover a predecessor whose ECS record also expired,
+supply the original passing production verdict JSON as a readable file. It must
+explicitly record the warm task as STOPPED as well. The controller
+checks its source, image digest and each tracked task ARN and imports only
+explicit STOPPED records. The current cluster inventory must agree.
+
 ## Verification
 
 ```sh
@@ -358,3 +369,38 @@ active protocol 1 deployment to protocol 0 or overlap senders. API167 requires
 verified PR17 activation; API115/UI224 require verified nonce-safe activation.
 A passing local fixture removes the configuration limitation on the new source;
 it does not mark any dependency shipped or waive these acceptance obligations.
+
+### First upgrade from a sender without queue discovery
+
+Use the registration-compatible build of the production branch as the first
+upgrade and retain its verified digest for rollback. The deployed and historical
+fallback executables lack queue discovery. Neither is a compatible rollback
+target after registration reopens.
+
+For a protocol-1 incumbent without queue discovery, the controller prewarms
+the successor, installs a fixed HTTP 503 response on the dedicated service
+listener for POST create, import and clone, and probes each resolved listener
+address from the warm task before admitting public standby traffic. The client
+may retry an explicit maintenance response. A timeout on a previously admitted
+registration needs reconciliation. Existing senders continue to accept and
+process payments through the normal handoff. Use the service ingress for public
+traffic; a separate direct route to an old task must use the same maintenance
+window. The controller requires a dedicated HTTP listener with one default
+target group and refuses conflicting rules.
+
+The database also guards the three registration handlers on updated processes.
+An old active release leaves registration closed on the standby. The controller
+reopens it after verifying the replacement owns processing, all previous targets
+are retired, and the public target group contains only that healthy task.
+Recovery reuses the original tagged rule. Resume the journal after an interruption.
+The deployment role requires Get/Describe access to listener rules, their tags
+and load balancers, and CreateRule, AddTags and DeleteRule on the relayer listener.
+Later upgrades between queue-discovering peers use ordinary registration.
+
+Run the isolated first-upgrade case with the actual deployed executable as
+`--baseline`, the compatibility build as `--binary`, and the PR build as
+`--registration-rollback`. Use `--scenarios first_registration_upgrade`.
+It exercises maintenance refusal, existing-sender settlement, first payments
+for registered senders and ownership changes in both directions. Repeat with
+the historical fallback as the starting peer. Keep exact image identities with
+the release evidence.

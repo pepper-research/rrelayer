@@ -89,9 +89,6 @@ pub async fn import_relayer(
         )));
     }
 
-    // Acquire mutex to prevent concurrent relayer creation deadlocks
-    let _lock = state.relayer_creation_mutex.lock().await;
-
     let wallet_index = state.db.get_next_wallet_index(&chain_id).await.map_err(|e| {
         internal_server_error(Some(format!("Failed to get next wallet index: {}", e)))
     })?;

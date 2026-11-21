@@ -330,13 +330,14 @@ networks:
     def onchain_nonce(self):
         return int(rpc(self.anvil_url, "eth_getTransactionCount", [self.relayer, "latest"]), 16)
 
-    def chain_scan(self):
+    def chain_scan(self, senders=None):
+        senders = {address.lower() for address in (senders or [self.relayer or ""])}
         latest = int(rpc(self.anvil_url, "eth_blockNumber", []), 16)
         out = []
         for n in range(0, latest + 1):
             b = rpc(self.anvil_url, "eth_getBlockByNumber", [hex(n), True])
             for t in b["transactions"]:
-                if t["from"].lower() != (self.relayer or "").lower():
+                if t["from"].lower() not in senders:
                     continue
                 rc = rpc(self.anvil_url, "eth_getTransactionReceipt", [t["hash"]])
                 out.append({"block": n, "hash": t["hash"], "nonce": int(t["nonce"], 16), "to": t["to"],

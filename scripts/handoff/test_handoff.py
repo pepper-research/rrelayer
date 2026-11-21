@@ -37,8 +37,8 @@ def done(ctx, txs, seconds=45):
     assert lab.wait_until(lambda: all(ctx.rows().get(t['id'],{}).get('status') in lab.OK_STATUSES for t in txs),seconds,.25), ctx.rows()
 
 
-def check_money(ctx, txs):
-    chain = ctx.chain_scan()
+def check_money(ctx, txs, senders=None):
+    chain = ctx.chain_scan(senders)
     counts = lab.payload_counts(chain)
     for tx in txs:
         assert counts.get(tx['value']) == 1, (tx, chain)
@@ -51,8 +51,8 @@ def check_money(ctx, txs):
     return {'recipientBalanceWei':balance,'rows':ctx.rows(),'chain':chain}
 
 
-def startup(ctx, legacy=False):
-    binary = ctx.old_bin if legacy else ctx.new_bin
+def startup(ctx, legacy=False, binary=None):
+    binary = binary or (ctx.old_bin if legacy else ctx.new_bin)
     ctx.start_rr('old',binary,lab.PORTS['api'])
     # Production has pre-existing relayers. Seed that state, then restart to load it.
     # Current production's dynamic-create path recursively locks TransactionsQueues;
@@ -67,7 +67,7 @@ def startup(ctx, legacy=False):
 
 
 def warm_handoff(ctx):
-    startup(ctx)
+    startup(ctx, binary=ctx.old_bin)
     ctx.lab('/lab/hide_receipts',{'seconds':4})
     txs = [send(ctx,'old',11001)]
     ctx.lab('/lab/hold',{'on':True})
@@ -452,7 +452,7 @@ def failed_attempt_keeps_nonce_reserved(ctx):
     return {'rows': rows, 'reservedAttemptNonce': 1}
 
 
-def legacy_nonce_gap_recovery(ctx, delegated=False):
+def legacy_nonce_gap_recovery(ctx, delegated=False, only_legacy=False):
     startup(ctx)
     if delegated:
         delegate = "0x000000000000000000000000000000000000beef"
@@ -461,7 +461,7 @@ def legacy_nonce_gap_recovery(ctx, delegated=False):
     ctx.kill_rr('old')
     ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
     legacy = send(ctx, 'new', 205000)
-    held = send(ctx, 'new', 205001)
+    held = None if only_legacy else send(ctx, 'new', 205001)
     ctx.stop_rr('new')
     # Exact legacy shape: FAILED, conservatively attempted, no known hash or
     # persisted envelope. This never certifies that an old payout is impossible.
@@ -476,6 +476,47 @@ def legacy_nonce_gap_recovery(ctx, delegated=False):
         COMMIT;
     """)
     ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
+    if only_legacy:
+        api = ctx.rr['new']['api']
+        path = f'{api}/relayers/{ctx.relayer_id}'
+        assert len(ctx.rows()) == 1
+        code, body = lab.http('DELETE', path, auth=True)
+        assert code == 409, (code, body)
+        activate(ctx, 'new', 'old')
+        code, body = lab.http('PUT', path+'/pause', auth=True)
+        assert code == 204, (code, body)
+        endpoint = f"{api}/transactions/cancel-legacy-nonce/{legacy['id']}/0"
+        code, other = lab.http('POST', f'{api}/relayers/{lab.CHAIN_ID}/new', {'name':'independent'}, auth=True)
+        assert code == 200, (code, other)
+        ctx.lab('/lab/nonce_gate', {'sender':ctx.relayer.lower()})
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            cancelling = pool.submit(lab.http, 'PUT', endpoint, auth=True)
+            try:
+                assert lab.wait_until(lambda: ctx.lab('/lab/state').get('nonce_waiting'), 10)
+                original_id = ctx.relayer_id
+                ctx.relayer_id = other['id']
+                independent = ctx.submit('new')
+                ctx.relayer_id = original_id
+                assert independent['id'], independent
+                done(ctx, [independent], seconds=12)
+                assert not cancelling.done()
+            finally:
+                ctx.lab('/lab/nonce_gate', {})
+            code, response = cancelling.result()
+        assert code == 200, (code, response)
+        cancel = response['cancelTransactionId']
+        code, repeat = lab.http('PUT', endpoint, auth=True)
+        assert code == 200 and repeat['cancelTransactionId'] == cancel
+        assert lab.http('DELETE', path, auth=True)[0] == 409
+        assert lab.http('PUT', path+'/unpause', auth=True)[0] == 204
+        assert lab.wait_until(lambda: ctx.rows()[cancel]['status'] == 'CONFIRMED', 45)
+        rows = ctx.rows()
+        assert rows[legacy['id']]['status'] == 'CANCELLED' and rows[cancel]['nonce'] == 0
+        assert len(ctx.chain_scan()) == 1 and ctx.onchain_nonce() == 1
+        assert int(lab.rpc(ctx.anvil_url,'eth_getBalance',[lab.SINK,'latest']),16) == independent['value']
+        code, body = lab.http('DELETE', path, auth=True)
+        assert code == 204, (code, body)
+        return {'legacyNonceCancellation': cancel, 'independentConfirmed': independent['id'], 'recipientBalanceWei': independent['value']}
     key = str(uuid.uuid4())
     code, result = lab.http('POST', ctx.rr['new']['api']+f'/transactions/relayers/{lab.CHAIN_ID}/send-idempotent',
         {'to':lab.SINK,'value':hex(205002),'data':'0x','externalId':key}, auth=True)
@@ -526,13 +567,151 @@ def legacy_nonce_gap_recovery(ctx, delegated=False):
     return result
 
 
+def dynamic_registration(ctx):
+    ctx.start_rr('new', ctx.new_bin, lab.PORTS['api'])
+    api = ctx.rr['new']['api']
+    activate(ctx, 'new', bootstrap=True)
+    ctx.create_relayer(api)
+    original = ctx.relayer_id
+    source = str(uuid.uuid4())
+    address = lab.cast('wallet', 'address', '--mnemonic', lab.MNEMONIC, '--mnemonic-index', '1')
+    ctx.pg.psql(ctx.dbname, f"INSERT INTO relayer.record(id,name,chain_id,address,wallet_index) VALUES('{source}','source',{lab.CHAIN_ID + 1},decode('{address[2:]}','hex'),1)")
+    code, cloned = lab.http('POST', f'{api}/relayers/{source}/clone',
+                            {'chainId': lab.CHAIN_ID, 'newRelayerName': 'clone'}, auth=True)
+    assert code == 200, (code, cloned)
+    assert cloned['address'].lower() == address.lower()
+    assert cloned['id'] != original
+    total = 0
+    for relayer_id, sender in ((cloned['id'], address), (original, ctx.relayer)):
+        ctx.relayer_id = relayer_id
+        tx = ctx.submit('new')
+        assert tx['id'], tx
+        done(ctx, [tx])
+        receipt = lab.rpc(ctx.anvil_url, 'eth_getTransactionReceipt', [ctx.rows()[tx['id']]['hash']])
+        assert receipt['from'].lower() == sender.lower() and int(receipt['status'], 16) == 1
+        total += tx['value']
+    balance = int(lab.rpc(ctx.anvil_url, 'eth_getBalance', [lab.SINK, 'latest']), 16)
+    assert balance == total
+    return {'recipientBalanceWei': balance}
+
+
+def delete_after_settlement(ctx):
+    startup(ctx)
+    api = ctx.rr['old']['api']
+    path = f'{api}/relayers/{ctx.relayer_id}'
+    ctx.lab('/lab/hold', {'on': True})
+    tx = send(ctx, 'old', 23001)
+    code, body = lab.http('DELETE', path, auth=True)
+    assert code == 409, (code, body)
+    ctx.lab('/lab/hold', {'on': False})
+    done(ctx, [tx])
+    assert lab.wait_until(lambda: ctx.rows()[tx['id']]['status'] == 'CONFIRMED', 30), ctx.rows()
+    result = check_money(ctx, [tx])
+    code, body = lab.http('DELETE', path, auth=True)
+    assert code == 204, (code, body)
+    return result
+
+
+def standby_deletion(ctx):
+    startup(ctx)
+    original = ctx.relayer_id
+    ctx.create_relayer(ctx.rr['old']['api'])
+    ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
+    code, body = lab.http('DELETE', ctx.rr['new']['api'] + f'/relayers/{original}', auth=True)
+    assert code == 204, (code, body)
+    for name in ('new', 'old'):
+        log = Path(ctx.sdir) / f'rrelayer-{name}.log'
+        assert lab.wait_until(lambda: all(
+            f'{original} has been deleted stopping the {worker} queue' in log.read_text()
+            for worker in ('pending', 'inmempool', 'mined')), 20), name
+    before = ctx.submit('old')
+    assert before['id'], before
+    done(ctx, [before])
+    activate(ctx, 'new', 'old')
+    after = ctx.submit('new')
+    assert after['id'], after
+    done(ctx, [after])
+    return check_money(ctx, [before, after])
+
+
+def standby_registration(ctx):
+    startup(ctx)
+    ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
+    ctx.create_relayer(ctx.rr['new']['api'])
+    before = ctx.submit('new')
+    assert before['id'], before
+    done(ctx, [before])
+    assert lab.http('GET', ctx.rr['old']['api'] + '/ready')[1]['queuesReady']
+    activate(ctx, 'new', 'old')
+    after = ctx.submit('old')
+    assert after['id'], after
+    done(ctx, [after])
+    return check_money(ctx, [before, after])
+
+
+def first_registration_upgrade(ctx):
+    """Run with the deployed peer and a separately built, queue-discovering rollback."""
+    assert ctx.old_bin and ctx.registration_rollback, 'deployed --baseline and --registration-rollback required'
+    startup(ctx, binary=ctx.old_bin)
+    ctx.start_rr('new', ctx.new_bin, lab.PORTS['api_b'])
+    api = ctx.rr['new']['api']
+    senders = [ctx.relayer]
+    existing = ctx.relayer_id
+    count = lambda: ctx.pg.psql(ctx.dbname, 'SELECT count(*) FROM relayer.record', tuples_only=True).strip()
+    initial = count()
+    def assert_paused():
+        for path, request in [
+            (f'{lab.CHAIN_ID}/new', {'name': 'during-window'}),
+            (f'{lab.CHAIN_ID}/import', {'name': 'during-window', 'address': ctx.relayer, 'keyId': 'fixture'}),
+            (f'{existing}/clone', {'chainId': lab.CHAIN_ID, 'newRelayerName': 'during-window'}),
+        ]:
+            code, message = lab.http('POST', api + '/relayers/' + path, request, auth=True)
+            assert code == 503 and 'paused' in message, (code, message)
+        assert count() == initial
+    assert_paused()
+    payments = [ctx.submit('new')]
+    done(ctx, payments)
+    activate(ctx, 'new', 'old')
+    assert_paused()
+    payments.append(ctx.submit('new'))
+    done(ctx, payments)
+    ctx.stop_rr('old')
+    assert lab.http('POST', api + '/handoff/resume-registration', {}, auth=True)[0] == 200
+    ctx.create_relayer(api)
+    senders.append(ctx.relayer)
+    payments.append(ctx.submit('new'))
+    done(ctx, payments)
+    # A separate compatibility build prewarms and accepts a new sender. Its
+    # first payment must settle on the incumbent before ownership changes.
+    ctx.start_rr('rollback', ctx.registration_rollback, lab.PORTS['api'])
+    ctx.create_relayer(ctx.rr['rollback']['api'])
+    senders.append(ctx.relayer)
+    payments.append(ctx.submit('rollback'))
+    done(ctx, payments)
+    activate(ctx, 'rollback', 'new')
+    payments.append(ctx.submit('rollback'))
+    done(ctx, payments)
+    activate(ctx, 'new', 'rollback')
+    payments.append(ctx.submit('new'))
+    done(ctx, payments)
+    evidence = check_money(ctx, payments, senders)
+    evidence['previousBinarySha256'] = hashlib.sha256(Path(ctx.old_bin).read_bytes()).hexdigest()
+    evidence['rollbackBinarySha256'] = hashlib.sha256(Path(ctx.registration_rollback).read_bytes()).hexdigest()
+    return evidence
+
+
+SCENARIOS['standby_registration'] = standby_registration
+SCENARIOS['standby_deletion'] = standby_deletion
+SCENARIOS['delete_after_settlement'] = delete_after_settlement
+SCENARIOS['dynamic_registration'] = dynamic_registration
+SCENARIOS['delete_after_legacy_recovery'] = lambda ctx: legacy_nonce_gap_recovery(ctx, only_legacy=True)
 SCENARIOS['legacy_nonce_gap_recovery'] = legacy_nonce_gap_recovery
 SCENARIOS['delegated_legacy_nonce_gap_recovery'] = lambda ctx: legacy_nonce_gap_recovery(ctx, delegated=True)
 SCENARIOS['restart_gap_below_loaded_row_no_gap_rejection'] = restart_gap_below_loaded_row_no_gap_rejection
 SCENARIOS['failed_attempt_keeps_nonce_reserved'] = failed_attempt_keeps_nonce_reserved
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--binary',required=True);p.add_argument('--baseline');p.add_argument('--out',required=True);p.add_argument('--scenarios',default=','.join(SCENARIOS));args=p.parse_args();SCENARIOS.update(LEGACY)
+    p=argparse.ArgumentParser();p.add_argument('--binary',required=True);p.add_argument('--baseline');p.add_argument('--registration-rollback');p.add_argument('--out',required=True);p.add_argument('--scenarios',default=','.join(SCENARIOS));args=p.parse_args();SCENARIOS.update(LEGACY);SCENARIOS['first_registration_upgrade'] = first_registration_upgrade
     out=Path(args.out).resolve();out.mkdir(parents=True,exist_ok=True)
     pg=lab.Postgres(str(out));results=[]
     try:
@@ -541,6 +720,7 @@ def main():
             sdir=out/name;sdir.mkdir(exist_ok=True)
             ctx=lab.Ctx(pg,str(sdir),'handoff_'+name,str(Path(args.binary).resolve()),args.baseline,lab.TIP_WEI)
             try:
+                ctx.registration_rollback = args.registration_rollback
                 ctx.start_infra();result=SCENARIOS[name](ctx)
                 results.append({'scenario':name,'pass':True,'binarySha256':hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),**result})
             except Exception as error:

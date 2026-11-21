@@ -7,7 +7,10 @@ use crate::{
     provider::EvmProvider,
     relayer::{cache::invalidate_relayer_cache, Relayer},
     shared::HttpError,
-    transaction::{queue_system::TransactionsQueueSetup, NonceManager},
+    transaction::{
+        queue_system::{TransactionsQueueSetup, TransactionsQueues},
+        NonceManager,
+    },
 };
 
 /// Starts the transaction queue for a relayer and initializes it with the current nonce.
@@ -49,28 +52,53 @@ pub async fn start_relayer_queue(
 
     let relayer_id = relayer.id;
 
-    // Start the transaction queue for this relayer
-    state
-        .transactions_queues
-        .lock()
-        .await
-        .add_new_relayer(
-            TransactionsQueueSetup::new(
-                relayer,
-                provider.clone(),
-                NonceManager::new(current_nonce),
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                state.safe_proxy_manager.clone(),
-                gas_bump_config,
-                max_gas_price_multiplier,
-            ),
-            state.transactions_queues.clone(),
-        )
-        .await?;
+    TransactionsQueues::add_new_relayer(
+        state.transactions_queues.clone(),
+        TransactionsQueueSetup::new(
+            relayer,
+            provider.clone(),
+            NonceManager::new(current_nonce),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            state.safe_proxy_manager.clone(),
+            gas_bump_config,
+            max_gas_price_multiplier,
+        ),
+    )
+    .await;
 
     invalidate_relayer_cache(&state.cache, &relayer_id).await;
 
     Ok(())
+}
+
+pub(crate) async fn discover_relayer_queues(state: Arc<AppState>) {
+    use futures_util::stream::{self, StreamExt};
+    let chains: Vec<_> = state.network_configs.iter().map(|config| config.chain_id).collect();
+    let mut shutdown = crate::shutdown::subscribe_to_shutdown();
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => break,
+            _ = interval.tick() => {
+                let known: Vec<_> = state.transactions_queues.lock().await.queues.keys().copied().collect();
+                match state.db.missing_queue_relayers(&chains, &known).await {
+                    Ok(missing) => {
+                        stream::iter(missing).for_each_concurrent(4, |relayer| async {
+                            let chain_id = relayer.chain_id;
+                            if let Some(provider) = crate::provider::find_provider_for_chain_id(&state.evm_providers, &chain_id).await {
+                                let id = relayer.id;
+                                if let Err(error) = start_relayer_queue(&state, relayer, provider, &chain_id).await {
+                                    warn!("Could not discover relayer queue {}: {:?}", id, error);
+                                }
+                            }
+                        }).await;
+                    }
+                    Err(error) => warn!("Could not discover relayer queues: {}", error),
+                }
+            }
+        }
+    }
 }

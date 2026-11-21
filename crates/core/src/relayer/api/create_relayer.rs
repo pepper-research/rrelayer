@@ -44,9 +44,6 @@ pub async fn create_relayer(
         .await
         .ok_or(not_found("Could not find provider for the chain id".to_string()))?;
 
-    // Acquire mutex to prevent concurrent relayer creation deadlocks
-    let _lock = state.relayer_creation_mutex.lock().await;
-
     let relayer = state
         .db
         .create_relayer(&relayer.name, &chain_id, provider, CreateRelayerMode::Create)

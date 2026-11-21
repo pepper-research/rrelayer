@@ -548,8 +548,13 @@ impl AutomaticTopUpTask {
             }
         };
 
-        let mut transactions_queues = self.transactions_queues.lock().await;
-        match transactions_queues.add_transaction(&relayer_id, &transaction_to_send).await {
+        match TransactionsQueues::admit_transaction(
+            &self.transactions_queues,
+            &relayer_id,
+            &transaction_to_send,
+        )
+        .await
+        {
             Ok(transaction) => {
                 info!(
                     "Top-up transaction queued successfully: {} (queue transaction ID: {})",
@@ -999,8 +1004,13 @@ impl AutomaticTopUpTask {
             }
         };
 
-        let mut transactions_queues = self.transactions_queues.lock().await;
-        match transactions_queues.add_transaction(&relayer_id, &transaction_to_send).await {
+        match TransactionsQueues::admit_transaction(
+            &self.transactions_queues,
+            &relayer_id,
+            &transaction_to_send,
+        )
+        .await
+        {
             Ok(transaction) => {
                 info!(
                     "ERC-20 top-up transaction queued successfully: {} (queue transaction ID: {})",
