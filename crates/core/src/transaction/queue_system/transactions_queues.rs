@@ -419,6 +419,37 @@ impl TransactionsQueues {
         Ok(estimated_gas_limit)
     }
 
+    async fn estimate_admission_gas(
+        queue: &mut TransactionsQueue,
+        transaction: &Transaction,
+        gas_price: GasPriceResult,
+        blob_gas_price: Option<&BlobGasPriceResult>,
+    ) -> Result<(GasLimit, GasPriceResult), AddTransactionError> {
+        let estimated =
+            Self::estimate_and_validate_gas(queue, transaction, &gas_price, blob_gas_price).await;
+        // Only the exact pre-signing Ethereum base-fee race is refreshable.
+        // Preserve all normal simulation, gas-limit and affordability checks.
+        if queue.is_ordinary_ethereum(transaction)
+            && matches!(
+                &estimated,
+                Err(AddTransactionError::TransactionEstimateGasError(
+                    _,
+                    RpcError::ErrorResp(error)
+                )) if error.code == -32000
+                    && error.message == "max fee per gas less than block base fee"
+            )
+        {
+            if let Some(refreshed) =
+                queue.refresh_ordinary_ethereum_fee(transaction, &gas_price).await
+            {
+                let limit =
+                    Self::estimate_and_validate_gas(queue, transaction, &refreshed, None).await?;
+                return Ok((limit, refreshed));
+            }
+        }
+        estimated.map(|limit| (limit, gas_price))
+    }
+
     pub(crate) async fn sender_operation(
         registry: &Arc<Mutex<Self>>,
         relayer_id: &RelayerId,
@@ -532,16 +563,16 @@ impl TransactionsQueues {
         )
         .await?;
 
-        let estimated_gas_limit = Self::estimate_and_validate_gas(
+        let estimated_gas_limit = Self::estimate_admission_gas(
             &mut transactions_queue,
             &transaction,
-            &gas_price,
+            gas_price,
             blob_gas_price.as_ref(),
         )
         .await;
 
-        let estimated_gas_limit = match estimated_gas_limit {
-            Ok(limit) => limit,
+        let (estimated_gas_limit, gas_price) = match estimated_gas_limit {
+            Ok(estimate) => estimate,
             Err(err) => {
                 let failed_transaction =
                     Transaction { status: TransactionStatus::FAILED, ..transaction };
@@ -1239,6 +1270,141 @@ impl TransactionsQueues {
         } else {
             Err(ProcessMinedTransactionError::RelayerTransactionsQueueNotFound(*relayer_id))
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_fee_tests {
+    use super::super::transactions_queue::elysium_tests::Fixture;
+    use super::*;
+    use crate::gas::{GasPrice, MaxFee, MaxPriorityFee};
+    use serde_json::Value;
+
+    #[tokio::test]
+    async fn ordinary_ethereum_admission_refreshes_only_a_stale_fee_within_its_cap() {
+        let cases = [
+            // chain, refreshed fee, simulated base fee, configured cap, 7702, error, attempts, clears
+            (1, 200, 150, None, false, None, 2, true),
+            (1, 200, 150, Some(180), false, None, 1, false),
+            (1, 100, 150, None, false, None, 1, false),
+            (1, 200, 250, None, false, None, 2, false),
+            (1, 200, 150, None, true, None, 1, false),
+            (1, 200, 150, None, false, Some("execution reverted"), 1, false),
+            (8453, 200, 150, None, false, None, 1, false),
+        ];
+        for (chain, fresh, base_fee, cap, authorized, error, attempts, clears) in cases {
+            let mut fixture = Fixture::new(chain, Value::Null, 0).await;
+            fixture.set_estimation_fees(fresh, base_fee, error).await;
+            fixture.queue.set_max_gas_price(cap.map(GasPrice::new));
+            let mut transaction = fixture.queue.get_next_inmempool_transaction().await.unwrap();
+            transaction.authorization_list = authorized.then(|| vec![fixture.authorization()]);
+            let original = GasPriceResult {
+                max_fee: MaxFee::new(100),
+                max_priority_fee: MaxPriorityFee::new(1),
+                min_wait_time_estimate: None,
+                max_wait_time_estimate: None,
+            };
+            let result = TransactionsQueues::estimate_admission_gas(
+                &mut fixture.queue,
+                &transaction,
+                original,
+                None,
+            )
+            .await;
+            let requests = fixture.requests.lock().await;
+            let estimate_fees: Vec<_> = requests
+                .iter()
+                .filter(|request| request["method"] == "eth_estimateGas")
+                .map(|request| request["params"][0]["maxFeePerGas"].as_str().unwrap())
+                .collect();
+            assert_eq!(estimate_fees.len(), attempts);
+            assert_eq!(estimate_fees[0], "0x64");
+            if attempts == 2 {
+                assert_eq!(estimate_fees[1], "0xc8");
+            }
+            if clears {
+                let (limit, price) = result.unwrap();
+                assert_eq!(limit, GasLimit::new(48_000));
+                assert_eq!(price.max_fee, MaxFee::new(200));
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_ethereum_first_send_revalidates_admitted_gas_before_signing() {
+        let mut fixture = Fixture::new(1, Value::Null, 0).await;
+        fixture.set_estimation_fees(200, 150, None).await;
+        let mut transaction = fixture.queue.get_next_inmempool_transaction().await.unwrap();
+        transaction.status = TransactionStatus::PENDING;
+        let cached = GasPriceResult {
+            max_fee: MaxFee::new(100),
+            max_priority_fee: MaxPriorityFee::new(1),
+            min_wait_time_estimate: None,
+            max_wait_time_estimate: None,
+        };
+        let (admitted_limit, admitted_fee) = TransactionsQueues::estimate_admission_gas(
+            &mut fixture.queue,
+            &transaction,
+            cached.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        transaction.gas_limit = Some(admitted_limit);
+        assert_eq!(admitted_fee.max_fee, MaxFee::new(200));
+
+        // A worker may see the old cache after admission or restart, and the
+        // block may have advanced. Use the exact gas and price being signed.
+        fixture.set_estimation_fees(240, 210, None).await;
+        let (block_limit, minimum_fee) = fixture.block_gas_parameters().await;
+        assert_eq!(minimum_fee, Some(210));
+        let (limit, price) = fixture
+            .queue
+            .prepare_first_ethereum_send_fee(&transaction, &cached, block_limit, minimum_fee)
+            .await
+            .unwrap()
+            .unwrap();
+        let envelope = transaction
+            .to_eip1559_typed_transaction_with_gas_limit(Some(&price), Some(limit))
+            .unwrap();
+        let TypedTransaction::Eip1559(envelope) = envelope else {
+            panic!("ordinary Ethereum must keep its EIP-1559 envelope");
+        };
+        assert_eq!(envelope.max_fee_per_gas, 240);
+        assert_eq!(envelope.gas_limit, admitted_limit.into_inner() as u64);
+
+        fixture.budget.lock().await.balance = alloy::primitives::U256::from(10_000_000u64);
+        assert!(
+            fixture
+                .queue
+                .prepare_first_ethereum_send_fee(&transaction, &cached, block_limit, minimum_fee)
+                .await
+                .is_err(),
+            "a refreshed maximum fee must still be affordable before signing"
+        );
+        transaction.sent_with_gas = Some(admitted_fee);
+        assert!(
+            fixture
+                .queue
+                .prepare_first_ethereum_send_fee(&transaction, &cached, block_limit, minimum_fee)
+                .await
+                .unwrap()
+                .is_none(),
+            "a previous fee-bearing send must retain the existing replacement path"
+        );
+        transaction.sent_with_gas = None;
+        transaction.is_noop = true;
+        assert!(
+            fixture
+                .queue
+                .prepare_first_ethereum_send_fee(&transaction, &cached, block_limit, minimum_fee)
+                .await
+                .unwrap()
+                .is_none(),
+            "a no-op cancellation must retain its existing gas path"
+        );
     }
 }
 

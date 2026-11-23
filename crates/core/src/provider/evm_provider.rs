@@ -28,7 +28,7 @@ use alloy::rpc::types::serde_helpers::WithOtherFields;
 use alloy::{
     consensus::TypedTransaction,
     dyn_abi::eip712::TypedData,
-    eips::{BlockId, BlockNumberOrTag},
+    eips::{eip1559::BaseFeeParams, BlockId, BlockNumberOrTag},
     network::Ethereum,
     network::TransactionBuilderError,
     primitives::Signature,
@@ -621,13 +621,32 @@ impl EvmProvider {
     }
 
     pub async fn block_gas_limit(&self) -> Result<GasLimit, RpcError<TransportErrorKind>> {
+        self.block_gas_parameters().await.map(|(gas_limit, _)| gas_limit)
+    }
+
+    pub(crate) async fn block_gas_parameters(
+        &self,
+    ) -> Result<(GasLimit, Option<u64>), RpcError<TransportErrorKind>> {
         let block =
             self.rpc_client().get_block(BlockId::Number(BlockNumberOrTag::Latest)).await?.ok_or(
                 RpcError::Transport(TransportErrorKind::Custom(
                     "Latest block unavailable for gas limit validation".to_string().into(),
                 )),
             )?;
-        Ok(GasLimit::from(block.header.gas_limit))
+        let limit = block.header.gas_limit;
+        let minimum_ethereum_fee = block
+            .header
+            .base_fee_per_gas
+            .filter(|_| self.chain_id.u64() == 1 && limit >= 2 && block.header.gas_used <= limit)
+            .map(|base_fee| {
+                let next_fee = BaseFeeParams::ethereum().next_block_base_fee(
+                    block.header.gas_used,
+                    limit,
+                    base_fee,
+                );
+                base_fee.max(next_fee)
+            });
+        Ok((GasLimit::from(limit), minimum_ethereum_fee))
     }
 
     pub async fn estimate_gas(

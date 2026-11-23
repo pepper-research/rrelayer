@@ -14,12 +14,17 @@ use axum::{
 use serde_json::{json, Value};
 
 pub(in crate::transaction::queue_system) struct SimulationBudget {
-    balance: U256,
+    pub(in crate::transaction::queue_system) balance: U256,
     inner_native_value: U256,
     fee_sensitive: bool,
     final_reply: Option<Value>,
+    gas_quote: u64,
+    estimate_fee_floor: u64,
+    estimate_error: Option<&'static str>,
     pub(in crate::transaction::queue_system) receipts: HashMap<String, Value>,
 }
+
+type FixtureState = (u64, Value, u64, Arc<Mutex<Vec<Value>>>, Arc<Mutex<SimulationBudget>>);
 
 pub(in crate::transaction::queue_system) struct Fixture {
     pub(in crate::transaction::queue_system) queue: TransactionsQueue,
@@ -49,6 +54,9 @@ impl Fixture {
             inner_native_value: U256::ZERO,
             fee_sensitive: false,
             final_reply: None,
+            gas_quote: 1,
+            estimate_fee_floor: 0,
+            estimate_error: None,
             receipts: HashMap::new(),
         }));
         let state = (chain_id, simulation_reply, parent_fee, requests.clone(), budget.clone());
@@ -166,21 +174,44 @@ impl Fixture {
         )
         .await;
     }
+
+    pub(in crate::transaction::queue_system) async fn set_estimation_fees(
+        &self,
+        quote: u64,
+        minimum: u64,
+        error: Option<&'static str>,
+    ) {
+        let mut budget = self.budget.lock().await;
+        budget.gas_quote = quote;
+        budget.estimate_fee_floor = minimum;
+        budget.estimate_error = error;
+    }
+
+    pub(in crate::transaction::queue_system) fn authorization(
+        &self,
+    ) -> crate::transaction::types::TransactionAuthorization {
+        match &self.transaction {
+            TypedTransaction::Eip7702(transaction) => (&transaction.authorization_list[0]).into(),
+            _ => unreachable!(),
+        }
+    }
+
+    pub(in crate::transaction::queue_system) async fn block_gas_parameters(
+        &self,
+    ) -> (GasLimit, Option<u64>) {
+        self.queue.evm_provider.block_gas_parameters().await.unwrap()
+    }
 }
 
-async fn gas_prices() -> Json<Value> {
-    let speed = json!({ "suggestedMaxPriorityFeePerGas": "0.000000001", "suggestedMaxFeePerGas": "0.000000001" });
+async fn gas_prices(State((_, _, _, _, budget)): State<FixtureState>) -> Json<Value> {
+    let fee = budget.lock().await.gas_quote;
+    let fee_gwei = format!("{}.{:09}", fee / 1_000_000_000, fee % 1_000_000_000);
+    let speed = json!({ "suggestedMaxPriorityFeePerGas": "0.000000001", "suggestedMaxFeePerGas": fee_gwei });
     Json(json!({"slow": speed, "medium": speed, "fast": speed, "superFast": speed}))
 }
 
 async fn rpc(
-    State((chain_id, reply, parent_fee, requests, budget)): State<(
-        u64,
-        Value,
-        u64,
-        Arc<Mutex<Vec<Value>>>,
-        Arc<Mutex<SimulationBudget>>,
-    )>,
+    State((chain_id, reply, parent_fee, requests, budget)): State<FixtureState>,
     Json(request): Json<Value>,
 ) -> Json<Value> {
     requests.lock().await.push(request.clone());
@@ -190,10 +221,25 @@ async fn rpc(
         "eth_getTransactionCount" => {
             json!({ "result": if request["params"][1] == "pending" { "0x1" } else { "0x0" } })
         }
-        "eth_estimateGas" => json!({ "result": "0x9c40" }), // Nitro ignoring the fresh authorization.
+        "eth_getBalance" => json!({ "result": format!("0x{:x}", budget.lock().await.balance) }),
+        "eth_estimateGas" => {
+            let budget = budget.lock().await;
+            if let Some(message) = budget.estimate_error {
+                json!({ "error": { "code": -32000, "message": message } })
+            } else if budget.estimate_fee_floor > 0
+                && quantity(&request["params"][0]["maxFeePerGas"])
+                    < U256::from(budget.estimate_fee_floor)
+            {
+                json!({ "error": { "code": -32000, "message": "max fee per gas less than block base fee" } })
+            } else {
+                json!({ "result": "0x9c40" }) // Nitro ignoring the fresh authorization.
+            }
+        }
         "eth_getTransactionReceipt" => json!({ "result": budget.lock().await.receipts
             .get(request["params"][0].as_str().unwrap()).cloned().unwrap_or(Value::Null) }),
-        "eth_getBlockByNumber" => json!({ "result": {
+        "eth_getBlockByNumber" => {
+            let base_fee = budget.lock().await.estimate_fee_floor.max(100);
+            json!({ "result": {
             "number": "0x1", "hash": format!("0x{}", "11".repeat(32)),
             "parentHash": format!("0x{}", "00".repeat(32)),
             "sha3Uncles": format!("0x{}", "00".repeat(32)),
@@ -204,9 +250,10 @@ async fn rpc(
             "miner": format!("0x{}", "00".repeat(20)), "nonce": "0x0000000000000000",
             "mixHash": format!("0x{}", "00".repeat(32)),
             "difficulty": "0x0", "gasLimit": "0x989680", "gasUsed": "0x0",
-            "timestamp": "0x1", "extraData": "0x", "baseFeePerGas": "0x64",
+            "timestamp": "0x1", "extraData": "0x", "baseFeePerGas": format!("0x{base_fee:x}"),
             "transactions": [], "uncles": []
-        }}),
+            }})
+        }
         "eth_call" => json!({ "result": format!("0x{parent_fee:064x}{}", "0".repeat(320)) }),
         "eth_simulateV1" if request["params"][0]["validation"] == true => {
             json!({ "error": { "code": -32000, "message": "nonce too high: latest sender nonce is zero" } })

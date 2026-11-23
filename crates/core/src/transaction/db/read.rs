@@ -23,26 +23,41 @@ impl PostgresClient {
     pub async fn get_prebroadcast_failure(
         &self,
         id: &TransactionId,
+        legacy_external_id: Option<&str>,
     ) -> Result<Option<Transaction>, PostgresError> {
         let row = self.query_one_or_none(
             "SELECT t.* FROM relayer.transaction t
-             WHERE t.id=$1 AND t.external_id=t.id::text AND t.status='FAILED'
+             WHERE t.id=$1 AND t.external_id=COALESCE($2::text, t.id::text) AND t.status='FAILED'
                AND NOT t.broadcast_attempted AND t.hash IS NULL
                AND t.gas_limit IS NULL AND t.signed_envelope IS NULL
                AND t.sent_at IS NULL AND t.mined_at IS NULL AND t.confirmed_at IS NULL
                AND t.cancelled_by_transaction_id IS NULL AND t.competition_kind IS NULL
+               AND ($2::text IS NULL OR (
+                   t.authorization_list IS NULL AND t.blobs IS NULL
+                   AND t.failed_at IS NOT NULL
+                   AND t.failed_reason LIKE 'Failed to send transaction as always failing on gas estimation:%'
+                   AND NOT EXISTS (SELECT 1 FROM relayer.transaction other
+                       WHERE other.chain_id=t.chain_id AND other.\"from\"=t.\"from\"
+                         AND other.nonce=t.nonce AND other.id<>t.id)))
                AND EXISTS (SELECT 1 FROM relayer.sender_deployment WHERE singleton AND enabled)
                AND NOT EXISTS (SELECT 1 FROM relayer.transaction_attempt a WHERE a.transaction_id=t.id)
                AND NOT EXISTS (SELECT 1 FROM relayer.transaction other WHERE other.external_id=t.external_id AND other.id<>t.id)
-               AND EXISTS (SELECT 1 FROM relayer.transaction_audit_log a WHERE a.id=t.id)
-               AND NOT EXISTS (SELECT 1 FROM relayer.transaction_audit_log a WHERE a.id=t.id AND (
-                   a.status<>'FAILED' OR a.broadcast_attempted OR a.hash IS NOT NULL
+               AND COALESCE((SELECT bool_and((
+                   a.id<>t.id OR a.status<>'FAILED' OR a.broadcast_attempted OR a.hash IS NOT NULL
                    OR a.gas_limit IS NOT NULL OR a.signed_envelope IS NOT NULL
                    OR a.sent_at IS NOT NULL OR a.mined_at IS NOT NULL OR a.confirmed_at IS NOT NULL
                    OR a.external_id IS DISTINCT FROM t.external_id OR a.chain_id<>t.chain_id
                    OR a.\"from\"<>t.\"from\" OR a.\"to\"<>t.\"to\" OR a.value<>t.value
-                   OR a.data IS DISTINCT FROM t.data OR a.authorization_list IS DISTINCT FROM t.authorization_list))",
-            &[id],
+                   OR a.data IS DISTINCT FROM t.data OR a.authorization_list IS DISTINCT FROM t.authorization_list
+                   OR ($2::text IS NOT NULL AND (
+                       a.relayer_id<>t.relayer_id OR a.nonce<>t.nonce
+                       OR a.cancelled_by_transaction_id IS NOT NULL OR a.blobs IS NOT NULL
+                       OR a.failed_at IS DISTINCT FROM t.failed_at
+                       OR a.failed_reason IS DISTINCT FROM t.failed_reason
+                       OR a.value IS DISTINCT FROM t.value))) IS NOT TRUE)
+                   FROM relayer.transaction_audit_log a
+                   WHERE a.id=t.id OR ($2::text IS NOT NULL AND a.external_id=t.external_id)), FALSE)",
+            &[id, &legacy_external_id],
         ).await?;
         Ok(row.map(|row| build_transaction_from_transaction_view(&row)))
     }
