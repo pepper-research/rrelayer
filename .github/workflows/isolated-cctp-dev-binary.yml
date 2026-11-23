@@ -1,0 +1,84 @@
+name: rrelayer CCTP dev fixture AMD64 build
+
+on:
+  push:
+    branches:
+      - codex/cctp-dev-fixture-build
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_SHA: 210b2c55ce2057ed50cda0e152d2250c2f069802
+  SOURCE_TREE: 35210706c01af8b23db962762eeb9cda0ffbc58b
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  build:
+    if: github.repository == 'pepper-research/rrelayer'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the exact rrelayer candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+
+      - name: Verify source and runner
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          test -z "$(git status --porcelain)"
+          test "$(uname -m)" = x86_64
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Build locked jemalloc release
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64-v2
+        run: cargo build --locked --release -p rrelayer_cli --bin rrelayer_cli --target "$TARGET" --features jemalloc
+
+      - name: Verify and package the executable
+        run: |
+          git diff --exit-code HEAD
+          bundle="$RUNNER_TEMP/rrelayer-bundle"
+          output="$RUNNER_TEMP/rrelayer-fixture"
+          mkdir -p "$bundle" "$output"
+          install -m 0755 "target/$TARGET/release/rrelayer_cli" "$bundle/rrelayer_cli"
+          readelf -h "$bundle/rrelayer_cli" | grep -F 'Advanced Micro Devices X86-64'
+          {
+            printf 'source=%s\nsource_tree=%s\ntarget=%s\n' "$SOURCE_SHA" "$SOURCE_TREE" "$TARGET"
+            printf 'features=jemalloc\nprofile=release\ntarget_cpu=x86-64-v2\n'
+            printf 'workflow_sha=%s\nrun_id=%s\nrun_attempt=%s\n' "$GITHUB_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            rustc -vV
+            cargo --version
+            sha256sum Cargo.lock
+          } > "$bundle/BUILD-INFO.txt"
+          (
+            cd "$bundle"
+            sha256sum rrelayer_cli BUILD-INFO.txt > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+          tar -czf "$output/rrelayer-amd64.tar.gz" -C "$bundle" rrelayer_cli BUILD-INFO.txt SHA256SUMS
+          (
+            cd "$output"
+            sha256sum rrelayer-amd64.tar.gz > rrelayer-amd64.tar.gz.sha256
+          )
+
+      - name: Upload the fixture artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rrelayer-cctp-fixture-amd64-${{ env.SOURCE_SHA }}
+          path: ${{ runner.temp }}/rrelayer-fixture/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
