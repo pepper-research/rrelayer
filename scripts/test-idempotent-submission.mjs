@@ -220,6 +220,30 @@ try {
     BigInt(await rpc("eth_getBalance", [destination, "latest"])) - before,
     1000000n,
   );
+  const signer = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+  const unavailableSigner = "0x000000000000000000000000000000000000dead";
+  const senderEndpoint = "/transactions/relayers/31337/send-idempotent-for-sender";
+  const pinnedEndpoint = senderEndpoint + "?expectedSender=" + signer;
+  const wrongSenderEndpoint = senderEndpoint + "?expectedSender=" + unavailableSigner;
+  const pinned = {
+    ...transfer,
+    externalId: randomUUID(),
+    to: "0x0000000000000000000000000000000000001237",
+  };
+  const pinnedBefore = BigInt(await rpc("eth_getBalance", [pinned.to, "latest"]));
+  assert.equal((await request(pinnedEndpoint, pinned, false)).status, 401);
+  assert.equal((await request(senderEndpoint, pinned)).status, 400);
+  assert.equal((await request(wrongSenderEndpoint, pinned)).status, 400);
+  assert.equal((await request("/transactions/" + pinned.externalId)).body, null);
+  const acceptedPinned = await request(pinnedEndpoint, pinned);
+  assert.equal(acceptedPinned.status, 200, JSON.stringify(acceptedPinned));
+  assert.equal(acceptedPinned.body.id, pinned.externalId);
+  assert.equal((await request(wrongSenderEndpoint, pinned)).status, 400);
+  assert.deepEqual((await request(pinnedEndpoint, pinned)).body, acceptedPinned.body);
+  await until(async () =>
+    BigInt(await rpc("eth_getBalance", [pinned.to, "latest"])) - pinnedBefore === 1000000n,
+  );
+
   await stop(peer);
   await stop(server);
   server = await start(binary, ["start", "--path", fixture], env);
@@ -239,6 +263,32 @@ try {
   assert.equal(proof.body.transaction.id, rejected.externalId);
   assert.equal(proof.body.transaction.status, "FAILED");
   assert.equal(proof.body.transaction.txHash, undefined);
+
+  // An unsigned admission failure leaves a nonce reusable. Give the
+  // independent legacy fixture a nonce with no other transaction history.
+  const nextNonce = BigInt(await rpc("eth_getTransactionCount", [signer, "latest"])) + 1n;
+  await rpc("anvil_setNonce", [signer, "0x" + nextNonce.toString(16)]);
+  const legacyEndpoint = "/transactions/relayers/31337/send-random";
+  const legacyExternalId = "send_" + randomUUID().replaceAll("-", "");
+  assert.equal((await request(legacyEndpoint, { ...transfer, externalId: legacyExternalId })).status, 500);
+  const legacyRecord = await request("/transactions/external/" + legacyExternalId);
+  assert.equal(legacyRecord.status, 200);
+  assert.equal(legacyRecord.body.externalId, legacyExternalId);
+  const legacyPath = "/transactions/" + legacyRecord.body.id + "/prebroadcast-failure";
+  const legacyProofPath = legacyPath + "?legacyExternalId=" + legacyExternalId;
+  assert.equal((await request(legacyPath)).body, null);
+  assert.equal((await request(legacyProofPath, undefined, false)).status, 401);
+  assert.equal((await request(legacyPath + "?legacyExternalId=send_invalid")).status, 400);
+  assert.equal((await request(legacyPath + "?legacyExternalId=send_" + "f".repeat(32))).body, null);
+  assert.equal((await request(failurePath + "?legacyExternalId=" + legacyExternalId)).body, null);
+  const legacyProof = await request(legacyProofPath);
+  assert.equal(legacyProof.status, 200, JSON.stringify(legacyProof));
+  assert.equal(legacyProof.body.kind, "legacy_terminal_prebroadcast_v1");
+  assert.equal(legacyProof.body.transaction.id, legacyRecord.body.id);
+  assert.equal(legacyProof.body.transaction.externalId, legacyExternalId);
+  assert.equal(legacyProof.body.transaction.status, "FAILED");
+  assert.equal(legacyProof.body.transaction.txHash, undefined);
+
   // Refilling the sender cannot revive the same rejected key, even after restart.
   await rpc("anvil_setBalance", ["0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266", "0x100000000000000000000000000000000000000000000"]);
   await stop(server);
@@ -246,17 +296,31 @@ try {
   await until(async () => (await request("/health")).status === 200);
   assert.equal((await request(endpoint, rejected)).status, 400);
   assert.deepEqual((await request(failurePath)).body, proof.body);
+  assert.deepEqual((await request(legacyProofPath)).body, legacyProof.body);
+  const sibling = randomUUID();
+  const legacyId = legacyRecord.body.id;
+  execFileSync(process.env.PSQL_BIN ?? "psql", [database, "-v", "ON_ERROR_STOP=1", "-c",
+    "BEGIN; SELECT set_config('rrelayer.sender_token', o.token, true) FROM relayer.sender_owner o " +
+    "JOIN relayer.transaction t ON o.chain_id=t.chain_id AND o.signer=t.\"from\" WHERE t.id='" + legacyId + "' FOR SHARE OF o; " +
+    "INSERT INTO relayer.transaction (id,relayer_id,\"to\",\"from\",nonce,chain_id,value,speed,status,expires_at,external_id,broadcast_attempted) " +
+    "SELECT '" + sibling + "',relayer_id,\"to\",\"from\",nonce,chain_id,value,speed,'FAILED',expires_at,'" + sibling + "',TRUE " +
+    "FROM relayer.transaction WHERE id='" + legacyId + "'; COMMIT;"]);
+  assert.equal((await request(legacyProofPath)).body, null);
+  execFileSync(process.env.PSQL_BIN ?? "psql", [database, "-v", "ON_ERROR_STOP=1", "-c",
+    "DELETE FROM relayer.transaction WHERE id='" + sibling + "'"]);
+  assert.deepEqual((await request(legacyProofPath)).body, legacyProof.body);
   // The immutable history, not just today's missing hash, controls the proof.
   execFileSync(process.env.PSQL_BIN ?? "psql", [database, "-v", "ON_ERROR_STOP=1", "-c",
-    `UPDATE relayer.transaction_audit_log SET broadcast_attempted=TRUE WHERE id='${rejected.externalId}'`]);
+    `UPDATE relayer.transaction_audit_log SET broadcast_attempted=TRUE WHERE id IN ('${rejected.externalId}', '${legacyRecord.body.id}')`]);
   assert.equal((await request(failurePath)).body, null);
+  assert.equal((await request(legacyProofPath)).body, null);
   await sleep(1500);
   assert.equal(
     BigInt(await rpc("eth_getBalance", [destination, "latest"])) - before,
     1000000n,
   );
   console.log(
-    "PASS: concurrent keyed submissions, restart, mismatch, auth, terminal prebroadcast proof, refill cannot revive rejection, attempted history refuses proof; one native transfer",
+    "PASS: concurrent keyed submissions, exact sender pin, restart, mismatch, auth, keyed and legacy prebroadcast proof, ambiguous sibling and attempted history refuse proof",
   );
 } catch (error) {
   // Only task-owned processes and public local fixture identities reach these logs.

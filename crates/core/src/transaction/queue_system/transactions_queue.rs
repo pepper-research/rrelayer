@@ -145,21 +145,52 @@ impl TransactionsQueue {
         Ok((bytes, hash))
     }
 
+    async fn fresh_gas_price_for_speed(&self, speed: &TransactionSpeed) -> Option<GasPriceResult> {
+        let prices = self.evm_provider.calculate_gas_price().await.ok()?;
+        Some(match speed {
+            TransactionSpeed::SUPER => prices.super_fast,
+            TransactionSpeed::FAST => prices.fast,
+            TransactionSpeed::MEDIUM => prices.medium,
+            TransactionSpeed::SLOW => prices.slow,
+        })
+    }
+
     async fn gas_price_for_speed(&self, speed: &TransactionSpeed) -> Option<GasPriceResult> {
         if self.is_isolated_limit_base() {
-            let prices = self.evm_provider.calculate_gas_price().await.ok()?;
-            return Some(match speed {
-                TransactionSpeed::SUPER => prices.super_fast,
-                TransactionSpeed::FAST => prices.fast,
-                TransactionSpeed::MEDIUM => prices.medium,
-                TransactionSpeed::SLOW => prices.slow,
-            });
+            return self.fresh_gas_price_for_speed(speed).await;
         }
         self.gas_oracle_cache
             .lock()
             .await
             .get_gas_price_for_speed(&self.relayer.chain_id, speed)
             .await
+    }
+
+    pub(super) fn is_ordinary_ethereum(&self, transaction: &Transaction) -> bool {
+        self.chain_id().u64() == 1
+            && !self.is_legacy_transactions()
+            && !transaction.is_noop
+            && transaction.authorization_list.is_none()
+            && !transaction.is_blob_transaction()
+            && self
+                .safe_proxy_manager
+                .get_safe_proxy_for_relayer(&self.relayer.address, transaction.chain_id)
+                .is_none()
+    }
+
+    pub(super) async fn refresh_ordinary_ethereum_fee(
+        &self,
+        transaction: &Transaction,
+        cached: &GasPriceResult,
+    ) -> Option<GasPriceResult> {
+        let refreshed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.fresh_gas_price_for_speed(&transaction.speed),
+        )
+        .await
+        .ok()??;
+        (refreshed.max_fee > cached.max_fee && self.within_gas_price_bounds(&refreshed))
+            .then_some(refreshed)
     }
 
     pub fn new(
@@ -1201,6 +1232,70 @@ impl TransactionsQueue {
         Ok(estimated_gas_result)
     }
 
+    pub(super) async fn prepare_first_ethereum_send_fee(
+        &self,
+        transaction: &Transaction,
+        gas_price: &GasPriceResult,
+        block_gas_limit: GasLimit,
+        minimum_fee: Option<u64>,
+    ) -> Result<Option<(GasLimit, GasPriceResult)>, TransactionQueueSendTransactionError> {
+        // The caller has checked for a durable signed attempt before coming here.
+        if transaction.status != TransactionStatus::PENDING
+            || transaction.sent_with_gas.is_some()
+            || !self.is_ordinary_ethereum(transaction)
+        {
+            return Ok(None);
+        }
+        let invalid_fee = || {
+            TransactionQueueSendTransactionError::TransactionEstimateGasError(RpcError::Transport(
+                TransportErrorKind::Custom(
+                    "Ordinary Ethereum first send lacks a valid current fee quote"
+                        .to_string()
+                        .into(),
+                ),
+            ))
+        };
+        let minimum_fee = u128::from(minimum_fee.ok_or_else(invalid_fee)?);
+        if gas_price.max_fee.into_u128() >= minimum_fee {
+            return Ok(None);
+        }
+        let refreshed = self
+            .refresh_ordinary_ethereum_fee(transaction, gas_price)
+            .await
+            .filter(|price| price.max_fee.into_u128() >= minimum_fee)
+            .ok_or_else(invalid_fee)?;
+        let ceiling = transaction
+            .gas_limit
+            .filter(|limit| *limit <= block_gas_limit)
+            .unwrap_or(block_gas_limit);
+        let request = transaction
+            .to_eip1559_typed_transaction_with_gas_limit(Some(&refreshed), Some(ceiling))
+            .map_err(|error| {
+                TransactionQueueSendTransactionError::TransactionConversionError(error.to_string())
+            })?;
+        let (estimated, balance) = tokio::join!(
+            self.evm_provider.estimate_gas(&request, &self.relayer.address),
+            self.get_balance()
+        );
+        let estimated =
+            estimated.map_err(TransactionQueueSendTransactionError::TransactionEstimateGasError)?;
+        let balance =
+            balance.map_err(TransactionQueueSendTransactionError::TransactionEstimateGasError)?;
+        let limit = bounded_gas_estimate(estimated, ceiling, transaction.is_noop)
+            .map_err(TransactionQueueSendTransactionError::TransactionEstimateGasError)?;
+        let required = alloy::primitives::U256::from(limit.into_inner())
+            .saturating_mul(alloy::primitives::U256::from(refreshed.max_fee.into_u128()))
+            .saturating_add(transaction.value.into_inner());
+        if required > balance {
+            return Err(TransactionQueueSendTransactionError::TransactionEstimateGasError(
+                RpcError::Transport(TransportErrorKind::Custom(
+                    "Insufficient funds for refreshed Ethereum gas and value".to_string().into(),
+                )),
+            ));
+        }
+        Ok(Some((limit, refreshed)))
+    }
+
     pub async fn send_transaction(
         &mut self,
         db: &mut PostgresClient,
@@ -1387,9 +1482,22 @@ impl TransactionsQueue {
         }
 
         // Validate again at send time: persisted estimates can predate this limit or this code.
-        let block_gas_limit = self.evm_provider.block_gas_limit().await.map_err(|error| {
-            TransactionQueueSendTransactionError::TransactionSendError(error.into())
-        })?;
+        let (block_gas_limit, minimum_ethereum_fee) =
+            self.evm_provider.block_gas_parameters().await.map_err(|error| {
+                TransactionQueueSendTransactionError::TransactionSendError(error.into())
+            })?;
+        let refreshed = self
+            .prepare_first_ethereum_send_fee(
+                &working_transaction,
+                &gas_price,
+                block_gas_limit,
+                minimum_ethereum_fee,
+            )
+            .await?;
+        let (revalidated_limit, gas_price) = match refreshed {
+            Some((limit, price)) => (Some(limit), price),
+            None => (None, gas_price),
+        };
         let temp_gas_limit = block_gas_limit;
 
         let temp_transaction_request = if working_transaction.is_7702_transaction() {
@@ -1429,7 +1537,7 @@ impl TransactionsQueue {
         };
 
         let mut estimated_gas_limit = gas_limit_for_send(
-            transaction.gas_limit,
+            revalidated_limit.or(transaction.gas_limit),
             block_gas_limit,
             self.estimate_gas(
                 &temp_transaction_request,

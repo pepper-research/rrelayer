@@ -59,6 +59,15 @@ proof. Deploy this endpoint before the API's accelerated reservation recovery;
 the API still owns exact request binding, stopped execution, payout checks and
 the native signed cancellation window. No rollup/contract policy changes.
 
+For an original legacy journal send, the operator may supply the exact
+legacyExternalId query parameter along with the relayer's transaction UUID.
+This authenticated proof returns legacy_terminal_prebroadcast_v1 only for
+an ordinary admission failure with consistent immutable history and no sender
+nonce sibling. It leaves the original send terminal. Any separately reviewed
+keyed successor that must preserve its sender uses send-idempotent-for-sender
+with the required expectedSender query parameter. The separate route prevents
+an older relayer from interpreting a recovery as an ordinary random-sender send.
+
 `scripts/test-idempotent-submission.mjs` covers the proof using real local
 PostgreSQL/Anvil, including auth, refill/restart and attempted-history refusal.
 

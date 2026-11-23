@@ -1,23 +1,30 @@
-use super::send_random_transaction::select_random_relayer;
+use super::send_random_transaction::select_available_relayer;
 use super::send_transaction::{
     send_transaction_with_id, RelayTransactionRequest, SendTransactionResult,
 };
 use crate::app_state::AppState;
 use crate::network::ChainId;
 use crate::postgres::PostgresError;
-use crate::shared::{bad_request, internal_server_error, HttpError};
+use crate::shared::{bad_request, common_types::EvmAddress, internal_server_error, HttpError};
 use crate::transaction::types::TransactionId;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::HeaderMap,
     Json,
 };
 use once_cell::sync::Lazy;
+use serde::Deserialize;
 use std::{str::FromStr, sync::Arc};
 use tokio::sync::Mutex;
 
 // Do not let waiting requests fill the pool needed by the queue's durable write.
 static SUBMISSIONS: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SenderSubmissionQuery {
+    expected_sender: EvmAddress,
+}
 
 /// The caller's UUID is also the durable transaction primary key. The database
 /// lock serializes retries across processes; the queue commits before broadcast.
@@ -28,6 +35,29 @@ pub async fn send_idempotent_transaction(
     Json(request): Json<RelayTransactionRequest>,
 ) -> Result<Json<SendTransactionResult>, HttpError> {
     state.validate_allowed_passed_basic_auth(&headers)?;
+    submit(&state, &chain_id, &headers, request, None).await
+}
+
+/// A separate route makes a rollback reject this request instead of treating
+/// the sender pin as an unrecognized query on the random-sender route.
+pub async fn send_idempotent_for_sender(
+    State(state): State<Arc<AppState>>,
+    Path(chain_id): Path<ChainId>,
+    Query(query): Query<SenderSubmissionQuery>,
+    headers: HeaderMap,
+    Json(request): Json<RelayTransactionRequest>,
+) -> Result<Json<SendTransactionResult>, HttpError> {
+    state.validate_basic_auth_valid(&headers)?;
+    submit(&state, &chain_id, &headers, request, Some(query.expected_sender)).await
+}
+
+async fn submit(
+    state: &Arc<AppState>,
+    chain_id: &ChainId,
+    headers: &HeaderMap,
+    request: RelayTransactionRequest,
+    expected_sender: Option<EvmAddress>,
+) -> Result<Json<SendTransactionResult>, HttpError> {
     let external_id = request
         .external_id
         .as_deref()
@@ -60,7 +90,7 @@ pub async fn send_idempotent_transaction(
         }
         if let Some(existing) = state.db.get_transaction(&id).await? {
             // Auth must target the original relayer, even if random selection changed.
-            state.validate_auth_basic_or_api_key(&headers, &existing.from, &existing.chain_id)?;
+            state.validate_auth_basic_or_api_key(headers, &existing.from, &existing.chain_id)?;
             // Queue cancellation/replacement may change the current row's calldata;
             // bind retries to the immutable first audit record instead.
             let authorization = request
@@ -68,8 +98,8 @@ pub async fn send_idempotent_transaction(
                 .as_ref()
                 .map(|value| serde_json::to_value(value).unwrap());
             let original = lock.query_one(
-            "SELECT \"to\"=$2 AND value=$3 AND data=$4 AND chain_id=$5 AND external_id=$6 AND blobs IS NULL AND authorization_list IS NOT DISTINCT FROM $7::jsonb AS matches, hash FROM relayer.transaction_audit_log WHERE id=$1 ORDER BY history_id LIMIT 1",
-            &[&id, &request.to, &request.value, &request.data, &chain_id, &external_id, &authorization],
+            "SELECT \"to\"=$2 AND value=$3 AND data=$4 AND chain_id=$5 AND external_id=$6 AND blobs IS NULL AND authorization_list IS NOT DISTINCT FROM $7::jsonb AND ($8::bytea IS NULL OR \"from\"=$8) AS matches, hash FROM relayer.transaction_audit_log WHERE id=$1 ORDER BY history_id LIMIT 1",
+            &[&id, &request.to, &request.value, &request.data, chain_id, &external_id, &authorization, &expected_sender],
         ).await.map_err(PostgresError::from)?;
             if !original.get::<_, bool>("matches") || request.blobs.is_some() {
                 return Err(bad_request(
@@ -89,8 +119,8 @@ pub async fn send_idempotent_transaction(
         if request.blobs.is_some() {
             return Err(bad_request("Idempotent blob submission is not supported".to_string()));
         }
-        let relayer = select_random_relayer(&state, &chain_id).await?;
-        let result = send_transaction_with_id(relayer, request, &state, &headers, Some(id)).await?;
+        let relayer = select_available_relayer(state, chain_id, expected_sender).await?;
+        let result = send_transaction_with_id(relayer, request, state, headers, Some(id)).await?;
         lock.commit().await.map_err(|_| {
             internal_server_error(Some("Could not finish idempotent submission".to_string()))
         })?;

@@ -46,6 +46,10 @@ pub fn create_transactions_routes() -> Router<Arc<AppState>> {
             "/relayers/:chain_id/send-idempotent",
             post(send_idempotent_transaction::send_idempotent_transaction),
         )
+        .route(
+            "/relayers/:chain_id/send-idempotent-for-sender",
+            post(send_idempotent_transaction::send_idempotent_for_sender),
+        )
         .route("/replace/:transaction_id", put(replace_transaction::replace_transaction))
         .route("/cancel/:transaction_id", put(cancel_transaction::cancel_transaction))
         .route(
